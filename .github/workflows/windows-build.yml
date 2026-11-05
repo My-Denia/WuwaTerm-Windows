@@ -11,6 +11,13 @@ jobs:
   build:
     name: build and test
     runs-on: windows-latest
+    # Apply before every checkout, including the pinned external repositories.
+    # Windows Git defaults to CRLF, but the contract and icon checks compare
+    # committed bytes. Keep this scoped to this job, not the runner's config.
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
     steps:
       - uses: actions/checkout@v7
         with:

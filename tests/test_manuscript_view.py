@@ -1073,7 +1073,7 @@ def test_conflicting_imported_choices_require_explicit_undoable_removal(qapp, tm
     assert load_workfile(path) == view._payload == view._saved_payload
     program = "import fs from 'node:fs'; import {parseWorkfile} from './lib/manuscript.js'; console.log(JSON.stringify(parseWorkfile(fs.readFileSync(process.argv[1], 'utf8'))));"
     parsed = subprocess.run(["node", "--input-type=module", "-e", program, str(path)],
-                            cwd=os.environ["WUWATERM_WEB_ROOT"], capture_output=True, text=True, check=True, timeout=20)
+                            cwd=os.environ["WUWATERM_WEB_ROOT"], capture_output=True, text=True, encoding="utf-8", check=True, timeout=20)
     assert json.loads(parsed.stdout) == view._payload
 
 

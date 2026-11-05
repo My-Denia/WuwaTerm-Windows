@@ -200,7 +200,7 @@ def test_actual_web_and_client_read_each_others_files(contract_source) -> None:
     result = subprocess.run(["node", "--input-type=module", "-e", program], cwd=web_root,
                             input=json.dumps({"pythonFile": manuscript.serialize_workfile(payload), "payload": payload,
                                               "conflictingPayload": conflicting_payload}),
-                            text=True, capture_output=True, check=True, timeout=30)
+                            text=True, encoding="utf-8", capture_output=True, check=True, timeout=30)
     response = json.loads(result.stdout)
     assert response["parsed"] == payload
     assert manuscript.parse_workfile(response["webFile"]) == payload

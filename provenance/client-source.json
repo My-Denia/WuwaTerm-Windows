@@ -673,9 +673,9 @@
       "mode": "100644",
       "git_blob": "af7ba61c55becc901b54effc1cba16e25f661119",
       "sha256": "0165d89e64a29c7b1bdfbcc018e79feab935634ec195c7de67dc7d6b83cedd75",
-      "destination_sha256": "9665484ce69d3ab4be0f6dd04111ffb5d685a97f13560bca823652983f27062e",
+      "destination_sha256": "f362ea6e34b6244eaa47a148dd78244d606b49f7cb7c20c50c9884a6ae8c2ed9",
       "status": "adapted",
-      "reason": "require pinned Web source when CI contracts are required"
+      "reason": "require pinned Web source when CI contracts are required; decode Node IPC as UTF-8"
     },
     {
       "source": "client/tests/test_manuscript_view.py",
@@ -683,8 +683,9 @@
       "mode": "100644",
       "git_blob": "20c9842442f27cfb5af1a597821ca5dae0178b32",
       "sha256": "7e7b1d5f77935fea6fe6fd0f23125384445598bc7dcdaddcf67e02d66392e725",
-      "destination_sha256": "7e7b1d5f77935fea6fe6fd0f23125384445598bc7dcdaddcf67e02d66392e725",
-      "status": "unchanged"
+      "destination_sha256": "30d8019cdf7254fa5d8e1eb53a0479fab17c670aac13dcf4497d76405d94d16d",
+      "status": "adapted",
+      "reason": "decode Node IPC as UTF-8 for cross-product manuscript validation"
     },
     {
       "source": "client/tests/test_packaging_entry.py",
