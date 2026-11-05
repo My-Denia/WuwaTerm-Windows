@@ -1,0 +1,4 @@
+include LICENSE README.md main.py WuwaTerm.spec build.ps1 uv.lock
+recursive-include contracts *.json
+recursive-include provenance *.json
+recursive-include scripts *.py
