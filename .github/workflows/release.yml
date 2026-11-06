@@ -1,0 +1,122 @@
+name: Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: Full main-ancestor commit SHA to build
+        required: true
+        type: string
+      dry_run:
+        description: Build without creating a draft release
+        type: boolean
+        default: true
+      validation_run_id:
+        description: Optional successful main-push CI run ID for this exact commit
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.source.outputs.source }}
+      version: ${{ steps.source.outputs.version }}
+      ci_run: ${{ steps.ci.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate release source
+        id: source
+        env:
+          TARGET: ${{ inputs.target_commit }}
+          CONTROL_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test "$CONTROL_REF" = refs/heads/main
+          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$TARGET" origin/main
+          source=$(git rev-parse "$TARGET^{commit}")
+          test "$source" = "$TARGET"
+          version=$(git show "$source:pyproject.toml" | python -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Verify CI for the exact source
+        id: ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE: ${{ steps.source.outputs.source }}
+          RUN_ID: ${{ inputs.validation_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RUN_ID" ]; then
+            result=$(python scripts/verify_ci_source.py "$SOURCE" "$RUN_ID")
+          else
+            result=$(python scripts/verify_ci_source.py "$SOURCE")
+          fi
+          echo "$result"
+          run=$(cut -d ' ' -f 3 <<< "$result")
+          [[ "$run" =~ ^[1-9][0-9]*$ ]]
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+  windows:
+    name: Release build
+    needs: preflight
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      source_commit: ${{ needs.preflight.outputs.source }}
+  draft:
+    needs: [preflight, windows]
+    if: inputs.dry_run == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-release-zip
+          path: staging
+      - name: Create a draft with checksums and manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE: ${{ needs.preflight.outputs.source }}
+          VALIDATION_RUN: ${{ needs.preflight.outputs.ci_run }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          status=0
+          gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>tag-error || status=$?
+          if [ "$status" -eq 0 ]; then echo 'Tag already exists' >&2; exit 1; fi
+          grep -q 'HTTP 404' tag-error
+          cd staging
+          zip="WuwaTerm-$VERSION-windows-x64.zip"
+          test -s "$zip"
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
+          sha256sum "$zip" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          python - "$zip" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          name = sys.argv[1]
+          manifest = {"schema": 1, "version": os.environ["VERSION"], "source_commit": os.environ["SOURCE"],
+                      "validation_run_id": int(os.environ["VALIDATION_RUN"]), "asset": name,
+                      "sha256": hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest(), "signed": False}
+          pathlib.Path("manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          printf 'WuwaTerm Windows %s. Source: %s.\n\nUNSIGNED: Windows may display a SmartScreen warning. Verify SHA256SUMS before use.\nRequires HTTP API v1; manuscript review also needs review-v2. Manuscripts use wuwaterm-manuscript-v1.\n' "$VERSION" "$SOURCE" > ../notes.md
+          gh release create "$tag" --draft --latest=false --target "$SOURCE" --title "WuwaTerm Windows $VERSION" --notes-file ../notes.md "$zip" SHA256SUMS manifest.json
+          test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+          test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$SOURCE"
+          test "$(gh release view "$tag" --json assets --jq '.assets | length')" -eq 3

@@ -1,0 +1,836 @@
+{
+  "repository": "My-Denia/WuwaTerm",
+  "commit": "cc5743df0e807c42e4b669564fd8b4d0a465b79c",
+  "files": [
+    {
+      "source": "client/.gitignore",
+      "destination": ".gitignore",
+      "mode": "100644",
+      "git_blob": "13e2046a08e86321da69dcd1f2603b502eb06ceb",
+      "sha256": "cb81594f89bdd9bbbd60ce3024bc9d87d01f88b847b6088d0d9145870504daf1",
+      "destination_sha256": "a7c045cac623265d1e95c8a909265e5b04b65998eb5197c43b8c47f7a32d2ea4",
+      "status": "adapted",
+      "reason": "independent root and local contract fixtures"
+    },
+    {
+      "source": "client/README.md",
+      "destination": "README.md",
+      "mode": "100644",
+      "git_blob": "a8c7d17eb00f7cc098197332a717edc1e2a7c410",
+      "sha256": "bdfa5ba7436eb33a0ec62d23fdb8f54b4490a6aedae885d83a64dbb2bc1270b9",
+      "destination_sha256": "e9ac4cbe21a5f2ea3cde3d8c59b6e98e865fcec25dc69ab1307c52795f1be143",
+      "status": "adapted",
+      "reason": "standalone product, build, contract and release documentation"
+    },
+    {
+      "source": "client/WuwaTerm.spec",
+      "destination": "WuwaTerm.spec",
+      "mode": "100644",
+      "git_blob": "414f46751f7aa89988dff4b1487463bd278fafd1",
+      "sha256": "6557b9b73950b1460020377664bb242ec74a00786750cdfb97577c4130ae84ca",
+      "destination_sha256": "079cd2499ec8388c1eff19a378aa7fc180c46231442fd44c940e0edc89ebb9a2",
+      "status": "adapted",
+      "reason": "adjust source path documentation for independent root"
+    },
+    {
+      "source": "client/build.ps1",
+      "destination": "build.ps1",
+      "mode": "100644",
+      "git_blob": "a34e22b4e77b50d803f190a7a08101a98483ff3a",
+      "sha256": "a3fcd1f3800986f140a61b5081b5afd63aa5ff39a52109266bb27fe4a333fe14",
+      "destination_sha256": "1dcfd4bff164a15e5a1c7787f7b05146cff9f418b56bd037f090f67c4582de7d",
+      "status": "adapted",
+      "reason": "root build instructions and packaged resource checks"
+    },
+    {
+      "source": "client/main.py",
+      "destination": "main.py",
+      "mode": "100644",
+      "git_blob": "938f2265a4fce4091bc2fd315cecd4908d327142",
+      "sha256": "aedd38a0a03357ae250eb5ee5178158faae9c3863d2673b30691cddd8071b729",
+      "destination_sha256": "aedd38a0a03357ae250eb5ee5178158faae9c3863d2673b30691cddd8071b729",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/pyproject.toml",
+      "destination": "pyproject.toml",
+      "mode": "100644",
+      "git_blob": "7a2634b80bfc16ccc08cf546df57b8549b51e5ab",
+      "sha256": "e4c32e2b163a56526e14ec37920870d08c12e109a34f6cfea2829db91ecdb3b8",
+      "destination_sha256": "b8777c314a3489aafefba4199e409a579acadf5f68540cac7b5971eae9c82785",
+      "status": "adapted",
+      "reason": "independent version, license metadata and packaged resources"
+    },
+    {
+      "source": "client/src/wuwaterm_client/__init__.py",
+      "destination": "src/wuwaterm_client/__init__.py",
+      "mode": "100644",
+      "git_blob": "245f2b9bc95207c01d0cb5d934d0fb0c9d322b74",
+      "sha256": "d7045d143109b3db8ec90d87a5dda63922fdb7a2c3a591523e89faa934aa379f",
+      "destination_sha256": "2b035a94402ba9a4512c607d57d4523cd0e6609c77cb80db97804db51dce5d4a",
+      "status": "adapted",
+      "reason": "independent product version 0.3.0"
+    },
+    {
+      "source": "client/src/wuwaterm_client/__main__.py",
+      "destination": "src/wuwaterm_client/__main__.py",
+      "mode": "100644",
+      "git_blob": "1cd714cd8ff49881c8a81e1c231e00f37095f0d5",
+      "sha256": "01811580931dcd68e829ff013259dad23afd4e870e001f2f22a33b4321e7219d",
+      "destination_sha256": "01811580931dcd68e829ff013259dad23afd4e870e001f2f22a33b4321e7219d",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/api.py",
+      "destination": "src/wuwaterm_client/api.py",
+      "mode": "100644",
+      "git_blob": "56156c7c4ff83e94c00793bcec39fb60067db0c2",
+      "sha256": "fb233f045b82132fd4b8f28f870b3ae896548e75f010ba6ed7adc9c23b8d85f9",
+      "destination_sha256": "fb233f045b82132fd4b8f28f870b3ae896548e75f010ba6ed7adc9c23b8d85f9",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/app.py",
+      "destination": "src/wuwaterm_client/app.py",
+      "mode": "100644",
+      "git_blob": "44d6227dcfda86db130ef2b11243ddf03e3e54c3",
+      "sha256": "28100153187dbea59030109e0b703c101f57dadfa7e998d026aca26b99839328",
+      "destination_sha256": "28100153187dbea59030109e0b703c101f57dadfa7e998d026aca26b99839328",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/config.py",
+      "destination": "src/wuwaterm_client/config.py",
+      "mode": "100644",
+      "git_blob": "b3aa616db96866f13044062449ebfc6758e77422",
+      "sha256": "c04260f9c33d8354b456b57a5949f3340cc447067d6746e7d4d8794ac89aac78",
+      "destination_sha256": "c04260f9c33d8354b456b57a5949f3340cc447067d6746e7d4d8794ac89aac78",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/credentials.py",
+      "destination": "src/wuwaterm_client/credentials.py",
+      "mode": "100644",
+      "git_blob": "952e4322d655cf95edc074249e17269804f21def",
+      "sha256": "33d99a66fa69b3fa08fdfc5fb7ad0583b0747d38631ed8a4335893faa66193d3",
+      "destination_sha256": "33d99a66fa69b3fa08fdfc5fb7ad0583b0747d38631ed8a4335893faa66193d3",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/errors.py",
+      "destination": "src/wuwaterm_client/errors.py",
+      "mode": "100644",
+      "git_blob": "57789394fe005916d47d34b6f0f6ab0b58842f6e",
+      "sha256": "c8189d5f4aaeff5ed7bda3e25df60b3a3a67079d68530dca6939d1f74628b76c",
+      "destination_sha256": "c8189d5f4aaeff5ed7bda3e25df60b3a3a67079d68530dca6939d1f74628b76c",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/i18n.py",
+      "destination": "src/wuwaterm_client/i18n.py",
+      "mode": "100644",
+      "git_blob": "912d71ee3498967377900ce576c55865dcb314c3",
+      "sha256": "134a2144c4ca7109ce951995a8f6f2a24cfeb0a0aeb7a34cf95896b67f952285",
+      "destination_sha256": "134a2144c4ca7109ce951995a8f6f2a24cfeb0a0aeb7a34cf95896b67f952285",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/manuscript.py",
+      "destination": "src/wuwaterm_client/manuscript.py",
+      "mode": "100644",
+      "git_blob": "5f7d7216ba0f3821345cc14b314fa8aebd9328f3",
+      "sha256": "5dfc4a0f6b87c8c7211af603a54894fcfb75accdcba6597095775a012f00b46d",
+      "destination_sha256": "5dfc4a0f6b87c8c7211af603a54894fcfb75accdcba6597095775a012f00b46d",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/LICENSE",
+      "destination": "src/wuwaterm_client/resources/icons/LICENSE",
+      "mode": "100644",
+      "git_blob": "718bb3f0e44153809972abed31839375804bf652",
+      "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+      "destination_sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/README.md",
+      "destination": "src/wuwaterm_client/resources/icons/README.md",
+      "mode": "100644",
+      "git_blob": "8277a29adc819059b705cd02cf4429f11014dd5d",
+      "sha256": "68d716d0995260fb71a0b84555be8e722cce9cb49e3ae537531b0b6a03327ab4",
+      "destination_sha256": "68d716d0995260fb71a0b84555be8e722cce9cb49e3ae537531b0b6a03327ab4",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/SHA256SUMS",
+      "destination": "src/wuwaterm_client/resources/icons/SHA256SUMS",
+      "mode": "100644",
+      "git_blob": "9203c511f548dcabecd7af6919f6e0313b8b3473",
+      "sha256": "946ddd5a38bfeb52dd992e2527292412918cae06976f264a08ce14f67dfc68be",
+      "destination_sha256": "946ddd5a38bfeb52dd992e2527292412918cae06976f264a08ce14f67dfc68be",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/arrow-right.svg",
+      "destination": "src/wuwaterm_client/resources/icons/arrow-right.svg",
+      "mode": "100644",
+      "git_blob": "433ded3fcc5f7bd2b6a59356c6ffe8eceac6b7e3",
+      "sha256": "288397fdb73bb4f783cf9eabb726ff47357df1d4e3f1201dd748090579f108b9",
+      "destination_sha256": "288397fdb73bb4f783cf9eabb726ff47357df1d4e3f1201dd748090579f108b9",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/book-open.svg",
+      "destination": "src/wuwaterm_client/resources/icons/book-open.svg",
+      "mode": "100644",
+      "git_blob": "9e0ace59b788e2b45fc35d9fbf68c2a80bd518bc",
+      "sha256": "9b9bed0ff057283d5c5c5a1c71f8d3e927db26a56639603a92fdf7b25961510e",
+      "destination_sha256": "9b9bed0ff057283d5c5c5a1c71f8d3e927db26a56639603a92fdf7b25961510e",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/check.svg",
+      "destination": "src/wuwaterm_client/resources/icons/check.svg",
+      "mode": "100644",
+      "git_blob": "5abe1527434e7b251bde0661f99af96178976d8c",
+      "sha256": "7f33acc9a77a61659531044525fc008edebe215bf4dcf1c789c8674ad3277db0",
+      "destination_sha256": "7f33acc9a77a61659531044525fc008edebe215bf4dcf1c789c8674ad3277db0",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/chevron-down.svg",
+      "destination": "src/wuwaterm_client/resources/icons/chevron-down.svg",
+      "mode": "100644",
+      "git_blob": "e70d30b88399a721cd5d20d0d26756608cf8c42b",
+      "sha256": "66ea878e72ed3488bb3b464c39dfdccee8d1f78e560dccea40e5e12da0e87e87",
+      "destination_sha256": "66ea878e72ed3488bb3b464c39dfdccee8d1f78e560dccea40e5e12da0e87e87",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/chevron-left.svg",
+      "destination": "src/wuwaterm_client/resources/icons/chevron-left.svg",
+      "mode": "100644",
+      "git_blob": "056d5abc06e44940302c8b2a1912a382ea26b36d",
+      "sha256": "83b0681aa38bf55e9d52a1e4b4cced624abe1fe7678ecafda133a574f1161d93",
+      "destination_sha256": "83b0681aa38bf55e9d52a1e4b4cced624abe1fe7678ecafda133a574f1161d93",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/chevron-right.svg",
+      "destination": "src/wuwaterm_client/resources/icons/chevron-right.svg",
+      "mode": "100644",
+      "git_blob": "db62a0c20181edd6173722b2a483e0b85e30f240",
+      "sha256": "2758143d7b2434e4aa7307dfd34405c87909ff4052f21b5f3f40d45224b4f19b",
+      "destination_sha256": "2758143d7b2434e4aa7307dfd34405c87909ff4052f21b5f3f40d45224b4f19b",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/circle-check.svg",
+      "destination": "src/wuwaterm_client/resources/icons/circle-check.svg",
+      "mode": "100644",
+      "git_blob": "14e45c58c9ece47f2204e89d19d8463f485325a0",
+      "sha256": "9711e045a5999f8a3b0782eb88e09b04e0559bc7b379dcc0a4ae645223e10345",
+      "destination_sha256": "9711e045a5999f8a3b0782eb88e09b04e0559bc7b379dcc0a4ae645223e10345",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/clipboard.svg",
+      "destination": "src/wuwaterm_client/resources/icons/clipboard.svg",
+      "mode": "100644",
+      "git_blob": "de4cc0138cfb13bff41452df89b3dfe511932c7a",
+      "sha256": "d9b433e6a571d96a035ddb83d2ff52c4f85925ffcba9e584cf371d0dfa90875d",
+      "destination_sha256": "d9b433e6a571d96a035ddb83d2ff52c4f85925ffcba9e584cf371d0dfa90875d",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/copy.svg",
+      "destination": "src/wuwaterm_client/resources/icons/copy.svg",
+      "mode": "100644",
+      "git_blob": "f62ce99c1f34989a5f70cd15192f8adf9140f4ed",
+      "sha256": "ea80e566c7a12628a447cb53179b19aea4f60b9143e2becd0d0f20bf260e5718",
+      "destination_sha256": "ea80e566c7a12628a447cb53179b19aea4f60b9143e2becd0d0f20bf260e5718",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/external-link.svg",
+      "destination": "src/wuwaterm_client/resources/icons/external-link.svg",
+      "mode": "100644",
+      "git_blob": "a73a9ba286ebaac4c7fc65bf9303a2fb9624ae76",
+      "sha256": "3891241b8c3bfc3a8a930078f26ffc5a7e9763da6d0162ace2050b28d4c1d1fe",
+      "destination_sha256": "3891241b8c3bfc3a8a930078f26ffc5a7e9763da6d0162ace2050b28d4c1d1fe",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/file-plus.svg",
+      "destination": "src/wuwaterm_client/resources/icons/file-plus.svg",
+      "mode": "100644",
+      "git_blob": "fe4715be0d025be10a51b3d6fae6be54e4fbc750",
+      "sha256": "bbcf862a2a4425baa8a5bda39c7f16ec1d283816a3db77baf84f2e8766dd223e",
+      "destination_sha256": "bbcf862a2a4425baa8a5bda39c7f16ec1d283816a3db77baf84f2e8766dd223e",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/file-text.svg",
+      "destination": "src/wuwaterm_client/resources/icons/file-text.svg",
+      "mode": "100644",
+      "git_blob": "67dc5b9d1a07a1b501ba87d62563b914c059096e",
+      "sha256": "52ca55846c202335fb870c8aa23e9345630ec10489303756d62e750f7109605c",
+      "destination_sha256": "52ca55846c202335fb870c8aa23e9345630ec10489303756d62e750f7109605c",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/folder-open.svg",
+      "destination": "src/wuwaterm_client/resources/icons/folder-open.svg",
+      "mode": "100644",
+      "git_blob": "b01f60fcb51848a9b3a7380d4566c4de7534745c",
+      "sha256": "ee57452b40e71df310214091dd9da1941a397c83197b8ff8d7ae66dd4242578b",
+      "destination_sha256": "ee57452b40e71df310214091dd9da1941a397c83197b8ff8d7ae66dd4242578b",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/languages.svg",
+      "destination": "src/wuwaterm_client/resources/icons/languages.svg",
+      "mode": "100644",
+      "git_blob": "c3c1486ee10dc0ec0c9a94f88171e62ca8dea9c8",
+      "sha256": "ae9048feb2c7b19855da9a8f5414f68125573039777a89b9c253cceed5dc5075",
+      "destination_sha256": "ae9048feb2c7b19855da9a8f5414f68125573039777a89b9c253cceed5dc5075",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/link-2.svg",
+      "destination": "src/wuwaterm_client/resources/icons/link-2.svg",
+      "mode": "100644",
+      "git_blob": "627adb76c110373cb18128d84b357f553e76a446",
+      "sha256": "5a17fc2afb01f2889deee2c90c95e37b8eb942f5ffd625b028c87995b46e87ab",
+      "destination_sha256": "5a17fc2afb01f2889deee2c90c95e37b8eb942f5ffd625b028c87995b46e87ab",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/menu.svg",
+      "destination": "src/wuwaterm_client/resources/icons/menu.svg",
+      "mode": "100644",
+      "git_blob": "0ec97458f92564242574b65de900afbfd7123715",
+      "sha256": "af6491988ac1ba30dc5414f485bc48713e957e1edb0fbef4a0dd8691c3c21598",
+      "destination_sha256": "af6491988ac1ba30dc5414f485bc48713e957e1edb0fbef4a0dd8691c3c21598",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/panel-right-close.svg",
+      "destination": "src/wuwaterm_client/resources/icons/panel-right-close.svg",
+      "mode": "100644",
+      "git_blob": "bcd34cbf15bf4cede3907c38a90304ae0cef0b86",
+      "sha256": "48b9f4f84d55f99d6e4b7dc9e31937f687bc6aca223c003d7f3bd8bab6526c0b",
+      "destination_sha256": "48b9f4f84d55f99d6e4b7dc9e31937f687bc6aca223c003d7f3bd8bab6526c0b",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/panel-right-open.svg",
+      "destination": "src/wuwaterm_client/resources/icons/panel-right-open.svg",
+      "mode": "100644",
+      "git_blob": "613e58973fbac788d2b148cbc0fea4e7c0bcd993",
+      "sha256": "7cea098473914c767e3a17561626df816a886de878cc943da79ae95bf726c9f0",
+      "destination_sha256": "7cea098473914c767e3a17561626df816a886de878cc943da79ae95bf726c9f0",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/panel-right.svg",
+      "destination": "src/wuwaterm_client/resources/icons/panel-right.svg",
+      "mode": "100644",
+      "git_blob": "53ba1e6120eb638530de38ca5b696741dfcaa6ad",
+      "sha256": "327d197328f9feb1f88c36c9db04e9b00fe717d877459f92fcd892f5e4c349fa",
+      "destination_sha256": "327d197328f9feb1f88c36c9db04e9b00fe717d877459f92fcd892f5e4c349fa",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/panels-top-left.svg",
+      "destination": "src/wuwaterm_client/resources/icons/panels-top-left.svg",
+      "mode": "100644",
+      "git_blob": "574e4dea55337481f976f0a12148ca56979d9cc6",
+      "sha256": "321a2a5500f2b814a2e62eb73c4b01dc65c7334fe2e6f7d77517239383e26bb1",
+      "destination_sha256": "321a2a5500f2b814a2e62eb73c4b01dc65c7334fe2e6f7d77517239383e26bb1",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/plus.svg",
+      "destination": "src/wuwaterm_client/resources/icons/plus.svg",
+      "mode": "100644",
+      "git_blob": "41f92bb93eb6626368d71c9884127bbcf7d3ccdf",
+      "sha256": "7f6af73bf1ff6c4bca3f18351c8d1bdec6749c0c2530c4de5da85d520c21df17",
+      "destination_sha256": "7f6af73bf1ff6c4bca3f18351c8d1bdec6749c0c2530c4de5da85d520c21df17",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/redo-2.svg",
+      "destination": "src/wuwaterm_client/resources/icons/redo-2.svg",
+      "mode": "100644",
+      "git_blob": "72371c8d34b46f77243fa889ec464780bbd7ceb9",
+      "sha256": "4cbd2cdebc70b6b7979c681ed3f313d9cbb102465dcf7d0d2d6a72c937b344bc",
+      "destination_sha256": "4cbd2cdebc70b6b7979c681ed3f313d9cbb102465dcf7d0d2d6a72c937b344bc",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/refresh-cw.svg",
+      "destination": "src/wuwaterm_client/resources/icons/refresh-cw.svg",
+      "mode": "100644",
+      "git_blob": "c27b3a9677e35fb2353167b01553d3d4cc4e3091",
+      "sha256": "2e10dd403c85a24f163d59fc6151aa21147fe9402e1305dfc8979208caee8944",
+      "destination_sha256": "2e10dd403c85a24f163d59fc6151aa21147fe9402e1305dfc8979208caee8944",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/rotate-ccw-clock.svg",
+      "destination": "src/wuwaterm_client/resources/icons/rotate-ccw-clock.svg",
+      "mode": "100644",
+      "git_blob": "67152e4fbda9c61602d11985f3f1fa74136f00d7",
+      "sha256": "a98ff758157910b9fc9d42d5d5dc80c2f4e037afa5f8ea4dee5f5649f03d438d",
+      "destination_sha256": "a98ff758157910b9fc9d42d5d5dc80c2f4e037afa5f8ea4dee5f5649f03d438d",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/save-all.svg",
+      "destination": "src/wuwaterm_client/resources/icons/save-all.svg",
+      "mode": "100644",
+      "git_blob": "cc427bbdc682a5ffd6fcf644ef2a6f9f21478962",
+      "sha256": "1cbf29694fdef63780b1ddbd44be764fcd1dc6266748de3935b810cbc297e865",
+      "destination_sha256": "1cbf29694fdef63780b1ddbd44be764fcd1dc6266748de3935b810cbc297e865",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/save.svg",
+      "destination": "src/wuwaterm_client/resources/icons/save.svg",
+      "mode": "100644",
+      "git_blob": "07af0708302018606f9619adb2d4d6ec2175db57",
+      "sha256": "ee9d56a7fec4b20dd6689546d41f68219ea8cbd67f99bd17a1bdaff5be6edb53",
+      "destination_sha256": "ee9d56a7fec4b20dd6689546d41f68219ea8cbd67f99bd17a1bdaff5be6edb53",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/search.svg",
+      "destination": "src/wuwaterm_client/resources/icons/search.svg",
+      "mode": "100644",
+      "git_blob": "03e442a5440cff92c219fe3a3c1f2b0788d30701",
+      "sha256": "283d371c2e433817bb9c0c8310caa6c77fa4177c0f4f1168d9c83b97af7389dc",
+      "destination_sha256": "283d371c2e433817bb9c0c8310caa6c77fa4177c0f4f1168d9c83b97af7389dc",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/settings.svg",
+      "destination": "src/wuwaterm_client/resources/icons/settings.svg",
+      "mode": "100644",
+      "git_blob": "4c6263af909841a3911f41a385021778eacba736",
+      "sha256": "0ae27fd0f81999229e3127ac96c5b32edfea448e291d509e76212b917551d66b",
+      "destination_sha256": "0ae27fd0f81999229e3127ac96c5b32edfea448e291d509e76212b917551d66b",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/undo-2.svg",
+      "destination": "src/wuwaterm_client/resources/icons/undo-2.svg",
+      "mode": "100644",
+      "git_blob": "3e93594c0a400186e7f6e8f1d3981dc82cffe7e8",
+      "sha256": "efad2edbbd2be6038cc23fd64df2d012fad5cc6460dfbf227cfa3d990e9e897f",
+      "destination_sha256": "efad2edbbd2be6038cc23fd64df2d012fad5cc6460dfbf227cfa3d990e9e897f",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/waves-horizontal.svg",
+      "destination": "src/wuwaterm_client/resources/icons/waves-horizontal.svg",
+      "mode": "100644",
+      "git_blob": "7a14fb375e540587914c5a9c209fa75f37736ad6",
+      "sha256": "b31f6534ef601e7c138922e99b0557ae61db7e5704c1a05806ecb78b2eaad443",
+      "destination_sha256": "b31f6534ef601e7c138922e99b0557ae61db7e5704c1a05806ecb78b2eaad443",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/icons/x.svg",
+      "destination": "src/wuwaterm_client/resources/icons/x.svg",
+      "mode": "100644",
+      "git_blob": "e31794349d3eecea1b3ae8e974b68bb8f4becda7",
+      "sha256": "4a9cdab38fbb96162e7dace28e33f4ca0e49d8963a6162abc3d4691b7d675117",
+      "destination_sha256": "4a9cdab38fbb96162e7dace28e33f4ca0e49d8963a6162abc3d4691b7d675117",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/theme_dark.qss",
+      "destination": "src/wuwaterm_client/resources/theme_dark.qss",
+      "mode": "100644",
+      "git_blob": "b689c8fb048bfae847f462e3a75db92a9efc05b1",
+      "sha256": "82f8385141ab0c111bd67e66225d552be2fd2e57c2483517a897ef660ae4ac1e",
+      "destination_sha256": "82f8385141ab0c111bd67e66225d552be2fd2e57c2483517a897ef660ae4ac1e",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/resources/theme_light.qss",
+      "destination": "src/wuwaterm_client/resources/theme_light.qss",
+      "mode": "100644",
+      "git_blob": "85e1ecd6ae64ceea28ffb6fd16ca1a1950e418f3",
+      "sha256": "cda7539f06f8f713e34f0675d29553d972832acd15ea4268cc05b2f7817be285",
+      "destination_sha256": "cda7539f06f8f713e34f0675d29553d972832acd15ea4268cc05b2f7817be285",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/strings.py",
+      "destination": "src/wuwaterm_client/strings.py",
+      "mode": "100644",
+      "git_blob": "a83d2413d642eacd7428079d970e09a9222cdf09",
+      "sha256": "20921703a87de030184b23d84c45447c78f8984065743ff8c695f1aeadd0c7e5",
+      "destination_sha256": "20921703a87de030184b23d84c45447c78f8984065743ff8c695f1aeadd0c7e5",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/theme.py",
+      "destination": "src/wuwaterm_client/theme.py",
+      "mode": "100644",
+      "git_blob": "4a1cec2893a423a7cea24a6b8b7ee8018721e1bc",
+      "sha256": "70893c5314f39e8e3fd2791a1c7bfc0f2785bedf0fd90305b615655c4c3d53a7",
+      "destination_sha256": "70893c5314f39e8e3fd2791a1c7bfc0f2785bedf0fd90305b615655c4c3d53a7",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/__init__.py",
+      "destination": "src/wuwaterm_client/ui/__init__.py",
+      "mode": "100644",
+      "git_blob": "6a66d9cc3ab6b91a65b40039935ebfd81554f7fd",
+      "sha256": "92c08546a98aede9cc8d0b8db9533f0c4034864fd4ef9c63cfcbab209d443d6a",
+      "destination_sha256": "92c08546a98aede9cc8d0b8db9533f0c4034864fd4ef9c63cfcbab209d443d6a",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/components.py",
+      "destination": "src/wuwaterm_client/ui/components.py",
+      "mode": "100644",
+      "git_blob": "f23f45fdc4afa170c01aabe92c4e7d32de4062ae",
+      "sha256": "35ce03ae5a9844f95cba14b132602e43f507da75c9b578dd4b63c6e793398e41",
+      "destination_sha256": "35ce03ae5a9844f95cba14b132602e43f507da75c9b578dd4b63c6e793398e41",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/error_presentation.py",
+      "destination": "src/wuwaterm_client/ui/error_presentation.py",
+      "mode": "100644",
+      "git_blob": "98b79317a011913506e7d87f1a2ee318ee3298c6",
+      "sha256": "1954a58b06f81d74f77513eef5887d76b0444a8a1731f8039671b44e79029228",
+      "destination_sha256": "1954a58b06f81d74f77513eef5887d76b0444a8a1731f8039671b44e79029228",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/first_run_dialog.py",
+      "destination": "src/wuwaterm_client/ui/first_run_dialog.py",
+      "mode": "100644",
+      "git_blob": "3c797ca11915e7ce4efa04da9ab4920cdc3b8585",
+      "sha256": "347c61c6160abc22bad5c0f03ef0c837a043ba8c63c3bb1c63700eaf93fda051",
+      "destination_sha256": "347c61c6160abc22bad5c0f03ef0c837a043ba8c63c3bb1c63700eaf93fda051",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/icons.py",
+      "destination": "src/wuwaterm_client/ui/icons.py",
+      "mode": "100644",
+      "git_blob": "3b2acd108072d7213f2251f8270300d303506033",
+      "sha256": "417338efaf1db2890bcaed555067a720d0b5e3ff947046a176a0d63f8fbf6c9c",
+      "destination_sha256": "417338efaf1db2890bcaed555067a720d0b5e3ff947046a176a0d63f8fbf6c9c",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/main_window.py",
+      "destination": "src/wuwaterm_client/ui/main_window.py",
+      "mode": "100644",
+      "git_blob": "c5b91b81e5a75cdc6b41b090ca311b6a8433abe8",
+      "sha256": "43eb1765128a5cac24c3c5d7f59683f392acec64a6c083e4d7bb6bf44d3777d9",
+      "destination_sha256": "43eb1765128a5cac24c3c5d7f59683f392acec64a6c083e4d7bb6bf44d3777d9",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/manuscript_view.py",
+      "destination": "src/wuwaterm_client/ui/manuscript_view.py",
+      "mode": "100644",
+      "git_blob": "066236582d90a77561aba24a2a6a154e9fbd464e",
+      "sha256": "6c6959ea6db85ec2ab044efea36e29ec433fad05000f21deace605ee9ed338b6",
+      "destination_sha256": "6c6959ea6db85ec2ab044efea36e29ec433fad05000f21deace605ee9ed338b6",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/settings_dialog.py",
+      "destination": "src/wuwaterm_client/ui/settings_dialog.py",
+      "mode": "100644",
+      "git_blob": "d19dc1d819e98bc4435eba9839dace789a01a8ff",
+      "sha256": "327b6ea2fccee84f3015c0ba5325a6ced615248c4e032bad58a9c1fc865ac0f2",
+      "destination_sha256": "327b6ea2fccee84f3015c0ba5325a6ced615248c4e032bad58a9c1fc865ac0f2",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/status_view.py",
+      "destination": "src/wuwaterm_client/ui/status_view.py",
+      "mode": "100644",
+      "git_blob": "0640eaf9870c76ecf8afb702b0a81f3ca6694586",
+      "sha256": "e82e47a926f52a3d70fb07fffec62763450ec1e663ad662811148b31d4a62a58",
+      "destination_sha256": "e82e47a926f52a3d70fb07fffec62763450ec1e663ad662811148b31d4a62a58",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/terms_view.py",
+      "destination": "src/wuwaterm_client/ui/terms_view.py",
+      "mode": "100644",
+      "git_blob": "80dff46039f789ddf1bb683ac187c9d3442dd7f8",
+      "sha256": "cf477181f0fc5fe3ff276001f3fa43c7c231b6f9882897a4fbc53c1d438cc7fa",
+      "destination_sha256": "cf477181f0fc5fe3ff276001f3fa43c7c231b6f9882897a4fbc53c1d438cc7fa",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/token_dialog.py",
+      "destination": "src/wuwaterm_client/ui/token_dialog.py",
+      "mode": "100644",
+      "git_blob": "42f159a5e3df15a114259716a7aa02c943bb420e",
+      "sha256": "374f1b1e4823a740203e1b5a6a6d732f6d2908fd17145158d2b239a9a4ac8cce",
+      "destination_sha256": "374f1b1e4823a740203e1b5a6a6d732f6d2908fd17145158d2b239a9a4ac8cce",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/src/wuwaterm_client/ui/translate_view.py",
+      "destination": "src/wuwaterm_client/ui/translate_view.py",
+      "mode": "100644",
+      "git_blob": "5bdd340e344bf23276f22c6b283694ecb5feeaa0",
+      "sha256": "95d18103fd206a5a079ebd188b1e0f69f8dffe6dfcf74884180859974542c6e9",
+      "destination_sha256": "95d18103fd206a5a079ebd188b1e0f69f8dffe6dfcf74884180859974542c6e9",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/conftest.py",
+      "destination": "tests/conftest.py",
+      "mode": "100644",
+      "git_blob": "0ea0940a82b3ba758a218c123bdcec4628b898ea",
+      "sha256": "2c3854d1a69213b6ea1636f43e9cc8dfe66e643ef343ced3fb47d80fba533a35",
+      "destination_sha256": "bade0e81d7b11cdf6815f0840f7ef023f26e303c7cc5984c3f24acc956636580",
+      "status": "adapted",
+      "reason": "strict immutable cross-product contract inputs"
+    },
+    {
+      "source": "client/tests/test_api.py",
+      "destination": "tests/test_api.py",
+      "mode": "100644",
+      "git_blob": "9af5ec1c8aff2ec12adb978250a34e16e6c642a6",
+      "sha256": "682cf86fa83a2b261bfde030aec1c923419beed65ea794b04839805c1836b2fe",
+      "destination_sha256": "682cf86fa83a2b261bfde030aec1c923419beed65ea794b04839805c1836b2fe",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_api_version_compat.py",
+      "destination": "tests/test_api_version_compat.py",
+      "mode": "100644",
+      "git_blob": "40df80770f5a31883b3761cb0efa3108881d43c7",
+      "sha256": "6b739fe6cffd5e78df05e446afc4e88dd874a133ae188446c796f41b3876783c",
+      "destination_sha256": "c4ceb494bbe3691c92def28852ae13cd924416bb60277e09997a6e23179afbff",
+      "status": "adapted",
+      "reason": "independent root and pinned Core source"
+    },
+    {
+      "source": "client/tests/test_config.py",
+      "destination": "tests/test_config.py",
+      "mode": "100644",
+      "git_blob": "4019455e341f150d912e04e5f57758f1e0964e6b",
+      "sha256": "8ba1af49dfa76464b5d07b92a4175e9fa893f5f39829429f7c4af621619ff1be",
+      "destination_sha256": "8ba1af49dfa76464b5d07b92a4175e9fa893f5f39829429f7c4af621619ff1be",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_config_persistence.py",
+      "destination": "tests/test_config_persistence.py",
+      "mode": "100644",
+      "git_blob": "38e23e545d31aff23f5daf7d779f0633b4fddf38",
+      "sha256": "fed201e53358ca692758df7da0249ee425ee5253ecaf5513b95c1b126be0c0a4",
+      "destination_sha256": "fed201e53358ca692758df7da0249ee425ee5253ecaf5513b95c1b126be0c0a4",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_credentials.py",
+      "destination": "tests/test_credentials.py",
+      "mode": "100644",
+      "git_blob": "33be51ae8bb7a6c6ee8fc5b7867ee5fd35043ee8",
+      "sha256": "c22bf44d1ce7055ec0fba35ddd389a5ae53baa0193dc1f72b17eefad1a91b49d",
+      "destination_sha256": "c22bf44d1ce7055ec0fba35ddd389a5ae53baa0193dc1f72b17eefad1a91b49d",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_error_dispatch.py",
+      "destination": "tests/test_error_dispatch.py",
+      "mode": "100644",
+      "git_blob": "361a72bc0ec0131a494f0c08a379d7eb30716574",
+      "sha256": "a1dc112e3e4d489f1e09a8a254f6c87523ec9e951d5af6febfe00919e45a59a4",
+      "destination_sha256": "a1dc112e3e4d489f1e09a8a254f6c87523ec9e951d5af6febfe00919e45a59a4",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_label_association.py",
+      "destination": "tests/test_label_association.py",
+      "mode": "100644",
+      "git_blob": "9e2541fa27d9a9077c99fd6f26a010ec529545bc",
+      "sha256": "2d1649c417295a2e62b005a9d19773280ae6eb5be11a48f022fb920c54324075",
+      "destination_sha256": "2d1649c417295a2e62b005a9d19773280ae6eb5be11a48f022fb920c54324075",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_manuscript.py",
+      "destination": "tests/test_manuscript.py",
+      "mode": "100644",
+      "git_blob": "af7ba61c55becc901b54effc1cba16e25f661119",
+      "sha256": "0165d89e64a29c7b1bdfbcc018e79feab935634ec195c7de67dc7d6b83cedd75",
+      "destination_sha256": "f362ea6e34b6244eaa47a148dd78244d606b49f7cb7c20c50c9884a6ae8c2ed9",
+      "status": "adapted",
+      "reason": "require pinned Web source when CI contracts are required; decode Node IPC as UTF-8"
+    },
+    {
+      "source": "client/tests/test_manuscript_view.py",
+      "destination": "tests/test_manuscript_view.py",
+      "mode": "100644",
+      "git_blob": "20c9842442f27cfb5af1a597821ca5dae0178b32",
+      "sha256": "7e7b1d5f77935fea6fe6fd0f23125384445598bc7dcdaddcf67e02d66392e725",
+      "destination_sha256": "30d8019cdf7254fa5d8e1eb53a0479fab17c670aac13dcf4497d76405d94d16d",
+      "status": "adapted",
+      "reason": "decode Node IPC as UTF-8 for cross-product manuscript validation"
+    },
+    {
+      "source": "client/tests/test_packaging_entry.py",
+      "destination": "tests/test_packaging_entry.py",
+      "mode": "100644",
+      "git_blob": "1764de684cf8c73977c3a0311ef0d5a08696b708",
+      "sha256": "65ad9073a033af6f0a5716d254999ec2221e30872f0a653e0886d455b8461750",
+      "destination_sha256": "65ad9073a033af6f0a5716d254999ec2221e30872f0a653e0886d455b8461750",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_qt_translations.py",
+      "destination": "tests/test_qt_translations.py",
+      "mode": "100644",
+      "git_blob": "0811c40f13ab126332820cf717a47115c441bdcf",
+      "sha256": "42f90ae9547a6d77838efaa612f9d3fcc9ff646607c866d4962bdc172335d276",
+      "destination_sha256": "42f90ae9547a6d77838efaa612f9d3fcc9ff646607c866d4962bdc172335d276",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_review_api.py",
+      "destination": "tests/test_review_api.py",
+      "mode": "100644",
+      "git_blob": "0caa527d6954d23d0e5a9f83a426fff6c37d3567",
+      "sha256": "5c8112f1a648deef1305700e12f75336fb14a8610d9e6dd7b844ed7af00c2699",
+      "destination_sha256": "5c8112f1a648deef1305700e12f75336fb14a8610d9e6dd7b844ed7af00c2699",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_terms_category_labels.py",
+      "destination": "tests/test_terms_category_labels.py",
+      "mode": "100644",
+      "git_blob": "3d8a9fa82e9ee1f65bcfe9015f67aac906672494",
+      "sha256": "878ba460703b5f85531551b4c37e57a072697b5b7d6b2010d555ac2f18ba923b",
+      "destination_sha256": "878ba460703b5f85531551b4c37e57a072697b5b7d6b2010d555ac2f18ba923b",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_terms_lookup.py",
+      "destination": "tests/test_terms_lookup.py",
+      "mode": "100644",
+      "git_blob": "4829b3b344e7c16b02bdde20a9aa2af4ba006a07",
+      "sha256": "5dbd89b5c20aaad218a981e78ca99c099a4ea3154760d36385d517617afe2ee5",
+      "destination_sha256": "5dbd89b5c20aaad218a981e78ca99c099a4ea3154760d36385d517617afe2ee5",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_theme_resources.py",
+      "destination": "tests/test_theme_resources.py",
+      "mode": "100644",
+      "git_blob": "af385a41ae275182df26646a16807b4df1faea7b",
+      "sha256": "9b245fa7f66ddd6b51b14c07fb0c1638bf6873054df4eb121b2ccac2c33d46b9",
+      "destination_sha256": "9b245fa7f66ddd6b51b14c07fb0c1638bf6873054df4eb121b2ccac2c33d46b9",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_translate_view_status.py",
+      "destination": "tests/test_translate_view_status.py",
+      "mode": "100644",
+      "git_blob": "d7c7d7172569fcb82183a498d751283074bbcf31",
+      "sha256": "d1fe04711ae44b50f5f79b85b4c996f18c92a9160dcfb90222c172df14df8f50",
+      "destination_sha256": "d1fe04711ae44b50f5f79b85b4c996f18c92a9160dcfb90222c172df14df8f50",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_transport_security.py",
+      "destination": "tests/test_transport_security.py",
+      "mode": "100644",
+      "git_blob": "61f3f05d1204d3ce4586af716ebe434edb0afe35",
+      "sha256": "e598ad12c3446339cdefe2dbc9b651d86f1867e64515d483dfa4f4ba6a1db667",
+      "destination_sha256": "e598ad12c3446339cdefe2dbc9b651d86f1867e64515d483dfa4f4ba6a1db667",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_ui_endpoint_state.py",
+      "destination": "tests/test_ui_endpoint_state.py",
+      "mode": "100644",
+      "git_blob": "d8910b14a66aa00ae702d6a8fe7e6f1d63161c89",
+      "sha256": "f6938de0a5165ad00c1d392df55b66a6ecea33d46a3890c3c74e9d66a4d20115",
+      "destination_sha256": "f6938de0a5165ad00c1d392df55b66a6ecea33d46a3890c3c74e9d66a4d20115",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_ui_smoke.py",
+      "destination": "tests/test_ui_smoke.py",
+      "mode": "100644",
+      "git_blob": "b0e14693b1399cc7619c7fd235c2a14428baedbb",
+      "sha256": "c12a1a680d797dde0593063fe1010b039cc937b6f1dc0118edb68fdbf8a6b66a",
+      "destination_sha256": "c12a1a680d797dde0593063fe1010b039cc937b6f1dc0118edb68fdbf8a6b66a",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_unconfigured_endpoint.py",
+      "destination": "tests/test_unconfigured_endpoint.py",
+      "mode": "100644",
+      "git_blob": "941ef8480f660007f46fcd0c372532a3f9f20d6f",
+      "sha256": "ac70d957caade7c083f624f1c93245e3fde00201d94143dd45a804f5f1df9373",
+      "destination_sha256": "ac70d957caade7c083f624f1c93245e3fde00201d94143dd45a804f5f1df9373",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_view_parity_with_main.py",
+      "destination": "tests/test_view_parity_with_main.py",
+      "mode": "100644",
+      "git_blob": "1fc1649ca344021c53ba55ab1b8dc95e77475aba",
+      "sha256": "68aa392acd84010554883be6c1e95b0ddd0652928e03acbeb3a1938544ca46a6",
+      "destination_sha256": "68aa392acd84010554883be6c1e95b0ddd0652928e03acbeb3a1938544ca46a6",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_view_sibling_consistency.py",
+      "destination": "tests/test_view_sibling_consistency.py",
+      "mode": "100644",
+      "git_blob": "39b4f0c04600a60cc5e5f2f240b913c69af9761c",
+      "sha256": "22d270738ecb705292f07a3989521dace3992e1526f003c3a160c30d68ab41bd",
+      "destination_sha256": "22d270738ecb705292f07a3989521dace3992e1526f003c3a160c30d68ab41bd",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_visual_resources.py",
+      "destination": "tests/test_visual_resources.py",
+      "mode": "100644",
+      "git_blob": "6820ac0909225e6dc18de9036b7ae4f7bf2cf72b",
+      "sha256": "6724007685fff210324da1d0d38bafab627704ed6c2074abf567647ace8e2678",
+      "destination_sha256": "6724007685fff210324da1d0d38bafab627704ed6c2074abf567647ace8e2678",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_workbench_flows.py",
+      "destination": "tests/test_workbench_flows.py",
+      "mode": "100644",
+      "git_blob": "7359a1235831020182e762c2c4ef44900edfc51f",
+      "sha256": "af72a63c8d70bbd43214915404d7b496142686652b6a37e25aa547f2d94231d6",
+      "destination_sha256": "af72a63c8d70bbd43214915404d7b496142686652b6a37e25aa547f2d94231d6",
+      "status": "unchanged"
+    },
+    {
+      "source": "client/tests/test_workspace_fit.py",
+      "destination": "tests/test_workspace_fit.py",
+      "mode": "100644",
+      "git_blob": "8cec761e109cf8f98eab55709b7a35b08633d2e1",
+      "sha256": "0773f9b7dd5ca4698a5c87a8bac577d97cd6ae793b7abb326a86e3028808810d",
+      "destination_sha256": "0773f9b7dd5ca4698a5c87a8bac577d97cd6ae793b7abb326a86e3028808810d",
+      "status": "unchanged"
+    }
+  ],
+  "description": "Snapshot of the initial extraction; destination hashes describe this candidate, not future releases."
+}

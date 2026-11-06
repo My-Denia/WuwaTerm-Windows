@@ -1,0 +1,19 @@
+{
+  "core": {
+    "repository": "My-Denia/WuwaTerm",
+    "commit": "cc5743df0e807c42e4b669564fd8b4d0a465b79c",
+    "files": {
+      "src/wuwaterm_api/__init__.py": "e0372e6495d03878ee3c76ac87c5e0cb334d31403c776c90bac1e80687222502",
+      "docs/api/openapi.json": "8e5aa34987b8bc1d13174a0bd3116d53778d7b32d77321fe67265c9be891fe84"
+    }
+  },
+  "web": {
+    "repository": "My-Denia/WuwaTerm-Web",
+    "commit": "31ab4c985ecf16daf00276e73b863b5ec2e6872f",
+    "files": {
+      "package.json": "bd0469d4231201ff9b2776dacfe49d2e05ed4728cc5daa48ee7e7bc0e7fa6573",
+      "lib/manuscript.js": "c57af151bff324d51b544f3dc732f7676597b673438969d468244e4b105ee66c",
+      "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69"
+    }
+  }
+}
