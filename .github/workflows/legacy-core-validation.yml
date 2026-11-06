@@ -1,0 +1,139 @@
+name: Historical Core client validation
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full SHA of a bundled-client Core main ancestor
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: windows-latest
+    env:
+      # Historical tests compare committed resource bytes and read UTF-8 text.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+      PYTHONUTF8: '1'
+    steps:
+      - name: Validate source identifier
+        shell: bash
+        env:
+          SOURCE: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE" =~ ^[0-9a-f]{40}$ ]]
+      # Reusable workflows see the caller's github.repository. Select Core
+      # explicitly instead of checking out the caller or this workflow repo.
+      - uses: actions/checkout@v7
+        with:
+          repository: My-Denia/WuwaTerm
+          ref: ${{ inputs.source_commit }}
+          path: core
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm historical Core source
+        shell: bash
+        working-directory: core
+        env:
+          SOURCE: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          case "$(git remote get-url origin)" in
+            https://github.com/My-Denia/WuwaTerm|https://github.com/My-Denia/WuwaTerm.git) ;;
+            *) echo 'Unexpected Core origin' >&2; exit 1 ;;
+          esac
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          test "$(git cat-file -t "$SOURCE")" = commit
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          # The inclusive interval is the supported bundled-client epoch:
+          # v0.6.1 through the last bundled source on actual Core main.
+          floor=13f601871566d89b372ecf31b45345f5387b601c
+          last=64e293cf53ba9106a4a67639fd5c6b0857e6c384
+          git merge-base --is-ancestor "$floor" "$SOURCE"
+          git merge-base --is-ancestor "$SOURCE" "$last"
+          git merge-base --is-ancestor "$SOURCE" refs/remotes/origin/main
+          git merge-base --is-ancestor "$last" refs/remotes/origin/main
+          for file in client/pyproject.toml client/build.ps1 client/WuwaTerm.spec \
+                      client/main.py client/src/wuwaterm_client/__init__.py \
+                      client/tests/conftest.py client/tests/test_api.py \
+                      client/tests/test_packaging_entry.py; do
+            test -f "$file" || { echo "Missing historical client file: $file" >&2; exit 1; }
+          done
+          echo "Validated Core source: $SOURCE"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Create client environment
+        working-directory: core
+        run: python -m venv client/.venv
+      - name: Update client pip
+        working-directory: core
+        run: client/.venv/Scripts/python.exe -m pip install -U pip
+      - name: Install historical client dependencies
+        working-directory: core
+        run: client/.venv/Scripts/python.exe -m pip install -e 'client[dev,build]'
+      # The old Windows workflow did not provide a Web checkout; Core's Linux
+      # contract job separately requires the historical Web/client file test.
+      - name: Client test suite
+        working-directory: core/client
+        run: .venv/Scripts/python.exe -m pytest
+      # The historical build script runs the built EXE self-check itself.
+      - name: One-folder PyInstaller build
+        working-directory: core
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File client/build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate ZIP and self-check extracted executable
+        working-directory: core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archives = @(Get-ChildItem client/dist/WuwaTerm-*-windows-x64.zip -File)
+          if ($archives.Count -ne 1 -or $archives[0].Length -le 0) {
+            throw 'Expected one nonempty Windows ZIP'
+          }
+          $version = & client/.venv/Scripts/python.exe -c 'import wuwaterm_client; print(wuwaterm_client.__version__)'
+          if ($LASTEXITCODE -ne 0 -or $archives[0].Name -ne "WuwaTerm-$version-windows-x64.zip") {
+            throw 'ZIP version mismatch'
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archives[0].FullName)
+          try {
+            $names = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            if ('WuwaTerm/WuwaTerm.exe' -notin $names -or -not ($names | Where-Object { $_ -like 'WuwaTerm/*.qss' })) {
+              throw 'ZIP lacks the executable or stylesheets'
+            }
+          } finally { $zip.Dispose() }
+          $destination = Join-Path $env:RUNNER_TEMP 'historical-core-extracted'
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $destination
+          $exe = Join-Path $destination 'WuwaTerm/WuwaTerm.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'Extracted ZIP lacks executable' }
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          $check = Start-Process -FilePath $exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw "Extracted executable self-check failed: $($check.ExitCode)" }
+      - name: Build output must stay out of the working tree
+        shell: bash
+        working-directory: core
+        run: |
+          set -euo pipefail
+          dirt=$(git status --porcelain)
+          test -z "$dirt" || { echo "$dirt" >&2; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: historical-core-windows-validation
+          path: core/client/dist/WuwaTerm-*-windows-x64.zip
+          if-no-files-found: error
