@@ -285,6 +285,20 @@ class Basis:
                 self.semantic_required and not semantic_part_valid(result))
 
 
+# COORDINATE RULE (alongside the reuse rule above; one place):
+# * Identity is the original report coordinates plus the text versions they
+#   were reported against: ``LiveIssue.issue`` spans with ``source_revision``/
+#   ``target_revision`` (``LiveIssue.occurrence``, decision records,
+#   ``make_decision``, ``_matches_decision``). These never change.
+# * Every position comparison uses current coordinates: ``LiveIssue``
+#   ``source_span``/``target_span``/``suggestion_span`` and the result cores,
+#   which edits shift (``Session.apply_edit``) and undo/redo restore
+#   (``Session.snapshot``/``restore``). Re-review compares recovered decision
+#   spans with ``_current_view`` of each issue; highlighting, liveness and
+#   accept/adjust use the current spans.
+# A decision's own spans are compared only against the text version they
+# belong to (recovered with ``recover_span`` first).
+
 TERM_CONTRACT = "review-v2"
 
 
@@ -427,7 +441,9 @@ def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], texts: dict[
     own = {_key(d) for d in decisions for issue in issues
            if _matches_decision(issue, d) and _key(d) not in issue.preexisting}
     prior = [d for d in decisions if _key(d) not in own]
-    outcomes = reconcile(prior, texts, source, target, [issue.issue for issue in issues])
+    # Compare at current positions (see COORDINATE RULE); identity stays with
+    # the original report coordinates and versions held in ``issue.issue``.
+    outcomes = reconcile(prior, texts, source, target, [_current_view(issue) for issue in issues])
     rank = {STATE_IGNORED_CARRIED: 3, "previously_applied": 2, STATE_NEEDS_RECONFIRM: 1, STATE_PENDING: 0}
     best: dict[int, tuple[str, dict]] = {}
 
@@ -447,6 +463,11 @@ def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], texts: dict[
         issue.previously_applied = state == "previously_applied"
         issue.base_state = STATE_PENDING if issue.previously_applied else state
         issue.previous = decision
+
+
+def _current_view(issue: LiveIssue) -> dict:
+    """The issue as it sits in the current text, for position comparisons."""
+    return {**issue.issue, "source_span": issue.source_span, "target_span": issue.target_span}
 
 
 def _key(decision: dict) -> str:

@@ -940,3 +940,92 @@ def test_an_ignore_survives_reopening_and_an_unrelated_edit_before_the_next_revi
         await settle(reopened)
         assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending", "ignored_carried"]
     asyncio.run(scenario())
+
+
+# -- coordinate rule: compare at current positions, identify by original ----
+
+
+def _reopen(path, server, monkeypatch) -> ManuscriptView:
+    view = make_view(server, "", "")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+    view.open_document()
+    return view
+
+
+def _prepend(editor, text: str) -> None:
+    cursor = editor.textCursor()
+    cursor.setPosition(0)
+    editor.setTextCursor(cursor)
+    editor.insertPlainText(text)
+
+
+def test_a_carried_ignore_survives_an_earlier_edit_and_a_re_review(qapp, tmp_path, monkeypatch) -> None:
+    source = "甲" * 1200 + "\n\n" + "乙不会出发。" + "乙" * 900
+    target = "A" * 1200 + "\n\nHe will leave. " + "B" * 1000
+
+    def issues(s, t):
+        return [issue(s, t, source_quote="不会", target_quote="will leave", replace="will leave",
+                      replacement="will not leave")] if "不会" in s else []
+
+    async def scenario():
+        view = make_view(Server(issues=issues), source, target)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        view.ignore_button.click()
+        view._path = tmp_path / "ignore.json"
+        assert view.save_document()
+        server = Server(issues=issues)
+        reopened = _reopen(view._path, server, monkeypatch)
+        reopened._start_review()
+        await settle(reopened)
+        [live] = reopened._session.issues()
+        assert reopened._issue_state(live) == "ignored_carried"
+        sent = len(server.sent("/v1/semantic-reviews"))
+        _prepend(reopened.source_edit, "新")
+        reopened._start_review()
+        await settle(reopened)
+        assert len(server.sent("/v1/semantic-reviews")) == sent + 1, "only the edited segment"
+        assert live.source_span["start"] == live.issue["source_span"]["start"] + 1
+        assert reopened._issue_state(live) == "ignored_carried"
+    asyncio.run(scenario())
+
+
+def test_an_ignore_never_carries_to_another_occurrence_through_original_coordinates(qapp, tmp_path, monkeypatch) -> None:
+    a_s, b_s = "甲不会出发。".ljust(1200, "甲"), "乙不会出发。".ljust(1200, "乙")
+    a_t, b_t = "A will leave. ".ljust(1200, "A"), "B will leave. ".ljust(1200, "B")
+    source, target = a_s + "\n\n" + b_s, a_t + "\n\n" + b_t
+
+    def issue_for(s, t):
+        reported = issue(s, t, source_quote="不会", target_quote="will leave", replace="will leave",
+                         replacement="will not leave")
+        reported["fingerprint"] = "e" * 32  # A and B share a fingerprint
+        return [reported]
+
+    async def scenario():
+        view = make_view(Server(issues=lambda s, t: issue_for(s, t) if s.startswith("甲") else []), source, target)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        view.ignore_button.click()  # A only
+        view._path = tmp_path / "ignore-A.json"
+        assert view.save_document()
+        # The next run reports only B.
+        server = Server(issues=lambda s, t: issue_for(s, t) if s.startswith("乙") else [])
+        reopened = _reopen(view._path, server, monkeypatch)
+        reopened._start_review()
+        await settle(reopened)
+        [live] = reopened._session.issues()
+        assert reopened._issue_state(live) == "needs_reconfirm"
+        # After a prepended paragraph, A's recovered place equals B's original
+        # coordinates; comparing at current positions keeps B unhandled.
+        _prepend(reopened.source_edit, "新" * 1200 + "\n\n")
+        _prepend(reopened.target_edit, "C" * 1200 + "\n\n")
+        reopened._start_review()
+        await settle(reopened)
+        assert len(reopened._current_pairs()) == 3 and len(server.sent("/v1/semantic-reviews")) == 3
+        assert reopened._issue_state(live) == "needs_reconfirm"
+        assert reopened.semantic_track_button.text() == strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=1)
+    asyncio.run(scenario())
