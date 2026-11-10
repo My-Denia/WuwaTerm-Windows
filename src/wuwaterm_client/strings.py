@@ -477,7 +477,7 @@ TRANSLATE_DIAGNOSTICS = "请求诊断"
 SETTINGS_TOKEN_STATUS_UNKNOWN = "无法读取凭据存储；凭据状态未知。"
 MANUSCRIPT_SOURCE_PLACEHOLDER = "在此输入或粘贴原文…"
 MANUSCRIPT_TARGET_PLACEHOLDER = "在此输入或粘贴译文…"
-MANUSCRIPT_REVIEW_LIMIT = "审校每侧最多 2,000 个字符；较长稿件仍可编辑和保存。"
+MANUSCRIPT_REVIEW_LIMIT = "超过 2,000 字的稿件按段审校；需要手动切分的段落会在“段落”列表中提示。"
 MANUSCRIPT_RULE_TERM_PAIR = "术语配对"
 TERMS_FILTER_ALL = "全部分类"
 TERMS_FILTER_LABEL = "分类筛选"
@@ -490,3 +490,109 @@ SETTINGS_CATEGORY_LABEL = "设置分类"
 MANUSCRIPT_NO_FINDINGS = "本次报告没有术语发现。"
 TERMS_DETAILS_META = "{category} · 匹配度 {score} · {reason}"
 TRANSLATE_COPY_RESULT = "复制译文"
+
+# -- Manuscript semantic review (semantic-review-v1) ----------------------
+# Model issues are suspicions, never verdicts: the wording says so, and the
+# deterministic term track keeps its own name and group.
+MANUSCRIPT_TRACK_TERMS = "术语约束 {count}"
+MANUSCRIPT_TRACK_SEMANTIC = "语义疑点 {count}"
+MANUSCRIPT_TRACK_SEGMENTS = "段落 {count}"
+MANUSCRIPT_TRACK_LABEL = "审校分组"
+MANUSCRIPT_PANEL_TITLE = "审校"
+MANUSCRIPT_TERMS_NOTE = "词面匹配，确定性规则；不调用模型。"
+MANUSCRIPT_SEMANTIC_NOTE = "以下是模型提出的疑点，可能有误，请结合上下文判断。没有列出的地方也不代表一定没有问题。"
+MANUSCRIPT_SEMANTIC_UNAVAILABLE = "当前服务器没有提供语义审校，本次只做术语审校。"
+MANUSCRIPT_SEMANTIC_NOT_RUN = "尚未进行语义审校。"
+MANUSCRIPT_SEMANTIC_PROMPT = "选择一条疑点查看详情。"
+MANUSCRIPT_SEMANTIC_NONE = "已审的段落里模型没有提出疑点。"
+MANUSCRIPT_SEMANTIC_PROGRESS = "语义审校：已审 {done}/{total} 段 · 待处理 {pending} 条"
+MANUSCRIPT_SEMANTIC_RUNNING = "正在审校第 {index} 段（{done}/{total}）…"
+MANUSCRIPT_SEMANTIC_PAUSED = "已暂停，已完成 {done}/{total} 段，可以继续。"
+MANUSCRIPT_SEMANTIC_QUOTA = "服务暂时限额，已完成 {done}/{total} 段；稍后可以继续。"
+MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS = "{count} 段未能完成，可以继续审校重试。"
+MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED = "翻译方向已更改，之前的语义疑点已清除。"
+MANUSCRIPT_REVIEW_CONTINUE = "继续审校"
+MANUSCRIPT_REVIEW_PAUSE = "暂停"
+MANUSCRIPT_CATEGORY = {
+    "omission": "可能漏译",
+    "unsupported_addition": "可能增译",
+    "meaning_shift": "意思可能有偏差",
+    "negation_change": "否定可能改变",
+    "quantity_change": "数量可能改变",
+    "reference_inconsistency": "指代可能不一致",
+    "term_sense": "词义可能用错",
+}
+MANUSCRIPT_CONFIDENCE = {
+    "high": "模型自评把握较高",
+    "medium": "模型自评把握一般",
+    "low": "模型自评把握较低",
+}
+MANUSCRIPT_CONFIDENCE_NOTE = "把握程度是模型的自评，未经校准。"
+MANUSCRIPT_ISSUE_STATE = {
+    "pending": "待处理",
+    "needs_reconfirm": "需重新确认",
+    "stale": "需重新确认",
+    "ignored_carried": "已忽略（沿用上次）",
+    "accepted": "已采纳",
+    "adjusted": "已调整",
+    "ignored": "已忽略",
+}
+MANUSCRIPT_ISSUE_ITEM = "{state} · {category}\n{source} → {target}"
+MANUSCRIPT_ISSUE_NO_SIDE = "（未定位）"
+MANUSCRIPT_ISSUE_RATIONALE = "模型的理由：{rationale}"
+MANUSCRIPT_ISSUE_SUGGESTION = "建议把“{old}”改为“{new}”"
+MANUSCRIPT_ISSUE_ALTERNATIVE = "改用备选：“{new}”"
+MANUSCRIPT_ISSUE_PRIMARY = "使用建议"
+MANUSCRIPT_ISSUE_WITHHELD = "范围较长，请人工调整。"
+MANUSCRIPT_ISSUE_NO_TARGET = "这条疑点只定位到原文，请在译文中手动修改。"
+MANUSCRIPT_ISSUE_NO_SUGGESTION = "模型没有给出可直接采纳的修改。"
+MANUSCRIPT_ISSUE_STALE = "这里的正文已经改动，原来的位置不再可靠；需重新确认，或重新审校这一段。"
+MANUSCRIPT_ISSUE_RECONFIRM = "上次的决定（{decision}）不能自动沿用，需重新确认。"
+MANUSCRIPT_ISSUE_PREVIOUSLY_APPLIED = "此处曾采纳建议，仍被报告。"
+MANUSCRIPT_ISSUE_CARRIED = "沿用了上次的“忽略”：两侧位置和文字都没有变化。"
+MANUSCRIPT_TERM_EFFECT = {
+    "none": "",
+    "alters_official_match": "此建议会改动一处官方译名匹配。如果这里是普通义（例如欢呼声 Encore），可以采纳。",
+    "introduces_official_form": "此建议会引入一处官方译名形式；请确认这里确实指该概念。",
+    "not_checked": "未检查此建议对官方译名匹配的影响。",
+}
+MANUSCRIPT_ACCEPT = "采纳"
+MANUSCRIPT_ADJUST = "调整"
+MANUSCRIPT_IGNORE = "忽略"
+MANUSCRIPT_ADJUST_LABEL = "调整为"
+MANUSCRIPT_ADJUST_APPLY = "应用调整"
+MANUSCRIPT_ACCEPTED = "已采纳这条建议；可以撤销。"
+MANUSCRIPT_ADJUSTED = "已按调整修改译文；可以撤销。"
+MANUSCRIPT_IGNORED = "已忽略这条疑点；可以撤销。"
+MANUSCRIPT_RECONFIRM_NEEDED = "当前译文与疑点记录的位置不一致，未执行替换；需重新确认。"
+MANUSCRIPT_DECISIONS_FULL = "处理记录已满或稿件将超过 1 MiB，这条决定没有记录；请先保存并整理稿件。"
+MANUSCRIPT_ALL_HANDLED = "所有疑点都已处理。"
+MANUSCRIPT_SEGMENTS_NOTE = "长稿按段落配对审校，每段每侧最多 1,800 字。"
+MANUSCRIPT_SEGMENT_ITEM = "第 {number} 段 · {status}（原文 {source} 字，译文 {target} 字）"
+MANUSCRIPT_SEGMENT_STATUS = {
+    "reviewed": "已审",
+    "pending": "待审",
+    "failed": "未完成",
+    "not_reviewed": "模型输出无效，未审",
+    "needs_manual_split": "需要手动切分",
+    "untranslated": "尚未翻译",
+    "unpaired_target": "译文多出一段",
+}
+MANUSCRIPT_SEGMENT_HARD_CUT = "，强制切分"
+MANUSCRIPT_SEGMENT_HINT = {
+    "needs_manual_split": "无法可靠地配对这一段：两侧段落或句子对不上。请在原文和译文的对应位置插入空行，再重新审校。",
+    "untranslated": "这一段还没有译文，可以先翻译。",
+    "unpaired_target": "译文多出一段，在原文里没有对应，可能是增译。这是确定性提示，没有调用模型。",
+    "hard_cut": "此处为强制切分，边界附近可能误判。",
+    "failed": "这一段的请求没有完成，继续审校时会重试。",
+    "not_reviewed": "模型这次的输出无法使用，这一段没有审校；继续审校时会重试。",
+    "truncated": "这一段疑点较多，另有 {count} 条没有显示。",
+    "dropped": "模型提出的 {count} 条疑点无法在正文中定位，已舍弃。",
+}
+MANUSCRIPT_TRANSLATE = "翻译"
+MANUSCRIPT_TRANSLATE_SEGMENT = "翻译此段"
+MANUSCRIPT_TRANSLATING = "正在翻译第 {index}/{total} 段…"
+MANUSCRIPT_TRANSLATED = "已写入机器翻译；请检查后再审校。可以撤销。"
+MANUSCRIPT_TRANSLATE_ONLY_BLANK = "只翻译空白的译文或尚未翻译的段落，不会覆盖已有译文。"
+MANUSCRIPT_TRANSLATE_CHANGED = "翻译期间正文已更改，没有写入译文。"
+MANUSCRIPT_SHORTCUTS = "快捷键：F8 / Shift+F8 下一条/上一条，Ctrl+Enter 采纳，Ctrl+Shift+E 调整，Ctrl+Shift+I 忽略，Ctrl+Shift+R 审校，Ctrl+Shift+T 翻译。"

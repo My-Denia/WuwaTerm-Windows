@@ -45,7 +45,14 @@ def report(source: str, target: str) -> dict:
 
 
 def client_with(handler) -> ApiClient:
-    return ApiClient("https://example.invalid", token_provider=lambda: "test-token", _test_transport=httpx.MockTransport(handler))
+    """A server that predates /v1/capabilities (404) unless the handler answers it."""
+    async def routed(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(404, json={"error": {"code": "invalid_request", "message": "not found"},
+                                             "request_id": "probe"})
+        result = handler(request)
+        return await result if asyncio.iscoroutine(result) else result
+    return ApiClient("https://example.invalid", token_provider=lambda: "test-token", _test_transport=httpx.MockTransport(routed))
 
 
 def install(view: ManuscriptView, source: str, target: str) -> None:

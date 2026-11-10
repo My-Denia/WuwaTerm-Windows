@@ -29,6 +29,7 @@ from .errors import (
     ClientError,
 )
 from .manuscript import valid_report
+from .semantic import encode_request, parse_capabilities, valid_semantic_report
 
 TokenProvider = Callable[[], "str | None"]
 
@@ -433,6 +434,7 @@ class ApiClient:
         *,
         timeout: float | None = None,
         matcher_basis: bool = False,
+        headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         # Before the target is resolved, before a header is attached, before
@@ -443,13 +445,15 @@ class ApiClient:
             raise ClientError(ERROR_NOT_CONFIGURED)
         self._guard_request_target(url)
         try:
-            headers = self._headers()
+            # Extra headers first, so they can never replace the credential.
+            merged = dict(headers) if headers else {}
+            merged.update(self._headers())
             if matcher_basis:
-                headers["X-WuwaTerm-Matcher-Basis"] = "1"
+                merged["X-WuwaTerm-Matcher-Basis"] = "1"
             response = await self._client.request(
                 method,
                 url,
-                headers=headers,
+                headers=merged,
                 timeout=timeout if timeout is not None else self._timeout,
                 **kwargs,
             )
@@ -537,11 +541,15 @@ class ApiClient:
             raise ClientError(ERROR_UNKNOWN) from exc
 
     async def translate(
-        self, text: str, *, to: str | None = None
+        self, text: str, *, to: str | None = None, context: dict[str, Any] | None = None
     ) -> TranslationResult:
         body: dict[str, Any] = {"text": text}
         if to is not None:
             body["to"] = to
+        if context is not None:
+            # The caller decides, from get_capabilities(), whether the server
+            # lists translation-context-v1.
+            body["context"] = context
         response = await self._request(
             "POST",
             "/v1/translations",
@@ -575,3 +583,37 @@ class ApiClient:
         response = await self._request("GET", "/v1/meta")
         return self._parsed(MetaResult.from_json, self._json(response))
 
+    async def get_capabilities(self) -> frozenset[str]:
+        """Optional capabilities the server lists. A server without the
+        endpoint (404) has none."""
+        try:
+            response = await self._request("GET", "/v1/capabilities")
+        except ClientError as exc:
+            if exc.status_code == 404:
+                return frozenset()
+            raise
+        return self._parsed(parse_capabilities, self._json(response))
+
+    async def semantic_review(
+        self, source: str, target: str, direction: str, *,
+        explain_language: str = "zh",
+        before: dict[str, str] | None = None,
+        precedents: Any = (),
+    ) -> dict[str, Any]:
+        content = encode_request(
+            source, target, direction,
+            explain_language=explain_language, before=before, precedents=precedents,
+        )
+        response = await self._request(
+            "POST", "/v1/semantic-reviews",
+            content=content,
+            headers={"Content-Type": "application/json"},
+            timeout=self._translate_timeout,
+        )
+
+        def accept(data: Any) -> dict[str, Any]:
+            if not valid_semantic_report(data, source, target):
+                raise ValueError("review is not a supported semantic report")
+            return data
+
+        return self._parsed(accept, self._json(response))

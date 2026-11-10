@@ -590,7 +590,7 @@ class MainWindow(QMainWindow):
         if not self.manuscript_view.confirm_discard():
             event.ignore()
             return
-        self.manuscript_view._cancel_pending()
+        self.manuscript_view.cancel_background_work()
         super().closeEvent(event)
 
     # -- settings ----------------------------------------------------------
