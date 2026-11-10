@@ -1126,3 +1126,36 @@ def test_withdrawn_semantic_capability_leaves_old_issues_stale_on_a_short_manusc
         assert not view.accept_button.isEnabled() and not view.adjust_button.isEnabled()
         assert [d["decision"] for d in view._decisions()] == ["ignored"], "decisions stay as history"
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("long_manuscript", [False, True])
+def test_undo_never_revives_issues_whose_semantic_basis_was_withdrawn(qapp, long_manuscript) -> None:
+    source, target = SOURCE, TARGET
+    if long_manuscript:
+        source = SOURCE.ljust(1200, "甲") + "\n\n" + "乙" * 1200
+        target = TARGET.ljust(1200, "A") + "\n\n" + "B" * 1200
+
+    async def scenario():
+        server = Server(issues=lambda s, t: two_issues(s, t) if "第三天" in s else [])
+        view = make_view(server, source, target)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        server.capabilities = ()
+        view._start_review()
+        await settle(view)
+        assert [view._issue_state(i) for i in view._issue_rows] == ["stale", "stale"]
+        view._undo_replace()  # takes back the ignore, not the lost basis
+        assert view._decisions() == []
+        assert [view._issue_state(i) for i in view._issue_rows] == ["stale", "stale"]
+        view.semantic_list.setCurrentRow(0)
+        assert not view.accept_button.isEnabled() and not view.adjust_button.isEnabled()
+        view.accept_button.setEnabled(True)  # even a stale enabled state cannot execute
+        view._accept_current()
+        assert view._payload["target"] == target
+        assert view.status_label.text() == strings.MANUSCRIPT_RECONFIRM_NEEDED
+        view._redo_edit()
+        assert [d["decision"] for d in view._decisions()] == ["ignored"]
+    asyncio.run(scenario())

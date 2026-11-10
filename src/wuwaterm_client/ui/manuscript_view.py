@@ -1129,13 +1129,21 @@ class ManuscriptView(QWidget):
         self.adjust_area.setVisible(self.adjust_area.isVisible() and self._can_adjust(issue))
         self._update_semantic_actions()
 
+    def _basis_holds(self, issue: sessions.LiveIssue) -> bool:
+        """The issue still comes from a current semantic report the server
+        still offers; checked again right before accept or adjust runs."""
+        if issue.basis_lost or not self._semantic_available():
+            return False
+        return any(issue in r.issues and sessions.semantic_part_valid(r) and self._ready_pair_for(r) is not None
+                   for r in self._session.results)
+
     def _can_accept(self, issue: sessions.LiveIssue | None) -> bool:
-        return (issue is not None and issue.issue["suggestion"] is not None
+        return (issue is not None and issue.issue["suggestion"] is not None and self._basis_holds(issue)
                 and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
                 and sessions.span_live(issue.suggestion_span, self._payload["target"]))
 
     def _can_adjust(self, issue: sessions.LiveIssue | None) -> bool:
-        return (issue is not None and issue.edit_span() is not None
+        return (issue is not None and issue.edit_span() is not None and self._basis_holds(issue)
                 and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
                 and sessions.span_live(issue.edit_span(), self._payload["target"]))
 
@@ -1235,6 +1243,10 @@ class ManuscriptView(QWidget):
         issue = self._current_issue()
         if issue is None or not self.accept_button.isEnabled():
             return
+        if not self._basis_holds(issue):
+            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
+            self._refresh_semantic()
+            return
         replacement, _effect = self._selected_option(issue)
         try:
             # The executable range must still be exactly what was reported.
@@ -1268,6 +1280,8 @@ class ManuscriptView(QWidget):
             return
         issue = self._current_issue()
         if issue is None or not self._can_adjust(issue):
+            if issue is not None:
+                self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
             return
         text = self.adjust_edit.toPlainText()
         if len(text) > semantic.MAX_SIDE_SCALARS:

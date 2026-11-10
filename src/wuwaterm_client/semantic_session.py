@@ -95,8 +95,12 @@ class LiveIssue:
     # state through the merge rules; they never count as a decision on this
     # report by themselves.
     preexisting: frozenset | None = None
-    # An edit overlapped this occurrence: it needs reconfirmation for good.
+    # An edit overlapped this occurrence. Undoable: snapshots restore it.
     invalid: bool = False
+    # The result it came from lost its basis (capability withdrawn, report
+    # dropped by the reuse rule, contract changed). Not part of any snapshot,
+    # so undo and redo can never make such an issue actionable again.
+    basis_lost: bool = False
 
     @property
     def id(self) -> str:
@@ -239,7 +243,7 @@ class Session:
                 # as needing reconfirmation, never actionable; decisions stay.
                 result.report = None
                 for issue in result.issues:
-                    issue.invalid = True
+                    issue.basis_lost = True
             if result.term_report is not None or result.report is not None or result.issues:
                 kept.append(result)
         self.results = kept
@@ -496,7 +500,7 @@ def decision_for(issue: LiveIssue, decisions: list[dict]) -> dict | None:
 def state_of(issue: LiveIssue, decisions: list[dict], source: str, target: str) -> str:
     """Validity first: an occurrence an edit touched needs reconfirmation,
     whatever was decided there before (the decision stays as history)."""
-    if issue.invalid:
+    if issue.invalid or issue.basis_lost:
         return STATE_STALE
     decision = decision_for(issue, decisions)
     if decision is not None and decision["decision"] != "ignored":
