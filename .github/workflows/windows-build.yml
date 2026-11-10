@@ -60,6 +60,17 @@ jobs:
           WUWATERM_WEB_ROOT: ${{ github.workspace }}/.contract-sources/web
           WUWATERM_CONTRACTS_REQUIRED: '1'
         run: .venv/Scripts/python.exe -m pytest
+      - name: Capture workbench screenshots (simulated, offscreen)
+        shell: bash
+        run: |
+          for scale in 1 1.5; do
+            .venv/Scripts/python.exe scripts/capture_workbench.py "$RUNNER_TEMP/workbench-screenshots" --scale "$scale"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbench-screenshots
+          path: ${{ runner.temp }}/workbench-screenshots/*.png
+          if-no-files-found: error
       - name: Build and inspect Python distribution artifacts
         run: |
           uv build --no-cache --out-dir dist
