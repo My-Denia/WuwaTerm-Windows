@@ -135,6 +135,9 @@ class SegmentResult:
     issues: list[LiveIssue] = field(default_factory=list)
     term_findings: list[dict] = field(default_factory=list)  # full coordinates
     term_report: dict[str, Any] | None = None
+    # The alignments the term request carried (segment coordinates, or None
+    # for automatic): a term report is reused only under the same setting.
+    term_alignments: list | None = None
     invalid: bool = False
 
     def current(self, source: str, target: str) -> bool:

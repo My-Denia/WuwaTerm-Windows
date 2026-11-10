@@ -818,3 +818,50 @@ def test_segmented_term_review_keeps_the_owners_alignment_choice(qapp) -> None:
             assert sent and all(body.get("alignments") == expected for body in sent)
             assert all(("alignments" in body) is (expected is not None) for body in sent)
     asyncio.run(scenario())
+
+
+def test_growing_into_segmented_review_requests_every_missing_term_report(qapp) -> None:
+    first, second = "第一段。" * 300, "第二段。" * 175
+    first_t, second_t = "One. " * 200, "Two. " * 150  # both sides within 2,000: document review first
+
+    async def scenario():
+        server = Server()
+        view = make_view(server, f"{first}\n\n{second}", f"{first_t}\n\n{second_t}")
+        view._start_review()
+        await settle(view)
+        assert view._term_mode == "document" and len(server.sent("/v1/semantic-reviews")) == 2
+        cursor = view.source_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        view.source_edit.setTextCursor(cursor)
+        view.source_edit.insertPlainText("\n\n" + "第三段。" * 450)  # too long to merge
+        cursor = view.target_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        view.target_edit.setTextCursor(cursor)
+        view.target_edit.insertPlainText("\n\n" + "Three. " * 250)
+        view._start_review()
+        await settle(view)
+        ready = [p for p in view._current_pairs() if p.status == "ready"]
+        assert view._term_mode == "segments"
+        assert len(server.sent("/v1/reviews")) == 1 + len(ready), "every segment gets a term report"
+        assert len(server.sent("/v1/semantic-reviews")) == 2 + 1, "only the new segment goes to the model"
+        assert view._progress() == (len(ready), len(ready))
+    asyncio.run(scenario())
+
+
+def test_choosing_automatic_alignment_redoes_cached_segment_term_reviews(qapp) -> None:
+    async def scenario():
+        server = Server()
+        view = make_view(server, LONG_SOURCE, LONG_TARGET)
+        view._payload["alignments"] = []
+        view._start_review()
+        await settle(view)
+        terms, models = len(server.sent("/v1/reviews")), len(server.sent("/v1/semantic-reviews"))
+        assert all(body["alignments"] == [] for body in server.sent("/v1/reviews"))
+        view._use_auto_alignment()
+        assert view._payload["alignments"] is None
+        view._start_review()
+        await settle(view)
+        again = server.sent("/v1/reviews")[terms:]
+        assert len(again) == terms and all("alignments" not in body for body in again)
+        assert len(server.sent("/v1/semantic-reviews")) == models, "the model results are kept"
+    asyncio.run(scenario())

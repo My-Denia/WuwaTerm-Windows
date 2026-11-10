@@ -966,7 +966,7 @@ class ManuscriptView(QWidget):
         if pair.status != STATUS_READY:
             return pair.status
         result = self._session.result_for(pair, self._payload["source"], self._payload["target"])
-        if result is not None and not (result.semantic_missing and self._semantic_available()):
+        if not self._needs_work(result):
             return "reviewed"
         return self._segment_failures.get(self._segment_key(pair), "pending")
 
@@ -1841,12 +1841,15 @@ class ManuscriptView(QWidget):
     def _show_segment_term_report(self) -> None:
         """Long manuscripts: one display report from every segment still current."""
         source, target = self._payload["source"], self._payload["target"]
-        reports = [r.term_report for r in self._session.results if r.term_report is not None and r.current(source, target)]
+        usable = [r for r in self._session.results if r.current(source, target) and self._term_current(r)]
+        reports = [r.term_report for r in usable]
         if not reports:
             return
+        findings = [f for r in usable for f in r.term_findings
+                    if sessions.span_live(f.get("source_span"), source) and sessions.span_live(f.get("target_span"), target)]
         self._show_term_report({
             "request_id": reports[-1]["request_id"],
-            "findings": self._session.term_findings(source, target),
+            "findings": findings,
             "coverage": {"evaluated": sum(r["coverage"]["evaluated"] for r in reports),
                          "not_evaluated": sum(r["coverage"]["not_evaluated"] for r in reports),
                          "rules": reports[-1]["coverage"]["rules"]},
@@ -1924,10 +1927,22 @@ class ManuscriptView(QWidget):
         for pair in self._current_pairs():
             if pair.status != STATUS_READY or self._segment_key(pair) in attempted:
                 continue
-            result = self._session.result_for(pair, source, target)
-            if result is None or (result.semantic_missing and self._semantic_available()):
+            if self._needs_work(self._session.result_for(pair, source, target)):
                 return pair
         return None
+
+    def _term_current(self, result: sessions.SegmentResult) -> bool:
+        """A segment's term report counts only if it was computed with the
+        correspondence the owner has selected now."""
+        return (result.term_report is not None
+                and result.term_alignments == self._alignments_for(result.source_core, result.target_core))
+
+    def _needs_work(self, result: sessions.SegmentResult | None) -> bool:
+        if result is None:
+            return True
+        if result.semantic_missing and self._semantic_available():
+            return True
+        return self._term_mode == "segments" and not self._term_current(result)
 
     def _segment_alignments(self, pair) -> list | None:
         """The owner's correspondence for one segment's term request.
@@ -1937,10 +1952,14 @@ class ManuscriptView(QWidget):
         alignments inside this segment's cores move to segment coordinates and
         the rest are left out.
         """
+        return self._alignments_for((pair.source.core_start, pair.source.core_end),
+                                    (pair.target.core_start, pair.target.core_end))
+
+    def _alignments_for(self, source_core: tuple[int, int], target_core: tuple[int, int]) -> list | None:
         alignments = self._payload["alignments"]
         if alignments is None:
             return None
-        (a, b), (c, d) = (pair.source.core_start, pair.source.core_end), (pair.target.core_start, pair.target.core_end)
+        (a, b), (c, d) = source_core, target_core
         out = []
         for item in alignments:
             source, target = item["source"], item["target"]
@@ -1991,12 +2010,15 @@ class ManuscriptView(QWidget):
             report = None
             # A segment whose term review already succeeded only needs the model.
             existing = self._session.result_for(pair, source, target)
-            term_report = existing.term_report if existing is not None else None
+            term_report = existing.term_report if existing is not None and self._term_current(existing) else None
+            term_alignments = self._segment_alignments(pair)
+            # A segment whose model review is complete only needs its term part.
+            need_semantic = semantic_on and (existing is None or existing.semantic_missing)
             try:
                 if segments and term_report is None:
                     term_report = await self._api_client.review_pair(
-                        key[4], key[5], direction, alignments=self._segment_alignments(pair))
-                if semantic_on and generation == self._semantic_generation:
+                        key[4], key[5], direction, alignments=term_alignments)
+                if need_semantic and generation == self._semantic_generation:
                     report = await self._api_client.semantic_review(
                         key[4], key[5], direction, before=before, precedents=precedents)
             except ClientError as exc:
@@ -2008,7 +2030,8 @@ class ManuscriptView(QWidget):
                     self._session.pending = None
                     if term_report is not None and moved.current(self._payload["source"], self._payload["target"]):
                         # The deterministic track does not depend on the model.
-                        self._store_segment(pair.index, moved, None, term_report, direction, semantic_missing=True)
+                        self._store_segment(pair.index, moved, None, term_report, direction,
+                                            semantic_missing=True, term_alignments=term_alignments)
                 if generation != self._semantic_generation or exc.code == ERROR_CANCELLED:
                     return
                 if exc.code in _QUOTA_CODES:
@@ -2029,20 +2052,33 @@ class ManuscriptView(QWidget):
             source, target = self._payload["source"], self._payload["target"]
             if pending is None or not pending.current(source, target):
                 continue
+            if not need_semantic and existing is not None and term_report is not None:
+                # Keep the model result and its issues (decisions bind to them);
+                # only the term part was redone.
+                existing.term_report, existing.term_alignments = term_report, term_alignments
+                existing.term_findings = sessions.term_findings_from_report(
+                    term_report, source_offset=existing.source_core[0], target_offset=existing.target_core[0])
+                failure_streak = (None, 0)
+                self._show_segment_term_report()
+                self._refresh_semantic()
+                self._update_controls()
+                continue
             if report is not None and report["status"] != "complete":
                 if term_report is not None:
-                    self._store_segment(pair.index, pending, None, term_report, direction, semantic_missing=True)
+                    self._store_segment(pair.index, pending, None, term_report, direction,
+                                        semantic_missing=True, term_alignments=term_alignments)
                 self._segment_failures[_core_key(pending.source_core, pending.target_core, source, target)] = "not_reviewed"
                 continue
             failure_streak = (None, 0)
-            self._store_segment(pair.index, pending, report, term_report, direction)
+            self._store_segment(pair.index, pending, report, term_report, direction, term_alignments=term_alignments)
         if generation == self._semantic_generation:
             self._semantic_state = "done"
             if self._term_mode == "segments":
                 self._show_segment_term_report()
 
     def _store_segment(self, index: int, pending: sessions.SegmentResult, report: dict | None,
-                       term_report: dict | None, direction: str, *, semantic_missing: bool = False) -> None:
+                       term_report: dict | None, direction: str, *, semantic_missing: bool = False,
+                       term_alignments: list | None = None) -> None:
         source, target = self._payload["source"], self._payload["target"]
         result = sessions.SegmentResult(
             sent_source=pending.sent_source, sent_target=pending.sent_target,
@@ -2063,7 +2099,7 @@ class ManuscriptView(QWidget):
             if report["dropped_unanchored"]:
                 notes.append(strings.MANUSCRIPT_SEGMENT_HINT["dropped"].format(count=report["dropped_unanchored"]))
         if term_report is not None:
-            result.term_report = term_report
+            result.term_report, result.term_alignments = term_report, term_alignments
             result.term_findings = sessions.term_findings_from_report(
                 term_report, source_offset=pending.source_core[0], target_offset=pending.target_core[0])
         if not result.semantic_missing:
