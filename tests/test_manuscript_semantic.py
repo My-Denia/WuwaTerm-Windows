@@ -189,7 +189,9 @@ def test_tracks_stay_apart_and_issues_express_uncertainty(qapp) -> None:
         assert strings.MANUSCRIPT_SEMANTIC_NOTE in view.semantic_note.text()
         assert view.issue_rationale.textFormat() == Qt.TextFormat.PlainText
         assert view.target_edit.textCursor().selectedText() == "second day"
-        assert view._payload["semantic_history"][-1]["report"]["request_id"] == "semantic"
+        [snapshot] = view._payload["semantic_history"]
+        assert (snapshot["source"], snapshot["target"]) == (SOURCE, TARGET)
+        assert snapshot["segments"][0]["report"]["request_id"] == "semantic"
     asyncio.run(scenario())
 
 
@@ -378,9 +380,20 @@ def test_decisions_persist_in_v2_and_re_review_applies_the_merge_rules(qapp, tmp
         reopened, _ = await review_reopened()
         assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending", "ignored_carried"]
 
-        # Any change to the manuscript means the old decision is only a reference.
+        # An edit on another line: the saved old text lets the ignore recover.
+        cursor = reopened.target_edit.textCursor()
+        cursor.setPosition(0)
+        reopened.target_edit.setTextCursor(cursor)
+        reopened.target_edit.insertPlainText("Intro.\n")
+        assert reopened.save_document()
+        saved = load_workfile(path)
+        assert [t["revision"] for t in saved["semantic_texts"]] == [digest(TARGET)]
+        edited, _ = await review_reopened()
+        assert [edited._issue_state(i) for i in edited._issue_rows] == ["pending", "ignored_carried"]
+
+        # A change inside the reported line: the old decision is only a reference.
         loaded = load_workfile(path)
-        loaded["target"] = TARGET + " Then they rest."
+        loaded["target"] = "Intro.\n" + TARGET + " Then they rest."
         from wuwaterm_client.manuscript import save_workfile
         save_workfile(path, loaded)
         changed, _ = await review_reopened()

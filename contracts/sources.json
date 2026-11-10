@@ -30,11 +30,21 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "31ab4c985ecf16daf00276e73b863b5ec2e6872f",
+    "commit": "fc62cd27ab121e2ca51ca8dd1f833ce14ae62387",
     "files": {
-      "package.json": "bd0469d4231201ff9b2776dacfe49d2e05ed4728cc5daa48ee7e7bc0e7fa6573",
-      "lib/manuscript.js": "c57af151bff324d51b544f3dc732f7676597b673438969d468244e4b105ee66c",
-      "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69"
+      "package.json": "61838c75a07b621d9fedbaf78716414791e23fe52763ceb0415f2cd5ed52a5bf",
+      "lib/manuscript.js": "ffb939f691efa7b61c1c2928feca1fced6f1e1f87baac35573038e8df78c16cd",
+      "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
+      "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
+      "docs/manuscript-v2.md": "bf5548afcab94ef91672196f1deaf24c45ae1bb9e22d6722624e9e6ec1c15cd2",
+      "contracts/manuscript-v2/cases.json": "fb846d23f40d257b38910c0251d19c63f91469fe33b1f006733e5617b7f94886",
+      "contracts/manuscript-v2/invalid-129-decisions.json": "6f597aad8f6df0bc33d6bfccce41bd572d19177c37dd1a9560a1a4831c96b80b",
+      "contracts/manuscript-v2/invalid-bad-hex.json": "3bdbd3509078196fde01be06b52bae84d345e5b33b9d8998196594768153323b",
+      "contracts/manuscript-v2/invalid-both-spans-null.json": "705eec315e11ec8b1ff74f673a724c09792211fa1bc10b0051983c4ced694758",
+      "contracts/manuscript-v2/invalid-duplicate-occurrence.json": "cf51ce6925303da91809ac6cb26ad2ce5cf2231babf6cd3d864453427c8a118d",
+      "contracts/manuscript-v2/invalid-ignored-with-text.json": "35cdecc33f5a5ff3c33a755b2381a9f4f0693e5ae77e9865b5b119188e381763",
+      "contracts/manuscript-v2/invalid-unknown-key.json": "9102960ff2e071f21d3a8f230b503f85cf36d743e640a7cf5a659c5f6b90b043",
+      "contracts/manuscript-v2/valid-all-parts.json": "e7de60c3e934267a9a25aa10a1144d249734f742c759493d18aa4261d3f32363"
     }
   }
 }

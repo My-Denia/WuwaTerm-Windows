@@ -6,7 +6,6 @@ not grant them runtime trust; a presentation layer must request a new review.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -25,9 +24,11 @@ MAX_CHOICES = 32
 MAX_HISTORY = 2
 MAX_SEMANTIC_DECISIONS = 128
 MAX_SEMANTIC_HISTORY = 2
+MAX_SEMANTIC_TEXTS = 16
+MAX_HISTORY_SEGMENTS = 64
 _HEX = re.compile(r"^[a-f0-9]{64}$")
 _TOP = {"format", "source", "target", "direction", "alignments", "choices", "history"}
-_TOP_V2 = _TOP | {"semantic_decisions", "semantic_history"}
+_TOP_V2 = _TOP | {"semantic_decisions", "semantic_texts", "semantic_history"}
 _DECISION_KEYS = {"issue_id", "fingerprint", "category", "segment_index", "source_revision",
                   "target_revision", "source_span", "target_span", "decision", "applied_text", "basis"}
 _VERDICTS = {"verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated"}
@@ -237,12 +238,12 @@ def _hex32(value: Any) -> bool:
 def _decision_span(span: Any) -> bool:
     return (_keys(span, {"start", "end", "text"}) and _strict_int(span["start"])
             and _strict_int(span["end"]) and 0 <= span["start"] < span["end"]
-            and _text(span["text"], 2000, False))
+            and _text(span["text"], 2000, False) and span["end"] - span["start"] == len(span["text"]))
 
 
-def _decision(value: Any, source: str, target: str) -> bool:
-    """A recorded semantic decision. Spans are historical, but a decision made
-    against exactly the current text must still point at that text."""
+def _decision(value: Any) -> bool:
+    """A recorded semantic decision (Web docs/manuscript-v2.md). Structure only:
+    spans are historical and are checked against old texts when they are used."""
     if not _keys(value, _DECISION_KEYS):
         return False
     basis, kind, applied = value["basis"], value["decision"], value["applied_text"]
@@ -261,29 +262,64 @@ def _decision(value: Any, source: str, target: str) -> bool:
         if applied is not None:
             return False
     elif not _text(applied, 2000):
-        # An accepted suggestion may be a deletion: Core allows an empty
-        # replacement, so the applied text may be empty too.
+        # An accepted suggestion may be a deletion, so the text may be empty.
         return False
     spans = (value["source_span"], value["target_span"])
     if spans[0] is None and spans[1] is None:
         return False
-    for span, side, revision in ((spans[0], source, value["source_revision"]),
-                                 (spans[1], target, value["target_revision"])):
-        if span is None:
-            continue
-        if not _decision_span(span):
-            return False
-        if revision == hashlib.sha256(side.encode("utf-8")).hexdigest() and (
-                span["end"] > len(side) or side[span["start"]:span["end"]] != span["text"]):
-            return False
-    return True
+    return all(span is None or _decision_span(span) for span in spans)
+
+
+def occurrence_key(decision: Mapping[str, Any]) -> str:
+    """One decision per reported occurrence (Web ``occurrenceKey``)."""
+    def bounds(span):
+        return None if span is None else [span["start"], span["end"]]
+    return json.dumps([decision["category"], decision["source_revision"], decision["target_revision"],
+                       bounds(decision["source_span"]), bounds(decision["target_span"])], separators=(",", ":"))
+
+
+def _semantic_text(value: Any) -> bool:
+    return _keys(value, {"revision", "text"}) and _hex(value["revision"]) and _text(value["text"], MAX_WORKFILE_BYTES)
+
+
+def _history_segment(item: Any, source: str, target: str) -> bool:
+    if not _keys(item, {"segment_index", "source_start", "source_end", "target_start", "target_end", "report"}):
+        return False
+    a, b, c, d = (item[k] for k in ("source_start", "source_end", "target_start", "target_end"))
+    return (_strict_int(item["segment_index"]) and item["segment_index"] >= 0
+            and all(_strict_int(x) for x in (a, b, c, d)) and 0 <= a <= b <= len(source) and 0 <= c <= d <= len(target)
+            and valid_semantic_report(item["report"], source[a:b], target[c:d]))
 
 
 def _semantic_snapshot(value: Any) -> bool:
-    return (_keys(value, {"segment_index", "source", "target", "direction", "report"})
-            and _strict_int(value["segment_index"]) and value["segment_index"] >= 0
-            and _text(value["source"]) and _text(value["target"]) and _direction(value["direction"])
-            and valid_semantic_report(value["report"], value["source"], value["target"]))
+    """One semantic run over a whole manuscript: untrusted reference data."""
+    return (_keys(value, {"source", "target", "direction", "segments"})
+            and _text(value["source"], MAX_WORKFILE_BYTES) and _text(value["target"], MAX_WORKFILE_BYTES)
+            and _direction(value["direction"]) and isinstance(value["segments"], list)
+            and len(value["segments"]) <= MAX_HISTORY_SEGMENTS
+            and all(_history_segment(item, value["source"], value["target"]) for item in value["segments"]))
+
+
+def recover_span(old: str, span: Mapping[str, Any], current: str) -> dict[str, Any] | None:
+    """Web ``recoverSpan``: relocate only inside an identical, unique, complete line block."""
+    start, end, value = span["start"], span["end"], span["text"]
+    if not (0 <= start < end <= len(old) and old[start:end] == value):
+        return None
+    if old == current:
+        return {"start": start, "end": end, "text": value}
+    old_blocks, new_blocks = old.split("\n"), current.split("\n")
+    offset = 0
+    for block in old_blocks:
+        block_end = offset + len(block)
+        if offset <= start and block_end >= end:
+            if old_blocks.count(block) != 1 or new_blocks.count(block) != 1:
+                return None
+            index = new_blocks.index(block)
+            moved = sum(len(b) + 1 for b in new_blocks[:index]) + start - offset
+            recovered = {"start": moved, "end": moved + end - start, "text": value}
+            return recovered if current[moved:moved + end - start] == value else None
+        offset = block_end + 1
+    return None
 
 
 def _recovered_mention(choice: dict[str, Any], source: str) -> str | None:
@@ -361,28 +397,62 @@ def parse_workfile(content: str) -> dict[str, Any]:
     if len(set(original)) != len(original) or choice_conflict_groups(value):
         raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
     if v2:
-        decisions, snapshots = value["semantic_decisions"], value["semantic_history"]
+        decisions, texts, snapshots = value["semantic_decisions"], value["semantic_texts"], value["semantic_history"]
         if (not isinstance(decisions, list) or len(decisions) > MAX_SEMANTIC_DECISIONS
-                or not all(_decision(d, source, target) for d in decisions)
+                or not all(_decision(d) for d in decisions)
+                or not isinstance(texts, list) or len(texts) > MAX_SEMANTIC_TEXTS
+                or not all(_semantic_text(t) for t in texts)
+                or len({t["revision"] for t in texts}) != len(texts)
                 or not isinstance(snapshots, list) or len(snapshots) > MAX_SEMANTIC_HISTORY
                 or not all(_semantic_snapshot(h) for h in snapshots)):
-            raise WorkfileError("workfile_invalid_semantic", "语义复审记录无效；当前稿件未被替换。")
+            raise WorkfileError("workfile_invalid_content", "稿件内容、选择或位置依据无效；当前稿件未被替换。")
+        keys = [occurrence_key(d) for d in decisions]
+        if len(set(keys)) != len(keys):
+            raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
     return value
 
 
+def _semantic_texts_needed(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Web's writer keeps only texts an ``ignored`` decision references, once each."""
+    needed = set()
+    for decision in payload.get("semantic_decisions") or []:
+        if decision["decision"] == "ignored":
+            needed.update((decision["source_revision"], decision["target_revision"]))
+    seen: set[str] = set()
+    out = []
+    for entry in payload.get("semantic_texts") or []:
+        if entry["revision"] in needed and entry["revision"] not in seen:
+            seen.add(entry["revision"])
+            out.append({"revision": entry["revision"], "text": entry["text"]})
+    return out
+
+
+def _dump(value: Mapping[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+
+
 def serialize_workfile(payload: Mapping[str, Any]) -> str:
+    """v1 bytes without semantic data; otherwise v2, dropping the oldest
+    semantic history snapshot until the file fits. Decisions are never dropped."""
     if not isinstance(payload, Mapping):
         raise WorkfileError("workfile_invalid_content", "稿件内容无效。")
     try:
-        value = {key: payload[key] for key in ("source", "target", "direction", "alignments", "choices", "history")}
-        decisions = payload.get("semantic_decisions") or []
-        snapshots = payload.get("semantic_history") or []
+        value = {key: payload[key] for key in ("source", "target", "direction", "alignments", "choices")}
+        value["history"] = list(payload["history"])[-MAX_HISTORY:]
+        decisions = list(payload.get("semantic_decisions") or [])
+        snapshots = list(payload.get("semantic_history") or [])[-MAX_SEMANTIC_HISTORY:]
         if decisions or snapshots:
-            value = {"format": WORKFILE_FORMAT_V2, **value,
-                     "semantic_decisions": decisions, "semantic_history": snapshots}
+            texts = _semantic_texts_needed(payload)
+
+            def v2(history: list) -> str:
+                return _dump({"format": WORKFILE_FORMAT_V2, **value, "semantic_decisions": decisions,
+                              "semantic_texts": texts, "semantic_history": history})
+            content = v2(snapshots)
+            while snapshots and len(content.encode("utf-8")) > MAX_WORKFILE_BYTES:
+                snapshots.pop(0)
+                content = v2(snapshots)
         else:
-            value = {"format": WORKFILE_FORMAT, **value}
-        content = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+            content = _dump({"format": WORKFILE_FORMAT, **value})
         parse_workfile(content)
         return content
     except (KeyError, TypeError, ValueError, RecursionError) as exc:

@@ -217,9 +217,48 @@ def test_actual_web_and_client_read_each_others_files(contract_source) -> None:
     assert recovered["history"] == payload["history"]
 
 
-@pytest.mark.skip(reason="等待 Web W1 合并：pin 的 Web 31ab4c98 不认识稿件 v2")
-def test_web_reads_and_resaves_v2_workfile_with_semantic_records(contract_source) -> None:
-    # Will check: a v2 file with decisions and history, written by manuscript.save_workfile,
-    # loads in the pinned Web importer, round-trips through its exporter, and parses back
-    # here with semantic_decisions/semantic_history unchanged.
-    contract_source("web")
+def _web_v2_cases(web_root: Path) -> dict:
+    return json.loads((web_root / "contracts" / "manuscript-v2" / "cases.json").read_text(encoding="utf-8"))
+
+
+def test_web_v2_fixtures_are_accepted_and_rejected_with_the_same_codes(contract_source) -> None:
+    web_root = contract_source("web")
+    cases = _web_v2_cases(web_root)
+    folder = web_root / "contracts" / "manuscript-v2"
+    for case in cases["valid"]:
+        raw = (folder / case["file"]).read_text(encoding="utf-8")
+        parsed = manuscript.parse_workfile(raw)
+        assert parsed["format"] == manuscript.WORKFILE_FORMAT_V2 == cases["format"]
+        assert parsed == json.loads(raw)
+        assert manuscript.parse_workfile(manuscript.serialize_workfile(parsed)) == parsed
+    for case in cases["invalid"]:
+        with pytest.raises(manuscript.WorkfileError) as error:
+            manuscript.parse_workfile((folder / case["file"]).read_text(encoding="utf-8"))
+        assert error.value.code == case["error"], case["file"]
+
+
+def test_actual_web_and_client_read_each_others_v2_files(contract_source) -> None:
+    """Both real parsers and serializers, on Web's v2 fixture, in both directions."""
+    web_root = contract_source("web")
+    if not shutil.which("node"):
+        if os.environ.get("WUWATERM_CONTRACTS_REQUIRED") == "1":
+            pytest.fail("Node is required for the Web manuscript contract")
+        pytest.skip("Node is required for the Web manuscript contract")
+    folder = web_root / "contracts" / "manuscript-v2"
+    payloads = [manuscript.parse_workfile((folder / case["file"]).read_text(encoding="utf-8"))
+                for case in _web_v2_cases(web_root)["valid"]]
+    program = """
+      import { readFileSync } from 'node:fs';
+      import { parseWorkfile, serializeWorkfile } from './lib/manuscript.js';
+      const input = JSON.parse(readFileSync(0, 'utf8'));
+      process.stdout.write(JSON.stringify(input.map(item => ({
+        parsed: parseWorkfile(item.pythonFile), webFile: serializeWorkfile(item.payload) }))));
+    """
+    result = subprocess.run(["node", "--input-type=module", "-e", program], cwd=web_root,
+                            input=json.dumps([{"pythonFile": manuscript.serialize_workfile(p), "payload": p}
+                                              for p in payloads]),
+                            text=True, encoding="utf-8", capture_output=True, check=True, timeout=30)
+    for payload, answer in zip(payloads, json.loads(result.stdout), strict=True):
+        assert answer["parsed"] == payload
+        assert manuscript.parse_workfile(answer["webFile"]) == payload
+        assert answer["webFile"] == manuscript.serialize_workfile(payload), "both writers produce the same bytes"

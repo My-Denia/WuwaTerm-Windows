@@ -215,33 +215,70 @@ def test_precedent_selection_and_context() -> None:
     assert semantic.context_before("a" * 500, "b") == {"source": "a" * 400, "target": "b"}
 
 
-def _decision(fp: str, kind: str, source: str, target: str, source_span, target_span) -> dict:
-    return {"fingerprint": fp, "decision": kind,
-            "source_revision": hashlib.sha256(source.encode()).hexdigest(),
-            "target_revision": hashlib.sha256(target.encode()).hexdigest(),
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _decision(kind: str, source: str, target: str, source_span, target_span, *, fp="f" * 32) -> dict:
+    return {"issue_id": "1" * 32, "fingerprint": fp, "category": "omission", "segment_index": 0,
+            "source_revision": _sha(source), "target_revision": _sha(target),
+            "source_span": source_span, "target_span": target_span, "decision": kind,
+            "applied_text": None if kind == "ignored" else "x",
+            "basis": {"review_version": "semantic-review-v1", "term_basis": {"dictionary_revision": "a" * 64,
+                                                                             "matcher_revision": "a" * 64}}}
+
+
+def _issue(source_span, target_span, *, ident="i" * 32, fp="f" * 32) -> dict:
+    return {"id": ident, "fingerprint": fp, "category": "omission",
             "source_span": source_span, "target_span": target_span}
 
 
-def test_reconcile_rules() -> None:
-    source, target = "甲乙", "AB"
-    ss = {"start": 0, "end": 1, "text": "甲"}
-    ts = {"start": 0, "end": 1, "text": "A"}
-    issue = {"fingerprint": "f" * 32, "source_span": ss, "target_span": ts, "segment_index": 0}
-    ignored = _decision("f" * 32, "ignored", source, target, ss, ts)
-    state = lambda decisions, issues=(issue,), s=source, t=target: semantic.reconcile(decisions, list(issues), s, t)  # noqa: E731
+def test_reconcile_follows_the_web_merge_rules() -> None:
+    """Web lib/semantic-decisions.js: only a uniquely recovered ignore with
+    exactly one candidate at the recovered place carries over."""
+    from wuwaterm_client.semantic_session import reconcile, verified_texts
 
-    assert state([ignored])[0]["state"] == "ignored_carried"
-    assert state([])[0] == {"state": "pending", "previous": None, "previously_applied": False}
-    assert state([_decision("e" * 32, "ignored", source, target, ss, ts)])[0]["state"] == "pending"
-    assert state([ignored], s="甲乙。")[0]["state"] == "needs_reconfirm"
-    assert state([ignored], t="AB!")[0]["state"] == "needs_reconfirm"
-    moved = dict(issue, source_span={"start": 1, "end": 2, "text": "乙"})
-    assert state([ignored], (moved,))[0]["state"] == "needs_reconfirm"
-    twin = dict(issue, target_span=None)
-    assert [x["state"] for x in state([ignored], (issue, twin))] == ["needs_reconfirm"] * 2
-    applied = _decision("f" * 32, "accepted", source, target, ss, ts)
-    result = state([ignored, applied])[0]
-    assert result["state"] == "pending" and result["previously_applied"] and result["previous"] is applied
+    old_s, old_t = "第一行\n甲乙", "line one\nAB"
+    ss, ts = {"start": 4, "end": 5, "text": "甲"}, {"start": 9, "end": 10, "text": "A"}
+    ignored = _decision("ignored", old_s, old_t, ss, ts)
+    here = _issue(ss, ts)
+
+    def code(decisions, issues, s=old_s, t=old_t, texts=None):
+        return [r["code"] for r in reconcile(decisions, texts or {}, s, t, issues)]
+
+    assert code([ignored], [here]) == ["carried"]
+    assert code([], [here]) == []
+    assert code([ignored], []) == ["not_reported"]
+    # An edit on another line: the old texts from semantic_texts recover the spans.
+    new_s, new_t = "改过的第一行\n甲乙", "edited\nAB"
+    moved = _issue({"start": 7, "end": 8, "text": "甲"}, {"start": 7, "end": 8, "text": "A"})
+    texts = {_sha(old_s): old_s, _sha(old_t): old_t}
+    assert code([ignored], [moved], new_s, new_t, texts) == ["carried"]
+    assert code([ignored], [moved], new_s, new_t) == ["old_text_unavailable"]
+    damaged = verified_texts([{"revision": _sha(old_s), "text": old_s}, {"revision": _sha(old_t), "text": "damaged"}])
+    assert code([ignored], [moved], new_s, new_t, damaged) == ["old_text_unavailable"]
+    assert code([ignored], [moved], "甲乙\n甲乙", new_t, texts) == ["source_span_unrecoverable"]
+    assert code([ignored], [here, _issue(ss, None, ident="j" * 32)]) == ["multiple_candidates"]
+    assert code([ignored], [_issue({"start": 5, "end": 6, "text": "乙"}, ts)]) == ["candidate_elsewhere"]
+    twin = dict(ignored, issue_id="2" * 32)
+    assert code([ignored, twin], [here]) == ["converged_on_one_issue"] * 2
+    accepted = _decision("accepted", old_s, old_t, ss, ts)
+    assert code([accepted], [here]) == ["previously_applied"]
+    assert code([accepted], [_issue({"start": 0, "end": 1, "text": "第"}, ts)]) == ["applied_not_carried"]
+
+
+def test_semantic_texts_keep_only_verified_texts_ignored_decisions_need() -> None:
+    from wuwaterm_client.semantic_session import semantic_texts_for, verified_texts
+
+    old, current = "old", "new"
+    ignored = _decision("ignored", old, current, {"start": 0, "end": 1, "text": "o"}, None)
+    accepted = _decision("accepted", "gone", current, {"start": 0, "end": 1, "text": "g"}, None)
+    known = verified_texts([{"revision": _sha(old), "text": old}, {"revision": _sha("gone"), "text": "bad"}])
+    assert known == {_sha(old): old}
+    assert semantic_texts_for([ignored, accepted], known, current, current) == [{"revision": _sha(old), "text": old}]
+    many = [_decision("ignored", f"t{i}", current, {"start": 0, "end": 1, "text": "t"}, None) for i in range(20)]
+    texts = semantic_texts_for(many, {_sha(f"t{i}"): f"t{i}" for i in range(20)}, current, current)
+    assert [t["text"] for t in texts] == [f"t{i}" for i in range(4, 20)], "the 16 newest are kept"
 
 
 # -- manuscript v2 ---------------------------------------------------------
@@ -249,47 +286,46 @@ def test_reconcile_rules() -> None:
 
 def _v2_payload(fixtures):
     request, report = _pair(fixtures, "minimal")
-    source, target = "第一段。\n\n" + request["source"], "First.\n\n" + request["target"]
+    prefix_s, prefix_t = "第一段。\n\n", "First.\n\n"
+    source, target = prefix_s + request["source"], prefix_t + request["target"]
     issue = next(i for i in report["issues"] if i["suggestion"])
-    offset_s, offset_t = len("第一段。\n\n"), len("First.\n\n")
     ts = issue["target_span"]
-    span = {"start": ts["start"] + offset_t, "end": ts["end"] + offset_t, "text": ts["text"]}
-    decision = {
-        "issue_id": issue["id"], "fingerprint": issue["fingerprint"], "category": issue["category"],
-        "segment_index": 1,
-        "source_revision": hashlib.sha256(source.encode()).hexdigest(),
-        "target_revision": hashlib.sha256(target.encode()).hexdigest(),
-        "source_span": None, "target_span": span, "decision": "accepted",
-        "applied_text": issue["suggestion"]["replacement"],
-        "basis": {"review_version": "semantic-review-v1", "term_basis": report["term_basis"]},
-    }
-    snapshot = {"segment_index": 1, "source": request["source"], "target": request["target"],
-                "direction": request["direction"], "report": report}
+    span = {"start": ts["start"] + len(prefix_t), "end": ts["end"] + len(prefix_t), "text": ts["text"]}
+    decision = _decision("ignored", "旧原文", "old target", None, span)
+    decision.update(issue_id=issue["id"], fingerprint=issue["fingerprint"], category=issue["category"],
+                    segment_index=1, basis={"review_version": "semantic-review-v1", "term_basis": report["term_basis"]})
+    snapshot = {"source": source, "target": target, "direction": request["direction"], "segments": [{
+        "segment_index": 1, "source_start": len(prefix_s), "source_end": len(source),
+        "target_start": len(prefix_t), "target_end": len(target), "report": report}]}
     payload = manuscript.empty_workfile()
-    payload.update(source=source, target=target, semantic_decisions=[decision], semantic_history=[snapshot])
-    return payload, offset_s
+    payload.update(source=source, target=target, semantic_decisions=[decision],
+                   semantic_texts=[{"revision": _sha("旧原文"), "text": "旧原文"},
+                                   {"revision": _sha("unused"), "text": "unused"}],
+                   semantic_history=[snapshot])
+    return payload, len(prefix_s)
 
 
-def test_v2_roundtrip_and_key_order(fixtures, tmp_path) -> None:
+def test_v2_roundtrip_key_order_and_unreferenced_texts_dropped(fixtures, tmp_path) -> None:
     payload, _ = _v2_payload(fixtures)
     content = manuscript.serialize_workfile(payload)
-    assert list(json.loads(content)) == ["format", "source", "target", "direction", "alignments",
-                                         "choices", "history", "semantic_decisions", "semantic_history"]
-    assert json.loads(content)["format"] == manuscript.WORKFILE_FORMAT_V2
+    data = json.loads(content)
+    assert list(data) == ["format", "source", "target", "direction", "alignments", "choices", "history",
+                          "semantic_decisions", "semantic_texts", "semantic_history"]
+    assert data["format"] == manuscript.WORKFILE_FORMAT_V2
+    assert data["semantic_texts"] == [{"revision": _sha("旧原文"), "text": "旧原文"}]
     path = tmp_path / "draft.json"
     manuscript.save_workfile(path, payload)
     loaded = manuscript.load_workfile(path)
     assert loaded["semantic_decisions"] == payload["semantic_decisions"]
     assert loaded["semantic_history"] == payload["semantic_history"]
-    assert manuscript.semantic_payload_fits(payload)
 
 
 def test_without_semantic_data_the_file_is_exactly_v1(fixtures) -> None:
     payload, _ = _v2_payload(fixtures)
     plain = {k: v for k, v in payload.items() if not k.startswith("semantic_")}
     v1 = manuscript.serialize_workfile(plain)
-    assert manuscript.serialize_workfile({**plain, "semantic_decisions": [], "semantic_history": []}) == v1
-    assert list(json.loads(v1)) == ["format", "source", "target", "direction", "alignments", "choices", "history"]
+    empty = {**plain, "semantic_decisions": [], "semantic_texts": [], "semantic_history": []}
+    assert manuscript.serialize_workfile(empty) == v1
     assert json.loads(v1)["format"] == manuscript.WORKFILE_FORMAT
     assert manuscript.parse_workfile(v1) == plain
 
@@ -305,39 +341,55 @@ def test_invalid_v2_content_is_rejected(fixtures) -> None:
         return raised.value.code
 
     d = lambda bad: bad["semantic_decisions"][0]  # noqa: E731
-    assert rejected(lambda b: d(b).update(extra=1)) == "workfile_invalid_semantic"
-    assert rejected(lambda b: d(b).update(applied_text=None)) == "workfile_invalid_semantic"
-    assert rejected(lambda b: d(b).update(decision="ignored")) == "workfile_invalid_semantic"
-    assert rejected(lambda b: d(b).update(category="nope")) == "workfile_invalid_semantic"
-    assert rejected(lambda b: d(b).update(source_span=None, target_span=None)) == "workfile_invalid_semantic"
-    # Same revision as the current text, but the span no longer matches it.
-    assert rejected(lambda b: d(b)["target_span"].update(text="X")) == "workfile_invalid_semantic"
-    assert rejected(lambda b: b["semantic_history"][0]["report"].update(source_revision="0" * 64)) == "workfile_invalid_semantic"
-    assert rejected(lambda b: b.update(semantic_history=b["semantic_history"] * 3)) == "workfile_invalid_semantic"
-    assert rejected(lambda b: b.update(semantic_decisions=[d(b)] * 129)) in ("workfile_too_many_entries", "workfile_invalid_semantic")
-    assert not manuscript.semantic_payload_fits({**payload, "semantic_history": "x"})
+    invalid = "workfile_invalid_content"
+    assert rejected(lambda b: d(b).update(extra=1)) == invalid
+    assert rejected(lambda b: d(b).update(applied_text="x")) == invalid
+    assert rejected(lambda b: d(b).update(source_revision="A" * 64)) == invalid
+    assert rejected(lambda b: d(b).update(source_span=None, target_span=None)) == invalid
+    assert rejected(lambda b: d(b)["target_span"].update(text="longer text")) == invalid
+    snapshot = lambda b: b["semantic_history"][0]["segments"][0]  # noqa: E731
+    assert rejected(lambda b: snapshot(b)["report"].update(source_revision="0" * 64)) == invalid
+    assert rejected(lambda b: snapshot(b).update(target_end=10**6)) == invalid
+    # The writer keeps the last two snapshots; a file with three is refused.
+    three = json.loads(manuscript.serialize_workfile(payload))
+    assert len(json.loads(manuscript.serialize_workfile({**payload, "semantic_history": payload["semantic_history"] * 3}))["semantic_history"]) == 2
+    three["semantic_history"] *= 3
+    with pytest.raises(manuscript.WorkfileError) as raised:
+        manuscript.parse_workfile(json.dumps(three, ensure_ascii=False))
+    assert raised.value.code == invalid
+    assert rejected(lambda b: b.update(semantic_decisions=[d(b)] * 129)) == "workfile_too_many_entries"
+    assert rejected(lambda b: b.update(semantic_decisions=[d(b), dict(d(b), issue_id="3" * 32)])) == \
+        "workfile_duplicate_choices"
+    text = {"revision": _sha("旧原文"), "text": "旧原文"}
+    bad = json.loads(manuscript.serialize_workfile(payload))
+    bad["semantic_texts"] = [text, text]
+    with pytest.raises(manuscript.WorkfileError):
+        manuscript.parse_workfile(json.dumps(bad, ensure_ascii=False))
 
 
-def test_decision_for_older_text_is_kept_without_span_check(fixtures) -> None:
-    payload, _ = _v2_payload(fixtures)
-    payload["semantic_decisions"][0]["target_revision"] = "1" * 64
-    payload["semantic_decisions"][0]["target_span"]["text"] = "已经改过的文字"
-    assert manuscript.parse_workfile(manuscript.serialize_workfile(payload))["semantic_decisions"]
-
-
-def test_v1_file_cannot_carry_semantic_keys(fixtures) -> None:
+def test_a_damaged_old_text_is_kept_as_structure_and_not_trusted(fixtures) -> None:
     payload, _ = _v2_payload(fixtures)
     data = json.loads(manuscript.serialize_workfile(payload))
-    data["format"] = manuscript.WORKFILE_FORMAT
-    with pytest.raises(manuscript.WorkfileError) as raised:
-        manuscript.parse_workfile(json.dumps(data))
-    assert raised.value.code == "workfile_unsupported_format"
+    data["semantic_texts"][0]["text"] = "被改动的旧文"
+    loaded = manuscript.parse_workfile(json.dumps(data, ensure_ascii=False))
+    from wuwaterm_client.semantic_session import verified_texts
+    assert loaded["semantic_decisions"] == payload["semantic_decisions"]
+    assert verified_texts(loaded["semantic_texts"]) == {}
 
 
-def test_two_maximum_size_snapshots_fit_the_workfile_limits(fixtures) -> None:
+def test_oversized_files_drop_oldest_history_and_never_a_decision(fixtures) -> None:
+    payload, _ = _v2_payload(fixtures)
     request, report = _pair(fixtures, "max")
-    snapshot = {"segment_index": 0, "source": request["source"], "target": request["target"],
-                "direction": request["direction"], "report": report}
-    payload = manuscript.empty_workfile()
-    payload.update(semantic_history=[snapshot, copy.deepcopy(snapshot)])
-    assert manuscript.semantic_payload_fits(payload)
+    filler = "填" * 150_000
+    big = {"source": filler + request["source"], "target": request["target"], "direction": request["direction"],
+           "segments": [{"segment_index": 0, "source_start": len(filler), "source_end": len(filler) + len(request["source"]),
+                         "target_start": 0, "target_end": len(request["target"]), "report": report}]}
+    payload["semantic_history"] = [big, copy.deepcopy(big)]
+    written = json.loads(manuscript.serialize_workfile(payload))
+    assert len(written["semantic_history"]) == 1
+    assert written["semantic_decisions"] == payload["semantic_decisions"]
+    payload["source"] = payload["target"] = "长" * 400_000
+    payload["semantic_history"] = []
+    with pytest.raises(manuscript.WorkfileError) as raised:
+        manuscript.serialize_workfile(payload)
+    assert raised.value.code == "workfile_too_large"

@@ -110,7 +110,7 @@ class LiveIssue:
     # Decisions already on file when the report arrived. They inform the base
     # state through the merge rules; they never count as a decision on this
     # report by themselves (an identical issue id is not a new decision).
-    preexisting: frozenset = frozenset()
+    preexisting: frozenset | None = None
 
     @property
     def id(self) -> str:
@@ -135,6 +135,7 @@ class SegmentResult:
     target_core: tuple[int, int]
     hard_cut: bool
     report: dict[str, Any] | None
+    index: int = 0
     issues: list[LiveIssue] = field(default_factory=list)
     term_findings: list[dict] = field(default_factory=list)  # full coordinates
     term_report: dict[str, Any] | None = None
@@ -251,16 +252,121 @@ def term_findings_from_report(report: dict, *, source_offset: int, target_offset
     return findings
 
 
-def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], source: str, target: str) -> None:
-    """Set each new issue's base state from the decisions already on file."""
-    if not issues:
-        return
-    states = semantic.reconcile(decisions, [issue.issue for issue in issues], source, target)
-    for issue, state in zip(issues, states):
-        issue.base_state = state["state"]
-        issue.previous = state["previous"]
-        issue.previously_applied = state["previously_applied"]
-        issue.preexisting = frozenset(_key(d) for d in decisions if _matches_decision(issue, d))
+def _same_range(a: dict | None, b: dict | None) -> bool:
+    if a is None:
+        return b is None
+    return b is not None and a["start"] == b["start"] and a["end"] == b["end"]
+
+
+def verified_texts(entries) -> dict[str, str]:
+    """``semantic_texts`` entries whose sha256 matches; a damaged entry is unusable."""
+    return {e["revision"]: e["text"] for e in entries if revision(e["text"]) == e["revision"]}
+
+
+def reconcile(decisions: list[dict], texts: dict[str, str], source: str, target: str,
+              issues: list[dict]) -> list[dict]:
+    """Web ``reconcileSemanticDecisions``, one outcome per decision.
+
+    The fingerprint only finds candidates. Only an ``ignored`` decision carries
+    over, when both old texts are available and verified, every span recovers
+    uniquely (``recover_span``), exactly one candidate exists in the whole
+    report, and it sits at the recovered place. Accepted and adjusted decisions
+    never carry; reported again at the same source place they are
+    ``previously_applied``. Everything else needs reconfirmation.
+    """
+    from .manuscript import recover_span
+
+    source_revision, target_revision = revision(source), revision(target)
+
+    def text_for(rev: str, current: str, current_rev: str) -> str | None:
+        return current if rev == current_rev else texts.get(rev)
+
+    results = []
+    for decision in decisions:
+        candidates = [i for i in issues if i["fingerprint"] == decision["fingerprint"]
+                      and i["category"] == decision["category"]]
+
+        def outcome(status: str, code: str, issue: dict | None = None) -> dict:
+            return {"decision": decision, "status": status, "code": code,
+                    "issue_id": None if issue is None else issue["id"],
+                    "candidates": [c["id"] for c in candidates]}
+        if not candidates:
+            results.append(outcome("not_reported", "not_reported"))
+            continue
+        old_source = text_for(decision["source_revision"], source, source_revision)
+        if decision["decision"] != "ignored":
+            here = (recover_span(old_source, decision["source_span"], source)
+                    if old_source is not None and decision["source_span"] is not None else None)
+            match = next((c for c in candidates if here and c["source_span"] and _same_range(c["source_span"], here)), None)
+            results.append(outcome("previously_applied", "previously_applied", match) if match
+                           else outcome("needs_reconfirmation", "applied_not_carried"))
+            continue
+        old_target = text_for(decision["target_revision"], target, target_revision)
+        if old_source is None or old_target is None:
+            results.append(outcome("needs_reconfirmation", "old_text_unavailable"))
+            continue
+        spans = []
+        failed = None
+        for span, old, current, code in ((decision["source_span"], old_source, source, "source_span_unrecoverable"),
+                                         (decision["target_span"], old_target, target, "target_span_unrecoverable")):
+            recovered = None if span is None else recover_span(old, span, current)
+            if span is not None and recovered is None:
+                failed = code
+                break
+            spans.append(recovered)
+        if failed:
+            results.append(outcome("needs_reconfirmation", failed))
+        elif len(candidates) != 1:
+            results.append(outcome("needs_reconfirmation", "multiple_candidates"))
+        elif not (_same_range(spans[0], candidates[0]["source_span"]) and _same_range(spans[1], candidates[0]["target_span"])):
+            results.append(outcome("needs_reconfirmation", "candidate_elsewhere"))
+        else:
+            results.append(outcome("carried", "carried", candidates[0]))
+    counts: dict[str, int] = {}
+    for r in results:
+        if r["status"] == "carried":
+            counts[r["issue_id"]] = counts.get(r["issue_id"], 0) + 1
+    for r in results:
+        if r["status"] == "carried" and counts[r["issue_id"]] > 1:
+            r.update(status="needs_reconfirmation", code="converged_on_one_issue", issue_id=None)
+    return results
+
+
+def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], texts: dict[str, str],
+                    source: str, target: str) -> None:
+    """Set every issue's base state from the decisions made before it arrived.
+
+    ``issues`` is the whole current report (all segments), so "exactly one
+    candidate" means one in the manuscript, as on the Web.
+    """
+    for issue in issues:
+        if issue.preexisting is None:
+            issue.preexisting = frozenset(_key(d) for d in decisions if _matches_decision(issue, d))
+    # A decision made on an issue of this session is that issue's own state,
+    # not history to merge.
+    own = {_key(d) for d in decisions for issue in issues
+           if _matches_decision(issue, d) and _key(d) not in issue.preexisting}
+    prior = [d for d in decisions if _key(d) not in own]
+    outcomes = reconcile(prior, texts, source, target, [issue.issue for issue in issues])
+    rank = {STATE_IGNORED_CARRIED: 3, "previously_applied": 2, STATE_NEEDS_RECONFIRM: 1, STATE_PENDING: 0}
+    best: dict[str, tuple[str, dict]] = {}
+
+    def offer(issue_id: str, state: str, decision: dict) -> None:
+        if issue_id not in best or rank[state] > rank[best[issue_id][0]]:
+            best[issue_id] = (state, decision)
+    for r in outcomes:
+        if r["status"] == "carried":
+            offer(r["issue_id"], STATE_IGNORED_CARRIED, r["decision"])
+        elif r["status"] == "previously_applied":
+            offer(r["issue_id"], "previously_applied", r["decision"])
+        elif r["status"] == "needs_reconfirmation":
+            for issue_id in r["candidates"]:
+                offer(issue_id, STATE_NEEDS_RECONFIRM, r["decision"])
+    for issue in issues:
+        state, decision = best.get(issue.id, (STATE_PENDING, None))
+        issue.previously_applied = state == "previously_applied"
+        issue.base_state = STATE_PENDING if issue.previously_applied else state
+        issue.previous = decision
 
 
 def _key(decision: dict) -> str:
@@ -275,7 +381,7 @@ def _matches_decision(issue: LiveIssue, decision: dict) -> bool:
 def decision_for(issue: LiveIssue, decisions: list[dict]) -> dict | None:
     """The decision made on this report's issue, if any."""
     for decision in reversed(decisions):
-        if _matches_decision(issue, decision) and _key(decision) not in issue.preexisting:
+        if _matches_decision(issue, decision) and _key(decision) not in (issue.preexisting or ()):
             return decision
     return None
 
@@ -313,8 +419,12 @@ def with_decision(decisions: list[dict], issue: LiveIssue, record: dict) -> list
     Accepted and adjusted records already changed the text; they stay as
     history even when the same place is reported again.
     """
+    from .manuscript import occurrence_key
+
     superseded = issue.previous if issue.previous and issue.previous.get("decision") == "ignored" else None
-    kept = [d for d in decisions if not _matches_decision(issue, d) and d != superseded]
+    occurrence = occurrence_key(record)
+    kept = [d for d in decisions if not _matches_decision(issue, d) and d != superseded
+            and occurrence_key(d) != occurrence]
     return kept + [record]
 
 
@@ -380,3 +490,18 @@ def precedent_candidates(payload: dict, pairs) -> list[tuple[int, dict]]:
             if item is not None:
                 out.append(item)
     return out
+
+
+def semantic_texts_for(decisions: list[dict], known: dict[str, str], source: str, target: str,
+                       limit: int = 16) -> list[dict]:
+    """Web ``buildSemanticTexts``: the verified old texts that ``ignored``
+    decisions need beyond the current texts, newest decisions first kept."""
+    current = {revision(source), revision(target)}
+    wanted: list[str] = []
+    for decision in reversed(decisions):
+        if decision["decision"] != "ignored":
+            continue
+        for rev in (decision["source_revision"], decision["target_revision"]):
+            if rev not in current and rev in known and rev not in wanted:
+                wanted.append(rev)
+    return [{"revision": rev, "text": known[rev]} for rev in reversed(wanted[:limit])]

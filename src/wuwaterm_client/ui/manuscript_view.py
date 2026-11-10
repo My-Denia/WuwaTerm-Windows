@@ -25,8 +25,8 @@ from ..errors import (
     ERROR_LLM_UNAVAILABLE, ERROR_NOT_CONFIGURED, ERROR_OFFLINE, ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
 )
 from ..manuscript import (
-    MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, WorkfileError, choice_conflict_groups,
-    empty_workfile, load_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
+    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, WorkfileError, choice_conflict_groups,
+    empty_workfile, load_workfile, parse_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
 )
 from ..segmentation import (
     SEGMENT_LIMIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
@@ -59,9 +59,10 @@ def _normalize_semantic(payload: dict) -> dict:
     history = payload.get("semantic_history") or []
     if decisions or history:
         payload["semantic_decisions"], payload["semantic_history"] = decisions, history
+        payload["semantic_texts"] = payload.get("semantic_texts") or []
     else:
-        payload.pop("semantic_decisions", None)
-        payload.pop("semantic_history", None)
+        for key in ("semantic_decisions", "semantic_texts", "semantic_history"):
+            payload.pop(key, None)
     return payload
 
 
@@ -391,6 +392,11 @@ class ManuscriptView(QWidget):
         self._semantic_detail = ""
         self._segment_failures: dict[tuple[str, str], str] = {}
         self._segment_notes: dict[tuple[str, str], list[str]] = {}
+        # Old whole texts by sha256, so an ignored decision can still recover
+        # its spans after the owner edits elsewhere (Web ``semantic_texts``).
+        self._known_texts: dict[str, str] = {}
+        self._history_run = 0
+        self._history_written = -1
         self._term_mode = "document"
         self._pairs_key: tuple | None = None
         self._pairs: list = []
@@ -1186,6 +1192,7 @@ class ManuscriptView(QWidget):
         candidate = copy.deepcopy(self._payload)
         candidate.update(copy.deepcopy(value))
         candidate.setdefault("semantic_history", [])
+        candidate["semantic_texts"] = self._semantic_texts(candidate)
         _normalize_semantic(candidate)
         if len(decisions) > MAX_SEMANTIC_DECISIONS or not semantic_payload_fits(candidate):
             self.status_label.setText(strings.MANUSCRIPT_DECISIONS_FULL)
@@ -1565,6 +1572,7 @@ class ManuscriptView(QWidget):
         self._payload.update(value)
         self._payload["semantic_decisions"] = decisions
         self._payload.setdefault("semantic_history", [])
+        self._payload.setdefault("semantic_texts", [])
         _normalize_semantic(self._payload)
 
     def _after_draft_change(self, before: dict, after: dict) -> None:
@@ -1826,6 +1834,7 @@ class ManuscriptView(QWidget):
     # -- segmented semantic run ------------------------------------------------
     def _start_semantic_run(self) -> None:
         self._stop_semantic()
+        self._history_run += 1
         self._semantic_state = "running"
         generation = self._semantic_generation
         self._semantic_task = asyncio.ensure_future(self._run_segments(generation))
@@ -1955,7 +1964,7 @@ class ManuscriptView(QWidget):
         result = sessions.SegmentResult(
             sent_source=pending.sent_source, sent_target=pending.sent_target,
             source_core=pending.source_core, target_core=pending.target_core,
-            hard_cut=pending.hard_cut, report=report)
+            hard_cut=pending.hard_cut, report=report, index=index)
         key = (pending.sent_source, pending.sent_target)
         notes = []
         if report is not None:
@@ -1963,7 +1972,8 @@ class ManuscriptView(QWidget):
                 report, segment_index=index, source_offset=pending.source_core[0],
                 target_offset=pending.target_core[0], source_revision=sessions.revision(source),
                 target_revision=sessions.revision(target))
-            sessions.apply_reconcile(result.issues, self._decisions(), source, target)
+            self._known_texts.setdefault(sessions.revision(source), source)
+            self._known_texts.setdefault(sessions.revision(target), target)
             if report["omitted_issues"]:
                 notes.append(strings.MANUSCRIPT_SEGMENT_HINT["truncated"].format(count=report["omitted_issues"]))
             if report["dropped_unanchored"]:
@@ -1976,7 +1986,10 @@ class ManuscriptView(QWidget):
         self._segment_notes[key] = notes
         self._session.replace_result(result)
         if report is not None:
-            self._remember_semantic_report(index, pending.sent_source, pending.sent_target, direction, report)
+            # "Exactly one candidate" is judged over the whole current report.
+            sessions.apply_reconcile(self._session.issues(), self._decisions(), self._texts_for_reconcile(),
+                                     source, target)
+            self._remember_semantic_report(direction)
         if term_report is not None:
             self._show_segment_term_report()
         self._refresh_semantic()
@@ -1984,15 +1997,36 @@ class ManuscriptView(QWidget):
             self._refresh_segments()
         self._update_controls()
 
-    def _remember_semantic_report(self, index: int, source: str, target: str, direction: str, report: dict) -> None:
-        """Keep the last two segment reports as untrusted history, if they fit."""
-        snapshot = {"segment_index": index, "source": source, "target": target,
-                    "direction": direction, "report": report}
+    def _texts_for_reconcile(self) -> dict[str, str]:
+        texts = sessions.verified_texts(self._payload.get("semantic_texts") or [])
+        texts.update(self._known_texts)
+        return texts
+
+    def _semantic_texts(self, payload: dict) -> list[dict]:
+        return sessions.semantic_texts_for(payload.get("semantic_decisions") or [], self._texts_for_reconcile(),
+                                           payload["source"], payload["target"])
+
+    def _remember_semantic_report(self, direction: str) -> None:
+        """Keep this run as one untrusted snapshot of the whole manuscript
+        (Web ``semantic_history``); the writer drops the oldest if too large."""
+        source, target = self._payload["source"], self._payload["target"]
+        segments = [{"segment_index": r.index, "source_start": r.source_core[0], "source_end": r.source_core[1],
+                     "target_start": r.target_core[0], "target_end": r.target_core[1], "report": r.report}
+                    for r in self._session.results if r.report is not None and r.current(source, target)]
+        snapshot = {"source": source, "target": target, "direction": direction,
+                    "segments": copy.deepcopy(segments[:MAX_HISTORY_SEGMENTS])}
         candidate = copy.deepcopy(self._payload)
-        candidate["semantic_history"] = (candidate.get("semantic_history", []) + [snapshot])[-MAX_SEMANTIC_HISTORY:]
+        history = list(candidate.get("semantic_history", []))
+        if self._history_written == self._history_run and history:
+            history[-1] = snapshot
+        else:
+            history.append(snapshot)
+        candidate["semantic_history"] = history[-MAX_SEMANTIC_HISTORY:]
         candidate.setdefault("semantic_decisions", [])
+        candidate["semantic_texts"] = self._semantic_texts(candidate)
         if semantic_payload_fits(_normalize_semantic(candidate)):
             self._payload = candidate
+            self._history_written = self._history_run
             self._document_revision += 1
 
     # -- translation in the manuscript ---------------------------------------
@@ -2227,6 +2261,8 @@ class ManuscriptView(QWidget):
             if not name:
                 return False
             path = Path(name)
+        if "semantic_decisions" in self._payload:
+            self._payload["semantic_texts"] = self._semantic_texts(self._payload)
         try:
             save_workfile(path, self._payload)
         except WorkfileError as exc:
@@ -2240,6 +2276,9 @@ class ManuscriptView(QWidget):
         except OSError as exc:
             self.status_label.setText(strings.MANUSCRIPT_SAVE_FAILED.format(reason=str(exc)))
             return False
+        if "semantic_history" in self._payload:
+            # The writer may have dropped the oldest history to fit 1 MiB.
+            self._payload["semantic_history"] = parse_workfile(serialize_workfile(self._payload))["semantic_history"]
         self._path = path
         self._saved_payload = copy.deepcopy(self._payload)
         self.status_label.setText(strings.MANUSCRIPT_SAVE_DONE)
@@ -2279,6 +2318,7 @@ class ManuscriptView(QWidget):
         self._conflict_mode = False
         self._refresh_conflicts()
         self._set_payload(value)
+        self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
         self._path = Path(name)
         self._saved_payload = copy.deepcopy(self._payload)
         self._set_review_state("history" if value["history"] else "none")
@@ -2297,6 +2337,7 @@ class ManuscriptView(QWidget):
         self._refresh_conflicts()
         value = empty_workfile()
         self._set_payload(value)
+        self._known_texts = {}
         self._saved_payload = copy.deepcopy(value)
         self._path = None
         self._set_review_state("none")
