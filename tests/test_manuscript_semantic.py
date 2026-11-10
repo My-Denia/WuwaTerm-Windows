@@ -1159,3 +1159,32 @@ def test_undo_never_revives_issues_whose_semantic_basis_was_withdrawn(qapp, long
         view._redo_edit()
         assert [d["decision"] for d in view._decisions()] == ["ignored"]
     asyncio.run(scenario())
+
+
+def test_accepting_one_issue_leaves_the_other_issues_of_its_segment_executable(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        view.accept_button.click()
+        assert view.semantic_list.currentRow() == 1
+        assert view.accept_button.isEnabled() and view.adjust_button.isEnabled()
+        view.accept_button.click()
+        both = TARGET.replace("second", "third").replace("will leave", "will not leave")
+        assert view._payload["target"] == both
+        assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "accepted"]
+        view._undo_replace()
+        assert view._payload["target"] == TARGET.replace("second", "third")
+        assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "pending"]
+        view.semantic_list.setCurrentRow(1)
+        assert view.accept_button.isEnabled()
+        view._undo_replace()
+        assert view._payload["target"] == TARGET
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "pending"]
+        view._redo_edit()
+        view._redo_edit()
+        assert view._payload["target"] == both
+        assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "accepted"]
+    asyncio.run(scenario())

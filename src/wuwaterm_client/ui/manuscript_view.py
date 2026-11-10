@@ -1130,12 +1130,18 @@ class ManuscriptView(QWidget):
         self._update_semantic_actions()
 
     def _basis_holds(self, issue: sessions.LiveIssue) -> bool:
-        """The issue still comes from a current semantic report the server
-        still offers; checked again right before accept or adjust runs."""
+        """The issue's semantic basis still holds; checked again right before
+        accept or adjust runs.
+
+        This is about one issue, not about reusing its segment's cache: an
+        accept elsewhere in the same segment makes the segment cache not
+        reusable, but leaves the other issues there executable. The issue's
+        own liveness (untouched by edits, spans still equal the text) is
+        checked separately by ``state_of`` and ``span_live``.
+        """
         if issue.basis_lost or not self._semantic_available():
             return False
-        return any(issue in r.issues and sessions.semantic_part_valid(r) and self._ready_pair_for(r) is not None
-                   for r in self._session.results)
+        return any(issue in r.issues and sessions.semantic_part_valid(r) for r in self._session.results)
 
     def _can_accept(self, issue: sessions.LiveIssue | None) -> bool:
         return (issue is not None and issue.issue["suggestion"] is not None and self._basis_holds(issue)
