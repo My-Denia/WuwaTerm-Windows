@@ -649,6 +649,7 @@ class ManuscriptView(QWidget):
         self.review_status = QFrame(inspector_body)
         self.review_status.setObjectName("reviewStatus")
         self.review_status.setProperty("tone", "neutral")
+        self.review_status.hide()
         status_layout = QVBoxLayout(self.review_status)
         status_layout.setContentsMargins(12, 8, 12, 10)
         status_layout.setSpacing(6)
@@ -821,6 +822,8 @@ class ManuscriptView(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
             self.track_group.addButton(button, index)
         self.terms_track_button.setChecked(True)
+        self.semantic_track_button.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
+        self.semantic_track_button.hide()
         self.track_group.idClicked.connect(self._show_track)
 
         page = QWidget(self)
@@ -829,6 +832,10 @@ class ManuscriptView(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        self.semantic_badge = QLabel(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL, page)
+        self.semantic_badge.setObjectName("experimentalBadge")
+        self.semantic_badge.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
+        layout.addWidget(self.semantic_badge, 0, Qt.AlignmentFlag.AlignLeft)
         self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
         self.semantic_note.setObjectName("secondaryText")
         self.semantic_note.setWordWrap(True)
@@ -1105,11 +1112,16 @@ class ManuscriptView(QWidget):
         if self._semantic_state == "error" and not self._semantic_running():
             self._show_status(self._semantic_detail, "danger")
             return
-        if self._capabilities is not None and not self._semantic_available() and not self._session.results:
-            self._show_status(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE, "neutral")
+        semantic = self._semantic_available()
+        if self._capabilities is not None and not semantic and not self._session.results:
+            # The usual state: a short manuscript reviewed for terms only. Its
+            # result is the term report; an empty semantic card would be noise.
+            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE)
+            self._hide_status()
             return
         if self._semantic_state == "none" and not self._session.results and not self._semantic_running():
-            self._show_status(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, "neutral")
+            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_NOT_RUN)
+            self._hide_status()
             return
         progress = self._progress()
         if progress is None:
@@ -1127,12 +1139,13 @@ class ManuscriptView(QWidget):
             text = strings.MANUSCRIPT_SEMANTIC_QUOTA.format(done=done, total=total)
             tone, bar = "warn", (done, total)
         else:
-            text = strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending)
+            text = (strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending) if semantic
+                    else strings.MANUSCRIPT_SEGMENTS_PROGRESS.format(done=done, total=total))
             failed = sum(1 for pair in self._cached_pairs() or () if self._segment_status(pair) in ("failed", "not_reviewed"))
             if failed:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS.format(count=failed)
                 tone = "warn"
-            if not self._session.issues() and done:
+            if semantic and not self._session.issues() and done:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_NONE
         self._show_status(text, tone, bar)
 
@@ -1141,6 +1154,8 @@ class ManuscriptView(QWidget):
         segment count as a bar while the run is going or waiting to go on.
         Neutral and done look alike on purpose: no issues is not a pass."""
         self.semantic_progress.setText(text)
+        if self.review_status.isHidden():
+            self.review_status.show()
         if self.review_status.property("tone") != tone:
             self.review_status.setProperty("tone", tone)
             self.review_status.style().unpolish(self.review_status)
@@ -1151,6 +1166,10 @@ class ManuscriptView(QWidget):
             self.review_progress.setValue(bar[0])
         if self.review_progress.isVisibleTo(self.review_status) != show_bar:
             self.review_progress.setVisible(show_bar)
+
+    def _hide_status(self) -> None:
+        if not self.review_status.isHidden():
+            self.review_status.hide()
 
     def _render_inspector_hint(self) -> None:
         if self._report is not None or self._review_state == "reviewing":
@@ -1506,6 +1525,15 @@ class ManuscriptView(QWidget):
             button.setText(text)
             button.setAccessibleName(text)
         self.segments_track_button.setToolTip(strings.MANUSCRIPT_SEGMENTS_NOTE)
+        # Semantic review is an experimental server option, off by default.
+        # Without it the track would only ever be empty; it appears once the
+        # server offers it, or when the manuscript already carries its data.
+        semantic = self._semantic_available() or bool(self._issue_rows) or bool(self._decisions())
+        if self.semantic_track_button.isVisibleTo(self) != semantic:
+            self.semantic_track_button.setVisible(semantic)
+        if not semantic and self.track_stack.currentIndex() == TRACK_SEMANTIC:
+            self._show_track(TRACK_TERMS)
+            return
         track = self.track_stack.currentIndex()
         if track == TRACK_SEMANTIC:
             current, total = self.semantic_list.currentRow(), len(self._issue_rows)

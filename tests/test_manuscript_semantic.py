@@ -166,6 +166,40 @@ def test_old_core_keeps_the_term_review_only(qapp) -> None:
         assert view._review_state == "current"
         assert view.semantic_progress.text() == strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE
         assert view.semantic_list.count() == 0
+        # Semantic review is off by default on servers: no empty track or card.
+        assert view.semantic_track_button.isHidden()
+        assert view.review_status.isHidden()
+    asyncio.run(scenario())
+
+
+def test_long_manuscript_without_semantic_shows_neutral_segment_progress(qapp) -> None:
+    """The usual production state: segments are reviewed for terms only, and
+    the progress says so without naming a semantic review that never ran."""
+    source = ("第一段。" * 100 + "\n\n" + "第二段。" * 100 + "\n\n" + "第三段。" * 100) * 2
+    target = ("One. " * 100 + "\n\n" + "Two. " * 100 + "\n\n" + "Three. " * 100) * 2
+
+    async def scenario():
+        server = Server(capabilities=("translation-context-v1",))
+        view = make_view(server, source, target)
+        view._start_review()
+        await settle(view)
+        assert "/v1/semantic-reviews" not in server.paths()
+        done, total = view._progress()
+        assert done == total >= 2
+        assert view.semantic_progress.text() == strings.MANUSCRIPT_SEGMENTS_PROGRESS.format(done=done, total=total)
+        assert not view.review_status.isHidden() and view.semantic_track_button.isHidden()
+    asyncio.run(scenario())
+
+
+def test_semantic_track_appears_with_the_capability_and_says_it_is_experimental(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        assert view.semantic_track_button.isHidden()
+        view._start_review()
+        await settle(view)
+        assert not view.semantic_track_button.isHidden()
+        assert view.semantic_badge.text() == strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL
+        assert strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL in view.semantic_progress.text()
     asyncio.run(scenario())
 
 

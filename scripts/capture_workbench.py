@@ -32,16 +32,24 @@ def _parse() -> argparse.Namespace:
 
 
 ARGS = _parse()
+_ORIGINAL_CWD = Path.cwd()
 # Before any Qt import: the scale factor and platform are read at startup.
 os.environ["QT_SCALE_FACTOR"] = ARGS.scale
 os.environ["APPDATA"] = tempfile.mkdtemp(prefix="wuwaterm-capture-")
 # The default offscreen screen is 800x800, smaller than the workbench's own
-# default size; describe a 1920x1080 desktop so the window is not clamped.
+# default size. Describe a desktop that still leaves room for the requested
+# logical size once the scale factor divides it.
+_scale = float(ARGS.scale)
+_width, _height = (int(v) for v in ARGS.size.split("x"))
 _screen = Path(os.environ["APPDATA"]) / "offscreen.json"
 _screen.write_text(json.dumps({"screens": [{
-    "name": "capture", "x": 0, "y": 0, "width": 1920, "height": 1080,
+    "name": "capture", "x": 0, "y": 0,
+    "width": int((_width + 200) * _scale), "height": int((_height + 200) * _scale),
     "logicalDpi": 96, "logicalBaseDpi": 96, "dpr": 1}]}), encoding="utf-8")
-os.environ["QT_QPA_PLATFORM"] = f"offscreen:configfile={_screen}"
+# Relative to the working directory: a Windows drive letter's colon would end
+# the platform argument early.
+os.chdir(_screen.parent)
+os.environ["QT_QPA_PLATFORM"] = "offscreen:configfile=offscreen.json"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import httpx  # noqa: E402
@@ -160,23 +168,34 @@ def _term_report(source: str, target: str) -> dict:
 
 
 class _Server:
-    def __init__(self, quota_after: int | None = None) -> None:
+    """``semantic`` mirrors the server switch: semantic review is an
+    experimental option, off by default, while translation context stays."""
+
+    def __init__(self, semantic: bool, quota_after: int | None = None) -> None:
+        self.semantic = semantic
         self.quota_after = quota_after
-        self.semantic_calls = 0
+        self.calls = 0
+
+    def _quota(self) -> httpx.Response | None:
+        self.calls += 1
+        if self.quota_after is not None and self.calls > self.quota_after:
+            return httpx.Response(429, json={"error": {"code": "rate_limited", "message": "slow down"},
+                                             "request_id": "req-quota"})
+        return None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
         path = request.url.path
         if path == "/v1/capabilities":
-            return httpx.Response(200, json={"api_version": "v1", "request_id": "caps",
-                                             "capabilities": ["semantic-review-v1", "translation-context-v1"]})
+            names = ["translation-context-v1"] + (["semantic-review-v1"] if self.semantic else [])
+            return httpx.Response(200, json={"api_version": "v1", "request_id": "caps", "capabilities": names})
         if path == "/v1/reviews":
+            if not self.semantic and (refused := self._quota()) is not None:
+                return refused
             return httpx.Response(200, json=_term_report(body["source"], body["target"]))
         if path == "/v1/semantic-reviews":
-            self.semantic_calls += 1
-            if self.quota_after is not None and self.semantic_calls > self.quota_after:
-                return httpx.Response(429, json={"error": {"code": "rate_limited", "message": "slow down"},
-                                                 "request_id": "req-quota"})
+            if (refused := self._quota()) is not None:
+                return refused
             source, target = body["source"], body["target"]
             return httpx.Response(200, json={
                 "request_id": "req-sem-0001", "review_version": "semantic-review-v1",
@@ -229,17 +248,13 @@ def _review(window) -> None:
     asyncio.run(run())
 
 
-def _states(app):
+def _states(semantic: bool):
     """(name, builder) pairs; each builder returns a window ready to grab."""
-
-    def empty():
-        return _window(_Server())
-
-    def unconfigured():
-        return _window(_Server(), configured=False)
+    long_source = "\n\n".join([SOURCE] * 24)
+    long_target = "\n\n".join([TARGET] * 24)
 
     def drafted():
-        window = _window(_Server())
+        window = _window(_Server(semantic))
         _load(window, SOURCE, TARGET)
         return window
 
@@ -258,13 +273,17 @@ def _states(app):
         view.semantic_list.setCurrentRow(0)
         return window
 
-    def quota():
-        window = _window(_Server(quota_after=1))
-        long_source = "\n\n".join([SOURCE] * 24)
-        long_target = "\n\n".join([TARGET] * 24)
+    def long_reviewed():
+        window = _window(_Server(semantic))
         _load(window, long_source, long_target)
         _review(window)
-        window.manuscript_view._show_track(TRACK_SEMANTIC)
+        return window
+
+    def quota():
+        window = _window(_Server(semantic, quota_after=1))
+        _load(window, long_source, long_target)
+        _review(window)
+        window.manuscript_view._show_track(TRACK_SEMANTIC if semantic else 0)
         return window
 
     def segments():
@@ -273,32 +292,43 @@ def _states(app):
         window.manuscript_view.segment_list.setCurrentRow(1)
         return window
 
-    return [("01-empty", empty), ("02-unconfigured", unconfigured), ("03-draft", drafted),
-            ("04-terms", terms), ("05-semantic-issue", semantic_issue), ("06-quota-paused", quota),
-            ("07-segments", segments)]
+    if not semantic:
+        return [("01-empty", lambda: _window(_Server(False))),
+                ("02-unconfigured", lambda: _window(_Server(False), configured=False)),
+                ("03-draft", drafted), ("04-terms", terms), ("05-long-reviewed", long_reviewed),
+                ("06-quota-paused", quota), ("07-segments", segments)]
+    return [("04-terms", terms), ("05-semantic-issue", semantic_issue),
+            ("06-quota-paused", quota), ("07-segments", segments)]
+
+
+def _capture(app, build, path: Path) -> bool:
+    window = build()
+    for _ in range(5):
+        app.processEvents()
+    image = window.grab()
+    saved = image.save(str(path))
+    print(f"{path.name} {image.width()}x{image.height()} px" if saved else f"failed to save {path}")
+    window.manuscript_view._saved_payload = window.manuscript_view._payload
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+    return saved
 
 
 def main() -> int:
     keyring.set_keyring(_MemoryKeyring())
     app = QApplication.instance() or QApplication([sys.argv[0]])
     app.setStyle("Fusion")
+    ARGS.out = ARGS.out.resolve() if ARGS.out.is_absolute() else (_ORIGINAL_CWD / ARGS.out).resolve()
     ARGS.out.mkdir(parents=True, exist_ok=True)
     scale_tag = ARGS.scale.replace(".", "")
     for scheme in ARGS.themes.split(","):
         theme.apply_theme(app, scheme)
-        for name, build in _states(app):
-            window = build()
-            for _ in range(5):
-                app.processEvents()
-            path = ARGS.out / f"{name}-{scheme}-{scale_tag}x-{ARGS.size}.png"
-            if not window.grab().save(str(path)):
-                print(f"failed to save {path}", file=sys.stderr)
-                return 1
-            window.manuscript_view._saved_payload = window.manuscript_view._payload
-            window.close()
-            window.deleteLater()
-            app.processEvents()
-            print(path)
+        for mode, semantic in (("plain", False), ("semantic", True)):
+            for name, build in _states(semantic):
+                path = ARGS.out / f"{mode}-{name}-{scheme}-{scale_tag}x.png"
+                if not _capture(app, build, path):
+                    return 1
     return 0
 
 

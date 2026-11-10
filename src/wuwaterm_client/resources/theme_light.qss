@@ -1232,3 +1232,13 @@ QDialogButtonBox {
     background-color: @accent@;
     border-radius: 2px;
 }
+
+/* 语义轨的"实验性"标记:中性小签,不用警示色,以免读成"出错"。 */
+#experimentalBadge {
+    background-color: @info-soft@;
+    color: @info@;
+    border: 1px solid @info@;
+    border-radius: 9px;
+    padding: 1px 8px;
+    font-size: @font-size-caption@;
+}

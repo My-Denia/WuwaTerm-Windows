@@ -79,6 +79,7 @@ OBJECT_NAMES = (
     "noticeText",
     "reviewStatus",
     "statusText",
+    "experimentalBadge",
 )
 
 # The dynamic properties, and the values the views set on them.
