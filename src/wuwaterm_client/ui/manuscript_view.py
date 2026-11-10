@@ -10,7 +10,7 @@ import asyncio
 import copy
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -202,6 +202,23 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._pending = None
             self._pending_range = None
+
+    def inputMethodQuery(self, query):
+        """Report caret rectangles in this widget's coordinates.
+
+        QPlainTextEdit answers in viewport coordinates, while the input method
+        maps the answer from the editor's own origin. The frame and the
+        stylesheet padding then move the IME candidate window up and left by
+        the viewport offset, onto the line being composed.
+        """
+        value = super().inputMethodQuery(query)
+        if query in (Qt.InputMethodQuery.ImCursorRectangle, Qt.InputMethodQuery.ImAnchorRectangle):
+            offset = self.viewport().pos()
+            if isinstance(value, QRectF):
+                return value.translated(offset.x(), offset.y())
+            if isinstance(value, QRect):
+                return value.translated(offset)
+        return value
 
     def inputMethodEvent(self, event) -> None:  # noqa: N802
         committed = bool(event.commitString()) or bool(event.replacementLength())
