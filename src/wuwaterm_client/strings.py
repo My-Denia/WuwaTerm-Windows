@@ -596,3 +596,30 @@ MANUSCRIPT_TRANSLATED = "已写入机器翻译；请检查后再审校。可以�
 MANUSCRIPT_TRANSLATE_ONLY_BLANK = "只翻译空白的译文或尚未翻译的段落，不会覆盖已有译文。"
 MANUSCRIPT_TRANSLATE_CHANGED = "翻译期间正文已更改，没有写入译文。"
 MANUSCRIPT_SHORTCUTS = "快捷键：F8 / Shift+F8 下一条/上一条，Ctrl+Enter 采纳，Ctrl+Shift+E 调整，Ctrl+Shift+I 忽略，Ctrl+Shift+R 审校，Ctrl+Shift+T 翻译。"
+
+
+# -- N2 file continuity --
+MENU_EDIT = "编辑(&E)"
+EDIT_PASTE_SOURCE = "粘贴为原文"
+EDIT_PASTE_TARGET = "粘贴为译文"
+EDIT_COPY_TARGET = "复制译文"
+MANUSCRIPT_NEW_FROM_CLIPBOARD = "从剪贴板新建"
+CLIPBOARD_EMPTY = "剪贴板里没有文本，没有改动。"
+COPY_TARGET_DONE = "已复制译文。"
+COPY_TARGET_EMPTY = "译文是空的，没有复制。"
+IMPORT_ONE_FILE_ONLY = "一次只能拖入一个文件，没有改动。"
+IMPORT_UNSUPPORTED_TYPE = "只能拖入 .txt、.md 文本或 .json 稿件文件，没有改动。"
+IMPORT_TOO_LARGE = "文件超过 1 MiB，没有导入。"
+IMPORT_NOT_UTF8 = "文件不是 UTF-8 文本，没有导入。"
+IMPORT_READ_FAILED = "无法读取文件，没有导入：{reason}"
+IMPORT_UNCHANGED = "内容与当前相同，没有改动。"
+IMPORT_REPLACED = {
+    "source": "已替换原文。可以撤销。",
+    "target": "已替换译文。可以撤销。",
+}
+RECENT_MENU = "最近打开(&R)"
+RECENT_NONE = "无最近文件"
+RECENT_MISSING_SUFFIX = "（文件不存在）"
+RECENT_REMOVE_MISSING = "移除不存在的条目"
+RECENT_CLEAR = "清除最近文件"
+RECENT_FILE_MISSING = "文件已不存在，无法打开：{name}"

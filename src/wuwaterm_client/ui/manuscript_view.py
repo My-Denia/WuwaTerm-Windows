@@ -7,18 +7,20 @@ opening and saving without editing therefore does not rewrite a manuscript.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import copy
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import semantic, strings
+from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .. import semantic_session as sessions
 from ..errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_LLM_BUDGET_EXHAUSTED,
@@ -45,6 +47,10 @@ _FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGU
 # The same failure on consecutive segments is the service, not the segment.
 _REPEATED_FAILURES = 2
 TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
+# A dropped text file is read whole into the editor, so it gets the same
+# ceiling as a workfile.
+MAX_IMPORT_BYTES = 1_048_576
+_TEXT_SUFFIXES = (".txt", ".md")
 _DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 _REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
 
@@ -117,6 +123,12 @@ class LosslessEditor(QPlainTextEdit):
     undoRequested = Signal()
     redoRequested = Signal()
     compositionChanged = Signal()
+    # Local files dropped (or pasted) on the editor: (paths, side). The view
+    # decides what they mean; the editor only keeps Qt from typing a URL.
+    filesDropped = Signal(object, str)
+    focused = Signal()
+
+    side = "source"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -162,7 +174,57 @@ class LosslessEditor(QPlainTextEdit):
         cursor = self.textCursor()
         self._pending_range = (cursor.selectionStart(), cursor.selectionEnd())
 
+    @staticmethod
+    def local_files(mime) -> list[str]:
+        if mime is None or not mime.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        # File URLs are intercepted even when the drag also carries text:
+        # QMimeData.text() would otherwise hand Qt the URL to type in.
+        if self.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        files = self.local_files(event.mimeData())
+        if not files:
+            super().dropEvent(event)
+            return
+        # Accept and return at once: whatever the drop leads to may show a
+        # dialog, and a modal inside the drop blocks the Explorer drag source.
+        event.acceptProposedAction()
+        self.filesDropped.emit(files, self.side)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        self.focused.emit()
+        super().focusInEvent(event)
+
+    def raw_cursor_offset(self) -> int:
+        index = _scalar_boundary(self._shown, self.textCursor().position())
+        return self._bounds[index] if index is not None else 0
+
+    def set_raw_cursor_offset(self, offset: int) -> None:
+        """Caret at a raw scalar offset, clamped; one inside a CRLF goes before it."""
+        offset = max(0, min(offset, len(self._raw)))
+        index = max(0, bisect.bisect_right(self._bounds, offset) - 1)
+        cursor = self.textCursor()
+        cursor.setPosition(_utf16_position(self._shown, index))
+        self.setTextCursor(cursor)
+
     def insertFromMimeData(self, source) -> None:  # noqa: N802
+        files = self.local_files(source)
+        if files:
+            self.filesDropped.emit(files, self.side)
+            return
         self._pending = source.text() if source.hasText() else None
         self._remember_cursor()
         try:
@@ -371,6 +433,13 @@ class _ElidedDocumentLabel(QLabel):
 class ManuscriptView(QWidget):
     documentChanged = Signal()
     lookup_requested = Signal(str)
+    # File continuity: the owner of the config (MainWindow) keeps the recent
+    # list; the view only reports. `documentLeaving` fires after the discard
+    # was settled and before the old document is replaced, so work_position()
+    # still describes it.
+    documentLeaving = Signal()
+    documentSaved = Signal()
+    documentOpened = Signal(str)
 
     def __init__(self, api_client, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -396,6 +465,13 @@ class ManuscriptView(QWidget):
         self._conflict_indexes: list[int] = []
         self._document_state: tuple[Path | None, bool, int] | None = None
         self._document_revision = 0
+        # Work position (see work_position): the editor last focused, an issue
+        # fingerprint waiting for its review to come back, and a counter that
+        # drops a deferred scroll restore once another document is open.
+        self._last_side = "target"
+        self._pending_issue_id: str | None = None
+        self._restore_serial = 0
+        self.setAcceptDrops(True)
         self._compact = False
         self._inspector_requested = True
         # Semantic review (semantic-review-v1). Capabilities are probed only
@@ -434,7 +510,10 @@ class ManuscriptView(QWidget):
         self.target_edit = LosslessEditor(self)
         self.source_edit.setPlaceholderText(strings.MANUSCRIPT_SOURCE_PLACEHOLDER)
         self.target_edit.setPlaceholderText(strings.MANUSCRIPT_TARGET_PLACEHOLDER)
+        self.target_edit.side = "target"
         for editor in (self.source_edit, self.target_edit):
+            editor.filesDropped.connect(self._files_dropped)
+            editor.focused.connect(lambda e=editor: setattr(self, "_last_side", e.side))
             editor.setMinimumHeight(36)
             editor.setMinimumWidth(80)
             editor.rawChanged.connect(lambda side="source" if editor is self.source_edit else "target",
@@ -1045,6 +1124,7 @@ class ManuscriptView(QWidget):
                 self._rows_dirty = False
         finally:
             self._refreshing_lists = False
+        self._select_pending_issue()
         self.semantic_list.setVisible(bool(rows))
         self._render_issue(self._current_issue())
         self._render_semantic_progress()
@@ -1203,6 +1283,8 @@ class ManuscriptView(QWidget):
         if self._refreshing_lists:
             return
         issue = self._current_issue()
+        if issue is not None:
+            self._pending_issue_id = None  # the owner chose; do not override
         self.issue_alternative_button.blockSignals(True)
         self.issue_alternative_button.setChecked(False)
         self.issue_alternative_button.blockSignals(False)
@@ -1449,6 +1531,10 @@ class ManuscriptView(QWidget):
     @property
     def document_title(self) -> str:
         return self._path.name if self._path is not None else strings.MANUSCRIPT_UNTITLED
+
+    @property
+    def document_path(self) -> Path | None:
+        return self._path
 
     @property
     def document_dirty(self) -> bool:
@@ -2475,14 +2561,21 @@ class ManuscriptView(QWidget):
         self._saved_payload = copy.deepcopy(self._payload)
         self.status_label.setText(strings.MANUSCRIPT_SAVE_DONE)
         self._update_controls()
+        self.documentSaved.emit()
         return True
 
     def open_document(self, _checked: bool = False) -> None:
         if not self._input_ready():
             return
         name, _ = QFileDialog.getOpenFileName(self, strings.MANUSCRIPT_OPEN, "", strings.MANUSCRIPT_FILE_FILTER)
-        if not name:
-            return
+        if name:
+            self.open_path(name)
+
+    def open_path(self, name: str | Path) -> bool:
+        """The one way a workfile is opened: dialog, drop and recent list."""
+        if not self._input_ready():
+            return False
+        name = str(name)
         def read_candidate() -> dict:
             value = load_workfile(name)
             if not self.source_edit.can_display(value["source"]) or not self.target_edit.can_display(value["target"]):
@@ -2492,16 +2585,19 @@ class ManuscriptView(QWidget):
             read_candidate()
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
-            return
+            return False
         if not self.confirm_discard():
-            return
+            return False
         # Saving the dirty draft may have overwritten the selected file. Read
         # again so the restored draft and the saved baseline reflect disk.
         try:
             value = read_candidate()
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
-            return
+            return False
+        self.documentLeaving.emit()
+        self._pending_issue_id = None
+        self._restore_serial += 1
         self._invalidate_report()
         self._stop_translation()
         self._clear_semantic()
@@ -2522,10 +2618,15 @@ class ManuscriptView(QWidget):
         self._set_review_state("history" if value["history"] else "none")
         self.status_label.setText(strings.MANUSCRIPT_OPENED)
         self._update_controls()
+        self.documentOpened.emit(name)
+        return True
 
-    def new_document(self, _checked: bool = False) -> None:
+    def new_document(self, _checked: bool = False) -> bool:
         if not self.confirm_discard():
-            return
+            return False
+        self.documentLeaving.emit()
+        self._pending_issue_id = None
+        self._restore_serial += 1
         self._invalidate_report()
         self._stop_translation()
         self._clear_semantic()
@@ -2542,3 +2643,171 @@ class ManuscriptView(QWidget):
         self._path = None
         self._set_review_state("none")
         self._update_controls()
+        return True
+
+    # -- file continuity: import, clipboard, work position -------------------
+    def _files_dropped(self, paths: list[str], side: str) -> None:
+        QTimer.singleShot(0, lambda: self.import_files(paths, side))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if LosslessEditor.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if LosslessEditor.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        files = LosslessEditor.local_files(event.mimeData())
+        if not files:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        self._files_dropped(files, "source")
+
+    def import_files(self, paths: list[str], side: str = "source") -> None:
+        """What dropped files mean: .json opens, .txt/.md replace one side."""
+        if not self._input_ready():
+            return
+        if len(paths) != 1:
+            self.status_label.setText(strings.IMPORT_ONE_FILE_ONLY)
+            return
+        path = Path(paths[0])
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            self.open_path(path)
+        elif suffix in _TEXT_SUFFIXES:
+            text = self._read_import_text(path)
+            if text is not None:
+                self._replace_side(side, text)
+        else:
+            self.status_label.setText(strings.IMPORT_UNSUPPORTED_TYPE)
+
+    def _read_import_text(self, path: Path) -> str | None:
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(MAX_IMPORT_BYTES + 1)
+        except OSError as exc:
+            self.status_label.setText(strings.IMPORT_READ_FAILED.format(reason=exc.strerror or type(exc).__name__))
+            return None
+        if len(data) > MAX_IMPORT_BYTES:
+            self.status_label.setText(strings.IMPORT_TOO_LARGE)
+            return None
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            self.status_label.setText(strings.IMPORT_NOT_UTF8)
+            return None
+
+    def _replace_side(self, side: str, text: str) -> bool:
+        """Replace one whole side as a single undoable edit."""
+        editor = self.target_edit if side == "target" else self.source_edit
+        if not editor.can_display(text):
+            self.status_label.setText(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
+            return False
+        value = self._draft_snapshot()
+        if value[side] == text:
+            self.status_label.setText(strings.IMPORT_UNCHANGED)
+            return False
+        value[side] = text
+        if value["alignments"] is not None:
+            value["alignments"] = []
+        self._apply_edit(value)
+        self.status_label.setText(strings.IMPORT_REPLACED[side])
+        return True
+
+    def paste_as(self, side: str) -> bool:
+        if not self._input_ready():
+            return False
+        text = QApplication.clipboard().text()
+        if not text:
+            self.status_label.setText(strings.CLIPBOARD_EMPTY)
+            return False
+        return self._replace_side(side, text)
+
+    def copy_target(self) -> bool:
+        text = self.target_edit.raw_text()
+        if not text:
+            self.status_label.setText(strings.COPY_TARGET_EMPTY)
+            return False
+        QApplication.clipboard().setText(text)
+        self.status_label.setText(strings.COPY_TARGET_DONE)
+        return True
+
+    def new_from_clipboard(self) -> bool:
+        if not self._input_ready():
+            return False
+        text = QApplication.clipboard().text()
+        if not text:
+            self.status_label.setText(strings.CLIPBOARD_EMPTY)
+            return False
+        # Checked before the old draft is given up, not after.
+        if not self.source_edit.can_display(text):
+            self.status_label.setText(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
+            return False
+        if not self.new_document():
+            return False
+        return self._replace_side("source", text)
+
+    def work_position(self) -> dict:
+        """Where the owner was, as plain data for the recent list.
+
+        Pure reads of widget state; called on save, leave and close, never
+        while typing.
+        """
+        editor = self.source_edit if self._last_side == "source" else self.target_edit
+        issue = self._current_issue()
+        width = None
+        if not self.inspector.isHidden():
+            value = self.work_splitter.sizes()[1]
+            if MIN_PANEL_WIDTH <= value <= MAX_PANEL_WIDTH:
+                width = value
+        return {
+            "cursor": {"side": editor.side, "offset": editor.raw_cursor_offset()},
+            "scroll": {"source": self.source_edit.verticalScrollBar().value(),
+                       "target": self.target_edit.verticalScrollBar().value()},
+            "selected_issue_id": issue.issue["fingerprint"] if issue is not None else self._pending_issue_id,
+            "panel_width": width,
+        }
+
+    def restore_work_position(self, entry: dict) -> None:
+        """Apply a stored position to the open document; clamps if it changed."""
+        cursor = entry.get("cursor")
+        if isinstance(cursor, dict) and cursor.get("side") in ("source", "target") \
+                and isinstance(cursor.get("offset"), int):
+            editor = self.source_edit if cursor["side"] == "source" else self.target_edit
+            editor.set_raw_cursor_offset(cursor["offset"])
+            self._last_side = cursor["side"]
+        width = entry.get("panel_width")
+        if isinstance(width, int) and not isinstance(width, bool) and not self.inspector.isHidden():
+            self.work_splitter.setSizes([max(1, sum(self.work_splitter.sizes()) - width), width])
+        issue_id = entry.get("selected_issue_id")
+        self._pending_issue_id = issue_id if isinstance(issue_id, str) else None
+        scroll = entry.get("scroll")
+        if isinstance(scroll, dict):
+            # After layout: before it the scrollbars have no range to clamp to,
+            # and setting the caret above scrolls to make it visible.
+            self._restore_serial += 1
+            serial = self._restore_serial
+            QTimer.singleShot(0, lambda: self._restore_scroll(serial, scroll))
+
+    def _restore_scroll(self, serial: int, scroll: dict) -> None:
+        if serial != self._restore_serial:
+            return
+        for side, editor in (("source", self.source_edit), ("target", self.target_edit)):
+            value = scroll.get(side)
+            if isinstance(value, int) and not isinstance(value, bool):
+                editor.verticalScrollBar().setValue(value)
+
+    def _select_pending_issue(self) -> None:
+        if self._pending_issue_id is None or self._current_issue() is not None:
+            return
+        for row, issue in enumerate(self._issue_rows):
+            if issue.issue["fingerprint"] == self._pending_issue_id:
+                self._pending_issue_id = None
+                self.semantic_list.setCurrentRow(row)
+                return
