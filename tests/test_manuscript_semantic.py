@@ -804,3 +804,17 @@ def test_re_reviewing_an_edited_segment_replaces_its_old_issues(qapp) -> None:
         assert len(view._session.issues()) == count
         assert all(view._issue_state(i) == "pending" for i in view._session.issues())
     asyncio.run(scenario())
+
+
+def test_segmented_term_review_keeps_the_owners_alignment_choice(qapp) -> None:
+    async def scenario():
+        for alignments, expected in ((None, None), ([], [])):
+            server = Server(capabilities=None)
+            view = make_view(server, LONG_SOURCE, LONG_TARGET)
+            view._payload["alignments"] = alignments
+            view._start_review()
+            await settle(view)
+            sent = server.sent("/v1/reviews")
+            assert sent and all(body.get("alignments") == expected for body in sent)
+            assert all(("alignments" in body) is (expected is not None) for body in sent)
+    asyncio.run(scenario())

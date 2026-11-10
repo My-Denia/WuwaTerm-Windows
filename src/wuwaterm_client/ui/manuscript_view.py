@@ -1929,6 +1929,27 @@ class ManuscriptView(QWidget):
                 return pair
         return None
 
+    def _segment_alignments(self, pair) -> list | None:
+        """The owner's correspondence for one segment's term request.
+
+        ``None`` (automatic) stays automatic. An explicit list, including the
+        empty list an edit leaves behind, never becomes automatic: the
+        alignments inside this segment's cores move to segment coordinates and
+        the rest are left out.
+        """
+        alignments = self._payload["alignments"]
+        if alignments is None:
+            return None
+        (a, b), (c, d) = (pair.source.core_start, pair.source.core_end), (pair.target.core_start, pair.target.core_end)
+        out = []
+        for item in alignments:
+            source, target = item["source"], item["target"]
+            if a <= source["start"] and source["end"] <= b and (target is None or c <= target["start"] and target["end"] <= d):
+                out.append({"source": {**source, "start": source["start"] - a, "end": source["end"] - a},
+                            "target": None if target is None else
+                            {**target, "start": target["start"] - c, "end": target["end"] - c}})
+        return out
+
     def _context_for(self, pair) -> dict | None:
         if pair.index == 0:
             return None
@@ -1973,7 +1994,8 @@ class ManuscriptView(QWidget):
             term_report = existing.term_report if existing is not None else None
             try:
                 if segments and term_report is None:
-                    term_report = await self._api_client.review_pair(key[4], key[5], direction)
+                    term_report = await self._api_client.review_pair(
+                        key[4], key[5], direction, alignments=self._segment_alignments(pair))
                 if semantic_on and generation == self._semantic_generation:
                     report = await self._api_client.semantic_review(
                         key[4], key[5], direction, before=before, precedents=precedents)
