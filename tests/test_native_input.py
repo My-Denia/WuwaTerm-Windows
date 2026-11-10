@@ -86,7 +86,7 @@ def test_ime_cursor_rectangle_matches_the_visible_caret(tmp_path) -> None:
     editor frame and stylesheet padding (20, 16 px in the workbench), so the
     candidate window covered the line being composed."""
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONPATH=str(ROOT / "src"), APPDATA=str(tmp_path))
-    completed = subprocess.run([sys.executable, "-c", _PROBE], cwd=tmp_path, env=env,
+    completed = subprocess.run([sys.executable, "-c", _PROBE], cwd=tmp_path, env=env, check=False,
                                capture_output=True, text=True, timeout=120)
     assert completed.returncode == 0, completed.stderr
     lines = [line.split()[1:] for line in completed.stdout.splitlines() if line.startswith("OFFSET ")]
