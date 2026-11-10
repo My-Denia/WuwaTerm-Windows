@@ -234,8 +234,13 @@ class Session:
             if result.term_report is not None and not term_part_valid(result, basis):
                 result.term_report, result.term_alignments, result.term_findings = None, None, []
             if result.report is not None and not (basis.semantic_required and semantic_part_valid(result)):
-                result.report, result.issues = None, []
-            if result.term_report is not None or result.report is not None:
+                # No longer a usable semantic result (for example the server
+                # stopped listing semantic-review-v1): its issues stay visible
+                # as needing reconfirmation, never actionable; decisions stay.
+                result.report = None
+                for issue in result.issues:
+                    issue.invalid = True
+            if result.term_report is not None or result.report is not None or result.issues:
                 kept.append(result)
         self.results = kept
 

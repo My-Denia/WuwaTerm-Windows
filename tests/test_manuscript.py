@@ -262,3 +262,18 @@ def test_actual_web_and_client_read_each_others_v2_files(contract_source) -> Non
         assert answer["parsed"] == payload
         assert manuscript.parse_workfile(answer["webFile"]) == payload
         assert answer["webFile"] == manuscript.serialize_workfile(payload), "both writers produce the same bytes"
+
+
+def test_integral_float_alignment_offsets_are_read_as_int() -> None:
+    source, target = "alpha beta", "甲乙 丙丁"
+    draft = manuscript.empty_workfile()
+    draft.update(source=source, target=target, alignments=[
+        {"source": {"start": 0.0, "end": 5.0, "text": "alpha"}, "target": {"start": 0.0, "end": 2.0, "text": "甲乙"}}])
+    parsed = manuscript.parse_workfile(json.dumps(draft, ensure_ascii=False))
+    span = parsed["alignments"][0]["source"]
+    assert (span["start"], span["end"]) == (0, 5) and type(span["start"]) is int and type(span["end"]) is int
+    bad = json.loads(json.dumps(draft))
+    bad["alignments"][0]["source"]["end"] = 4.5
+    with pytest.raises(manuscript.WorkfileError) as error:
+        manuscript.parse_workfile(json.dumps(bad))
+    assert error.value.code == "workfile_invalid_content"

@@ -1078,3 +1078,51 @@ def test_alignment_spans_are_clipped_to_the_core_or_left_out(qapp) -> None:
     assert view._alignments_for(*first) == []
     assert view._alignments_for(*second) == [{"source": _span(ALIGNED_SOURCE[1204:2404], 296, 396),
                                               "target": None}]
+
+
+def test_a_workfile_with_float_alignment_offsets_reviews_in_segments(qapp, tmp_path, monkeypatch) -> None:
+    path = tmp_path / "floats.json"
+    cuts_s, cuts_t = (0, 600, 1204, len(ALIGNED_SOURCE)), (0, 600, 1203, len(ALIGNED_TARGET))
+
+    def floating(text, a, b):
+        return {**_span(text, a, b), "start": float(a), "end": float(b)}
+    draft = empty_workfile()
+    draft.update(source=ALIGNED_SOURCE, target=ALIGNED_TARGET, alignments=[
+        {"source": floating(ALIGNED_SOURCE, cuts_s[i], cuts_s[i + 1]),
+         "target": floating(ALIGNED_TARGET, cuts_t[i], cuts_t[i + 1])} for i in range(3)])
+    path.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+
+    async def scenario():
+        server = Server(capabilities=None)
+        view = _reopen(path, server, monkeypatch)
+        assert type(view._payload["alignments"][0]["source"]["end"]) is int
+        view._start_review()
+        await settle(view)
+        assert view._semantic_state == "done"
+        sent = server.sent("/v1/reviews")
+        assert len(sent) == 2
+        core_s, core_t = ALIGNED_SOURCE[2:1202], ALIGNED_TARGET[1:1201]
+        assert sent[0]["alignments"] == [
+            {"source": _span(core_s, 0, 598), "target": _span(core_t, 0, 599)},
+            {"source": _span(core_s, 598, 1200), "target": _span(core_t, 599, 1200)}]
+    asyncio.run(scenario())
+
+
+def test_withdrawn_semantic_capability_leaves_old_issues_stale_on_a_short_manuscript(qapp) -> None:
+    async def scenario():
+        server = Server(issues=two_issues)
+        view = make_view(server, SOURCE, TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        server.capabilities = ()
+        view._start_review()
+        await settle(view)
+        assert len(server.sent("/v1/semantic-reviews")) == 1
+        assert [view._issue_state(i) for i in view._issue_rows] == ["stale", "stale"]
+        view.semantic_list.setCurrentRow(0)
+        assert not view.accept_button.isEnabled() and not view.adjust_button.isEnabled()
+        assert [d["decision"] for d in view._decisions()] == ["ignored"], "decisions stay as history"
+    asyncio.run(scenario())

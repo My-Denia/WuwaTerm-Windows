@@ -1775,6 +1775,9 @@ class ManuscriptView(QWidget):
         self._capabilities = capabilities
         document = len(source) <= _DOCUMENT_REVIEW_LIMIT and len(target) <= _DOCUMENT_REVIEW_LIMIT
         self._term_mode = "document" if document else "segments"
+        # Every review, short or long, applies the reuse rule first (one entry).
+        self._rebuild_plan()
+        self._refresh_semantic()
         if document and not await self._run_document_review(generation, source, target, direction, alignments):
             return
         if generation != self._generation:
@@ -1976,6 +1979,8 @@ class ManuscriptView(QWidget):
         source_text, target_text = self._payload["source"], self._payload["target"]
 
         def clip(span: dict, core: tuple[int, int], text: str) -> dict | None:
+            # parse_workfile normalizes offsets to int; slicing needs it.
+            assert type(span["start"]) is int and type(span["end"]) is int, span
             start, end = max(span["start"], core[0]), min(span["end"], core[1])
             if start >= end:
                 return None

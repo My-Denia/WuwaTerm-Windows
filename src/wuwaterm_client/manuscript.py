@@ -409,6 +409,13 @@ def parse_workfile(content: str) -> dict[str, Any]:
         keys = [occurrence_key(d) for d in decisions]
         if len(set(keys)) != len(keys):
             raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
+    # Validation accepts integral JSON numbers such as 1200.0 (JavaScript
+    # compatibility); offsets are used for slicing, so they become int here.
+    for items in [value["alignments"]] + [snapshot["alignments"] for snapshot in history]:
+        for item in items or ():
+            for span in (item["source"], item["target"]):
+                if span is not None:
+                    span["start"], span["end"] = int(span["start"]), int(span["end"])
     return value
 
 
