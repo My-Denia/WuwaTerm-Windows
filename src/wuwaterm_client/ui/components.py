@@ -21,19 +21,23 @@ import math
 from collections.abc import Callable, Sequence
 
 from PySide6.QtCore import QEvent, QMargins, QObject, QPoint, QRect, Qt, QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QIcon, QPainter
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyleOptionComboBox,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import strings
+from .icons import icon
 
 # How long the endpoint chip stays highlighted after the address changes.
 # Long enough to be noticed while looking elsewhere on screen, short enough
@@ -830,3 +834,35 @@ def clamp_to_workspace(
         min(budget[i], max(default_size[i], minimum[i])) for i in range(2)
     )
     return minimum, size
+
+
+class ChevronComboBox(QComboBox):
+    """A combo box whose arrow is the themed chevron icon.
+
+    The stylesheet used to draw the arrow from borders, and Qt renders that
+    as a short bar rather than a triangle. Fusion's own arrow brings a bevel
+    that the flat theme does not have. The vendored chevron follows the
+    theme and the screen's pixel ratio at paint time.
+    """
+
+    ARROW_SIZE = 14
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Loaded once: the icon engine picks the theme's colour at paint time.
+        self._arrow = icon("chevron-down", "text-secondary")
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        area = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, option, QStyle.SubControl.SC_ComboBoxArrow, self
+        )
+        side = self.ARROW_SIZE
+        target = QRect(area.center().x() - side // 2, area.center().y() - side // 2 + 1, side, side)
+        mode = QIcon.Mode.Normal if self.isEnabled() else QIcon.Mode.Disabled
+        painter = QPainter(self)
+        self._arrow.paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
+        painter.end()
+

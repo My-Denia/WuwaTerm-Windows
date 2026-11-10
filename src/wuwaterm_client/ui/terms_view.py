@@ -31,7 +31,6 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -52,6 +51,7 @@ from ..errors import ERROR_CANCELLED, ClientError
 from .components import (
     NO_REQUEST,
     Banner,
+    ChevronComboBox,
     EmptyStateCard,
     FieldError,
     ProgressLine,
@@ -301,7 +301,7 @@ class TermsView(QWidget):
 
         query_label = QLabel(strings.TERMS_QUERY_LABEL, self)
         query_label.setBuddy(self.query_edit)
-        self.category_filter = QComboBox(self)
+        self.category_filter = ChevronComboBox(self)
         self.category_filter.setAccessibleName(strings.TERMS_FILTER_LABEL)
         self.category_filter.addItem(strings.TERMS_FILTER_ALL, None)
         self.category_filter.currentIndexChanged.connect(self._filter_results)

@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "7122ea7cb41e5987aac80b23fc27bd071fcfa22b",
+    "commit": "d5c35d299dc8c6d467b8e3a2f8c6b03cf2720a45",
     "files": {
       "src/wuwaterm_api/__init__.py": "e0372e6495d03878ee3c76ac87c5e0cb334d31403c776c90bac1e80687222502",
-      "docs/api/openapi.json": "e927f51a9aa125bc3b4873f6c9d9cd79c109a607bc1072d8c0bda1572b9acf37",
+      "docs/api/openapi.json": "5c66f103693b291dec72778af5a132cea9867ea56afddf317e43d37822a751f5",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
@@ -30,13 +30,13 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "fc62cd27ab121e2ca51ca8dd1f833ce14ae62387",
+    "commit": "d9829dddb3d4636587ac6d65184844f695b31b95",
     "files": {
-      "package.json": "61838c75a07b621d9fedbaf78716414791e23fe52763ceb0415f2cd5ed52a5bf",
+      "package.json": "3c3348d7f6957fbd40dc0de57550f2199ba536c687649722effb311e7f6f9153",
       "lib/manuscript.js": "ffb939f691efa7b61c1c2928feca1fced6f1e1f87baac35573038e8df78c16cd",
       "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
       "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
-      "docs/manuscript-v2.md": "bf5548afcab94ef91672196f1deaf24c45ae1bb9e22d6722624e9e6ec1c15cd2",
+      "docs/manuscript-v2.md": "048532da011039ee7653daf6eb0d6953354d474378386dee699694c14a59ba95",
       "contracts/manuscript-v2/cases.json": "fb846d23f40d257b38910c0251d19c63f91469fe33b1f006733e5617b7f94886",
       "contracts/manuscript-v2/invalid-129-decisions.json": "6f597aad8f6df0bc33d6bfccce41bd572d19177c37dd1a9560a1a4831c96b80b",
       "contracts/manuscript-v2/invalid-bad-hex.json": "3bdbd3509078196fde01be06b52bae84d345e5b33b9d8998196594768153323b",

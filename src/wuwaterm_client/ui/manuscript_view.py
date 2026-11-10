@@ -7,18 +7,20 @@ opening and saving without editing therefore does not rewrite a manuscript.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import copy
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import semantic, strings
+from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .. import semantic_session as sessions
 from ..errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_LLM_BUDGET_EXHAUSTED,
@@ -32,6 +34,7 @@ from ..segmentation import (
     SEGMENT_LIMIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
     pair_segments, segment_text,
 )
+from .components import ChevronComboBox
 from .icons import icon
 
 # The whole-manuscript term review keeps its historical request shape; above
@@ -44,7 +47,16 @@ _FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGU
                           ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE, ERROR_LLM_UNAVAILABLE})
 # The same failure on consecutive segments is the service, not the segment.
 _REPEATED_FAILURES = 2
+# Precedents (the owner's earlier choices in this manuscript) go with both
+# translation and semantic review by default, as on the Web, because the
+# Core evaluation's M' gates (same-sense reuse, led astray) were met with
+# them (C2 receipt, round 1). Re-read the receipt when the Core pin moves.
+PRECEDENTS_DEFAULT_ON = True
 TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
+# A dropped text file is read whole into the editor, so it gets the same
+# ceiling as a workfile.
+MAX_IMPORT_BYTES = 1_048_576
+_TEXT_SUFFIXES = (".txt", ".md")
 _DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 _REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
 
@@ -117,6 +129,12 @@ class LosslessEditor(QPlainTextEdit):
     undoRequested = Signal()
     redoRequested = Signal()
     compositionChanged = Signal()
+    # Local files dropped (or pasted) on the editor: (paths, side). The view
+    # decides what they mean; the editor only keeps Qt from typing a URL.
+    filesDropped = Signal(object, str)
+    focused = Signal()
+
+    side = "source"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -162,7 +180,57 @@ class LosslessEditor(QPlainTextEdit):
         cursor = self.textCursor()
         self._pending_range = (cursor.selectionStart(), cursor.selectionEnd())
 
+    @staticmethod
+    def local_files(mime) -> list[str]:
+        if mime is None or not mime.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        # File URLs are intercepted even when the drag also carries text:
+        # QMimeData.text() would otherwise hand Qt the URL to type in.
+        if self.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        files = self.local_files(event.mimeData())
+        if not files:
+            super().dropEvent(event)
+            return
+        # Accept and return at once: whatever the drop leads to may show a
+        # dialog, and a modal inside the drop blocks the Explorer drag source.
+        event.acceptProposedAction()
+        self.filesDropped.emit(files, self.side)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        self.focused.emit()
+        super().focusInEvent(event)
+
+    def raw_cursor_offset(self) -> int:
+        index = _scalar_boundary(self._shown, self.textCursor().position())
+        return self._bounds[index] if index is not None else 0
+
+    def set_raw_cursor_offset(self, offset: int) -> None:
+        """Caret at a raw scalar offset, clamped; one inside a CRLF goes before it."""
+        offset = max(0, min(offset, len(self._raw)))
+        index = max(0, bisect.bisect_right(self._bounds, offset) - 1)
+        cursor = self.textCursor()
+        cursor.setPosition(_utf16_position(self._shown, index))
+        self.setTextCursor(cursor)
+
     def insertFromMimeData(self, source) -> None:  # noqa: N802
+        files = self.local_files(source)
+        if files:
+            self.filesDropped.emit(files, self.side)
+            return
         self._pending = source.text() if source.hasText() else None
         self._remember_cursor()
         try:
@@ -202,6 +270,23 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._pending = None
             self._pending_range = None
+
+    def inputMethodQuery(self, query):
+        """Report caret rectangles in this widget's coordinates.
+
+        QPlainTextEdit answers in viewport coordinates, while the input method
+        maps the answer from the editor's own origin. The frame and the
+        stylesheet padding then move the IME candidate window up and left by
+        the viewport offset, onto the line being composed.
+        """
+        value = super().inputMethodQuery(query)
+        if query in (Qt.InputMethodQuery.ImCursorRectangle, Qt.InputMethodQuery.ImAnchorRectangle):
+            offset = self.viewport().pos()
+            if isinstance(value, QRectF):
+                return value.translated(offset.x(), offset.y())
+            if isinstance(value, QRect):
+                return value.translated(offset)
+        return value
 
     def inputMethodEvent(self, event) -> None:  # noqa: N802
         committed = bool(event.commitString()) or bool(event.replacementLength())
@@ -371,6 +456,13 @@ class _ElidedDocumentLabel(QLabel):
 class ManuscriptView(QWidget):
     documentChanged = Signal()
     lookup_requested = Signal(str)
+    # File continuity: the owner of the config (MainWindow) keeps the recent
+    # list; the view only reports. `documentLeaving` fires after the discard
+    # was settled and before the old document is replaced, so work_position()
+    # still describes it.
+    documentLeaving = Signal()
+    documentSaved = Signal()
+    documentOpened = Signal(str)
 
     def __init__(self, api_client, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -396,6 +488,13 @@ class ManuscriptView(QWidget):
         self._conflict_indexes: list[int] = []
         self._document_state: tuple[Path | None, bool, int] | None = None
         self._document_revision = 0
+        # Work position (see work_position): the editor last focused, an issue
+        # fingerprint waiting for its review to come back, and a counter that
+        # drops a deferred scroll restore once another document is open.
+        self._last_side = "target"
+        self._pending_issue_id: str | None = None
+        self._restore_serial = 0
+        self.setAcceptDrops(True)
         self._compact = False
         self._inspector_requested = True
         # Semantic review (semantic-review-v1). Capabilities are probed only
@@ -434,7 +533,10 @@ class ManuscriptView(QWidget):
         self.target_edit = LosslessEditor(self)
         self.source_edit.setPlaceholderText(strings.MANUSCRIPT_SOURCE_PLACEHOLDER)
         self.target_edit.setPlaceholderText(strings.MANUSCRIPT_TARGET_PLACEHOLDER)
+        self.target_edit.side = "target"
         for editor in (self.source_edit, self.target_edit):
+            editor.filesDropped.connect(self._files_dropped)
+            editor.focused.connect(lambda e=editor: setattr(self, "_last_side", e.side))
             editor.setMinimumHeight(36)
             editor.setMinimumWidth(80)
             editor.rawChanged.connect(lambda side="source" if editor is self.source_edit else "target",
@@ -443,7 +545,7 @@ class ManuscriptView(QWidget):
             editor.redoRequested.connect(self._redo_edit)
             editor.compositionChanged.connect(self._on_composition_changed)
             editor.editRejected.connect(lambda: self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED))
-        self.direction_combo = QComboBox(self)
+        self.direction_combo = ChevronComboBox(self)
         self.direction_combo.addItem(strings.DIRECTION_TO_EN, "en")
         self.direction_combo.addItem(strings.DIRECTION_TO_ZH, "zh")
         self.direction_combo.currentIndexChanged.connect(self._on_edit)
@@ -626,8 +728,23 @@ class ManuscriptView(QWidget):
         inspector_body = QWidget(inspector_scroll)
         inspector_body.setObjectName("inspectorBody")
         details = QVBoxLayout(inspector_body)
-        details.setContentsMargins(18, 18, 18, 18)
+        details.setContentsMargins(16, 14, 16, 16)
         details.setSpacing(12)
+        self.review_status = QFrame(inspector_body)
+        self.review_status.setObjectName("reviewStatus")
+        self.review_status.setProperty("tone", "neutral")
+        self.review_status.hide()
+        status_layout = QVBoxLayout(self.review_status)
+        status_layout.setContentsMargins(12, 8, 12, 10)
+        status_layout.setSpacing(6)
+        self.semantic_progress.setParent(self.review_status)
+        status_layout.addWidget(self.semantic_progress)
+        self.review_progress = QProgressBar(self.review_status)
+        self.review_progress.setObjectName("progressLine")
+        self.review_progress.setTextVisible(False)
+        self.review_progress.hide()
+        status_layout.addWidget(self.review_progress)
+        details.addWidget(self.review_status)
         tracks = QHBoxLayout()
         tracks.setSpacing(4)
         for button in (self.terms_track_button, self.semantic_track_button, self.segments_track_button):
@@ -650,17 +767,22 @@ class ManuscriptView(QWidget):
         self.finding_title.setObjectName("findingTitle")
         self.finding_title.setWordWrap(True)
         pair.addWidget(self.finding_title)
+        # What to do next while there is nothing to show yet.
+        self.inspector_hint = QLabel(inspector_body)
+        self.inspector_hint.setObjectName("secondaryText")
+        self.inspector_hint.setWordWrap(True)
+        pair.addWidget(self.inspector_hint)
         self.finding_pair = QLabel(inspector_body)
         self.finding_pair.setObjectName("findingPair")
         self.finding_pair.setTextFormat(Qt.TextFormat.PlainText)
         self.finding_pair.setWordWrap(True)
-        pair.addWidget(self.finding_pair)
         summary.addLayout(pair, 1)
         self.finding_verdict = QLabel(inspector_body)
         self.finding_verdict.setObjectName("findingVerdict")
         self.finding_verdict.setWordWrap(True)
         summary.addWidget(self.finding_verdict, 0, Qt.AlignmentFlag.AlignTop)
         term_details.addLayout(summary)
+        term_details.addWidget(self.finding_pair)
         self.finding_rule = QLabel(inspector_body)
         self.finding_rule.setObjectName("secondaryText")
         self.finding_rule.setWordWrap(True)
@@ -674,14 +796,18 @@ class ManuscriptView(QWidget):
         self.lookup_button.setIcon(icon("external-link"))
         self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.lookup_button.clicked.connect(self._request_lookup)
-        term_details.addWidget(self.lookup_button)
-        self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
-        self.manual_edit_label.setWordWrap(True)
-        term_details.addWidget(self.manual_edit_label)
         self.replace_toggle = QPushButton(strings.MANUSCRIPT_REPLACE, inspector_body)
         self.replace_toggle.setCheckable(True)
         self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        term_details.addWidget(self.replace_toggle)
+        term_actions = QHBoxLayout()
+        term_actions.setSpacing(6)
+        term_actions.addWidget(self.replace_toggle)
+        term_actions.addWidget(self.lookup_button)
+        term_actions.addStretch(1)
+        term_details.addLayout(term_actions)
+        self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
+        self.manual_edit_label.setWordWrap(True)
+        term_details.addWidget(self.manual_edit_label)
         self.replacement_area = QWidget(inspector_body)
         self.replacement_area.setObjectName("inspectorBody")
         replacement = QVBoxLayout(self.replacement_area)
@@ -705,7 +831,11 @@ class ManuscriptView(QWidget):
         self.details_button = QPushButton(strings.MANUSCRIPT_DETAILS, inspector_body)
         self.details_button.setObjectName("commandButton")
         self.details_button.setCheckable(True)
-        details.addWidget(self.details_button)
+        self.details_button.setIcon(icon("chevron-right"))
+        self.details_button.setIconSize(QSize(16, 16))
+        self.details_button.toggled.connect(
+            lambda shown: self.details_button.setIcon(icon("chevron-down" if shown else "chevron-right")))
+        details.addWidget(self.details_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.more_details = QWidget(inspector_body)
         self.more_details.setObjectName("inspectorBody")
         more = QVBoxLayout(self.more_details)
@@ -717,6 +847,10 @@ class ManuscriptView(QWidget):
         self.request_id_label.setObjectName("secondaryText")
         self.request_id_label.setWordWrap(True)
         more.addWidget(self.request_id_label)
+        self.precedents_check = QCheckBox(strings.MANUSCRIPT_USE_PRECEDENTS, self.more_details)
+        self.precedents_check.setChecked(PRECEDENTS_DEFAULT_ON)
+        self.precedents_check.hide()
+        more.addWidget(self.precedents_check)
         self.more_details.hide()
         self.details_button.toggled.connect(self.more_details.setVisible)
         details.addWidget(self.more_details)
@@ -747,15 +881,18 @@ class ManuscriptView(QWidget):
         self.limit_label = QLabel(strings.MANUSCRIPT_REVIEW_LIMIT, footer)
         self.limit_label.setObjectName("secondaryText")
         self.limit_label.setWordWrap(True)
-        footer_layout.addWidget(self.report_label, 1)
-        footer_layout.addWidget(self.limit_label, 1)
-        footer_layout.addWidget(self.status_label, 1)
+        footer_layout.setSpacing(16)
+        footer_layout.addWidget(self.status_label, 3)
+        footer_layout.addWidget(self.limit_label, 3)
+        self.report_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        footer_layout.addWidget(self.report_label, 2)
         outer.addWidget(footer)
         self._render_finding(-1)
         self._build_shortcuts()
         self._render_issue(None)
         self._update_inspector_button()
         self._update_controls()
+        self._guard_text_inputs()
 
     # -- semantic review: widgets -------------------------------------------
     def _build_semantic_widgets(self) -> None:
@@ -774,6 +911,8 @@ class ManuscriptView(QWidget):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
             self.track_group.addButton(button, index)
         self.terms_track_button.setChecked(True)
+        self.semantic_track_button.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
+        self.semantic_track_button.hide()
         self.track_group.idClicked.connect(self._show_track)
 
         page = QWidget(self)
@@ -782,12 +921,19 @@ class ManuscriptView(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        self.semantic_badge = QLabel(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL, page)
+        self.semantic_badge.setObjectName("experimentalBadge")
+        self.semantic_badge.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
+        layout.addWidget(self.semantic_badge, 0, Qt.AlignmentFlag.AlignLeft)
         self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
+        self.semantic_note.setObjectName("secondaryText")
+        self.semantic_note.setWordWrap(True)
+        layout.addWidget(self.semantic_note)
+        # Shown in the status card above the tracks, so a pause or a limit is
+        # visible from every track, not only from the semantic one.
         self.semantic_progress = QLabel(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, page)
-        for label in (self.semantic_note, self.semantic_progress):
-            label.setObjectName("secondaryText")
-            label.setWordWrap(True)
-            layout.addWidget(label)
+        self.semantic_progress.setObjectName("statusText")
+        self.semantic_progress.setWordWrap(True)
         heading = QHBoxLayout()
         self.issue_title = QLabel(strings.MANUSCRIPT_SEMANTIC_PROMPT, page)
         self.issue_title.setObjectName("findingTitle")
@@ -806,9 +952,11 @@ class ManuscriptView(QWidget):
         self.issue_excerpts.setObjectName("findingPair")
         self.issue_rationale = QLabel(page)
         self.issue_suggestion = QLabel(page)
+        self.issue_suggestion.setObjectName("suggestionText")
         self.issue_term_effect = QLabel(page)
         self.issue_term_effect.setObjectName("secondaryText")
         self.issue_notice = QLabel(page)
+        self.issue_notice.setObjectName("noticeText")
         for label in (self.issue_confidence, self.issue_excerpts, self.issue_rationale,
                       self.issue_suggestion, self.issue_term_effect, self.issue_notice):
             # Model text is untrusted: never rendered as rich text.
@@ -816,7 +964,7 @@ class ManuscriptView(QWidget):
             label.setWordWrap(True)
             layout.addWidget(label)
         self.issue_alternative_button = QPushButton(page)
-        self.issue_alternative_button.setObjectName("commandButton")
+        self.issue_alternative_button.setObjectName("linkButton")
         self.issue_alternative_button.setCheckable(True)
         self.issue_alternative_button.toggled.connect(self._alternative_toggled)
         self.issue_alternative_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
@@ -864,7 +1012,7 @@ class ManuscriptView(QWidget):
         self.semantic_list.currentRowChanged.connect(self._select_issue)
         layout.addWidget(self.semantic_list)
         self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
-        self.shortcuts_label.setObjectName("secondaryText")
+        self.shortcuts_label.setObjectName("captionText")
         self.shortcuts_label.setWordWrap(True)
         layout.addWidget(self.shortcuts_label)
         layout.addStretch(1)
@@ -1045,39 +1193,81 @@ class ManuscriptView(QWidget):
                 self._rows_dirty = False
         finally:
             self._refreshing_lists = False
+        self._select_pending_issue()
         self.semantic_list.setVisible(bool(rows))
         self._render_issue(self._current_issue())
         self._render_semantic_progress()
 
     def _render_semantic_progress(self) -> None:
         if self._semantic_state == "error" and not self._semantic_running():
-            self.semantic_progress.setText(self._semantic_detail)
+            self._show_status(self._semantic_detail, "danger")
             return
-        if self._capabilities is not None and not self._semantic_available() and not self._session.results:
+        semantic = self._semantic_available()
+        if self._capabilities is not None and not semantic and not self._session.results:
+            # The usual state: a short manuscript reviewed for terms only. Its
+            # result is the term report; an empty semantic card would be noise.
             self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE)
+            self._hide_status()
             return
         if self._semantic_state == "none" and not self._session.results and not self._semantic_running():
             self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_NOT_RUN)
+            self._hide_status()
             return
         progress = self._progress()
         if progress is None:
             return  # refreshed shortly by the derived-state timer
         done, total = progress
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        tone, bar = "neutral", None
         if self._semantic_running():
             text = strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=done + 1, done=done, total=total)
+            tone, bar = "busy", (done, total)
         elif self._semantic_state == "paused":
             text = strings.MANUSCRIPT_SEMANTIC_PAUSED.format(done=done, total=total)
+            tone, bar = "paused", (done, total)
         elif self._semantic_state == "quota":
             text = strings.MANUSCRIPT_SEMANTIC_QUOTA.format(done=done, total=total)
+            tone, bar = "warn", (done, total)
         else:
-            text = strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending)
+            text = (strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending) if semantic
+                    else strings.MANUSCRIPT_SEGMENTS_PROGRESS.format(done=done, total=total))
             failed = sum(1 for pair in self._cached_pairs() or () if self._segment_status(pair) in ("failed", "not_reviewed"))
             if failed:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS.format(count=failed)
-            if not self._session.issues() and done:
+                tone = "warn"
+            if semantic and not self._session.issues() and done:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_NONE
+        self._show_status(text, tone, bar)
+
+    def _show_status(self, text: str, tone: str, bar: tuple[int, int] | None = None) -> None:
+        """One status card for the run: text, a colour for its kind, and the
+        segment count as a bar while the run is going or waiting to go on.
+        Neutral and done look alike on purpose: no issues is not a pass."""
         self.semantic_progress.setText(text)
+        if self.review_status.isHidden():
+            self.review_status.show()
+        if self.review_status.property("tone") != tone:
+            self.review_status.setProperty("tone", tone)
+            self.review_status.style().unpolish(self.review_status)
+            self.review_status.style().polish(self.review_status)
+        show_bar = bar is not None and bar[1] > 0
+        if show_bar:
+            self.review_progress.setMaximum(bar[1])
+            self.review_progress.setValue(bar[0])
+        if self.review_progress.isVisibleTo(self.review_status) != show_bar:
+            self.review_progress.setVisible(show_bar)
+
+    def _hide_status(self) -> None:
+        if not self.review_status.isHidden():
+            self.review_status.hide()
+
+    def _render_inspector_hint(self) -> None:
+        if self._report is not None or self._review_state == "reviewing":
+            self.inspector_hint.hide()
+            return
+        configured = self._api_client.is_configured
+        self.inspector_hint.setText(strings.MANUSCRIPT_HINT_START if configured else strings.MANUSCRIPT_HINT_UNCONFIGURED)
+        self.inspector_hint.show()
 
     def _current_issue(self) -> sessions.LiveIssue | None:
         row = self.semantic_list.currentRow()
@@ -1203,6 +1393,8 @@ class ManuscriptView(QWidget):
         if self._refreshing_lists:
             return
         issue = self._current_issue()
+        if issue is not None:
+            self._pending_issue_id = None  # the owner chose; do not override
         self.issue_alternative_button.blockSignals(True)
         self.issue_alternative_button.setChecked(False)
         self.issue_alternative_button.blockSignals(False)
@@ -1425,6 +1617,19 @@ class ManuscriptView(QWidget):
             button.setText(text)
             button.setAccessibleName(text)
         self.segments_track_button.setToolTip(strings.MANUSCRIPT_SEGMENTS_NOTE)
+        # Semantic review is an experimental server option, off by default.
+        # Without it the track would only ever be empty; it appears once the
+        # server offers it, or when the manuscript already carries its data.
+        offered = self._capabilities is not None and bool(
+            {semantic.CAPABILITY_SEMANTIC_REVIEW, semantic.CAPABILITY_TRANSLATION_CONTEXT} & self._capabilities)
+        if self.precedents_check.isVisibleTo(self.more_details) != offered:
+            self.precedents_check.setVisible(offered)
+        show_semantic = self._semantic_available() or bool(self._issue_rows) or bool(self._decisions())
+        if self.semantic_track_button.isVisibleTo(self) != show_semantic:
+            self.semantic_track_button.setVisible(show_semantic)
+        if not show_semantic and self.track_stack.currentIndex() == TRACK_SEMANTIC:
+            self._show_track(TRACK_TERMS)
+            return
         track = self.track_stack.currentIndex()
         if track == TRACK_SEMANTIC:
             current, total = self.semantic_list.currentRow(), len(self._issue_rows)
@@ -1449,6 +1654,10 @@ class ManuscriptView(QWidget):
     @property
     def document_title(self) -> str:
         return self._path.name if self._path is not None else strings.MANUSCRIPT_UNTITLED
+
+    @property
+    def document_path(self) -> Path | None:
+        return self._path
 
     @property
     def document_dirty(self) -> bool:
@@ -1502,6 +1711,7 @@ class ManuscriptView(QWidget):
         self.finding_count.setText(strings.MANUSCRIPT_FINDING_COUNT.format(
             current=index + 1 if finding is not None else 0, total=total))
         self.findings.setVisible(total > 0)
+        self._render_inspector_hint()
         if finding is None:
             self.finding_title.setText(
                 strings.MANUSCRIPT_FINDING_PROMPT if total else
@@ -1510,6 +1720,7 @@ class ManuscriptView(QWidget):
             for label in (self.finding_verdict, self.finding_pair, self.finding_rule, self.finding_positions, self.candidates_label):
                 label.clear()
             self.finding_verdict.hide()
+            self.finding_pair.hide()
             self.lookup_button.hide()
             self.manual_edit_label.hide()
             self.replace_toggle.hide()
@@ -1530,6 +1741,7 @@ class ManuscriptView(QWidget):
         self.finding_verdict.style().unpolish(self.finding_verdict)
         self.finding_verdict.style().polish(self.finding_verdict)
         self.finding_pair.setText(target["text"] if isinstance(target, dict) and isinstance(target.get("text"), str) else "")
+        self.finding_pair.setVisible(bool(self.finding_pair.text()))
         rule = strings.MANUSCRIPT_RULE_TERM_PAIR if finding["rule_id"] == "review.term_pair" else finding["rule_id"]
         self.finding_rule.setText(strings.MANUSCRIPT_RULE.format(rule=rule))
         positions = []
@@ -1702,6 +1914,7 @@ class ManuscriptView(QWidget):
         self._after_draft_change(before, value, edits, exempt)
 
     def _apply_endpoint_state(self) -> None:
+        self._render_inspector_hint()
         self._update_controls()
 
     def _on_composition_changed(self) -> None:
@@ -2084,7 +2297,8 @@ class ManuscriptView(QWidget):
                 hard_cut=pair.hard_cut, report=None)
             before = self._context_for(pair)
             precedents = semantic.select_precedents(
-                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start)
+                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start
+            ) if self.precedents_check.isChecked() else []
             term_alignments = self._segment_alignments(pair)
             self._render_semantic_progress()
             term_report = report = None
@@ -2248,9 +2462,11 @@ class ManuscriptView(QWidget):
             self._capabilities = await self._api_client.get_capabilities()
             context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
             if pair is None:
-                text = source
+                text, base = source, 0
             else:
-                text = source[pair.source.core_start:pair.source.core_end]
+                text, base = source[pair.source.core_start:pair.source.core_end], pair.source.core_start
+            candidates = (sessions.precedent_candidates(self._payload, self._current_pairs())
+                          if context_on and self.precedents_check.isChecked() else [])
             pieces = segment_text(text, SEGMENT_LIMIT)
             count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
             out: list[str] = []
@@ -2264,10 +2480,11 @@ class ManuscriptView(QWidget):
                 done += 1
                 self.status_label.setText(strings.MANUSCRIPT_TRANSLATING.format(index=done, total=count))
                 context = None
-                if context_on and previous is not None:
-                    # Precedents stay off until the ADR 0019 M′ gates pass.
-                    before = semantic.context_before(*previous)
-                    context = {"before": before} if before is not None else None
+                if context_on:
+                    before = semantic.context_before(*previous) if previous is not None else None
+                    precedents = semantic.select_precedents(candidates, core, base + piece.core_start)
+                    context = {**({"before": before} if before is not None else {}),
+                               **({"precedents": precedents} if precedents else {})} or None
                 result = await self._api_client.translate(core, to=direction, context=context)
                 if generation != self._translate_generation:
                     return
@@ -2475,14 +2692,21 @@ class ManuscriptView(QWidget):
         self._saved_payload = copy.deepcopy(self._payload)
         self.status_label.setText(strings.MANUSCRIPT_SAVE_DONE)
         self._update_controls()
+        self.documentSaved.emit()
         return True
 
     def open_document(self, _checked: bool = False) -> None:
         if not self._input_ready():
             return
         name, _ = QFileDialog.getOpenFileName(self, strings.MANUSCRIPT_OPEN, "", strings.MANUSCRIPT_FILE_FILTER)
-        if not name:
-            return
+        if name:
+            self.open_path(name)
+
+    def open_path(self, name: str | Path) -> bool:
+        """The one way a workfile is opened: dialog, drop and recent list."""
+        if not self._input_ready():
+            return False
+        name = str(name)
         def read_candidate() -> dict:
             value = load_workfile(name)
             if not self.source_edit.can_display(value["source"]) or not self.target_edit.can_display(value["target"]):
@@ -2492,16 +2716,19 @@ class ManuscriptView(QWidget):
             read_candidate()
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
-            return
+            return False
         if not self.confirm_discard():
-            return
+            return False
         # Saving the dirty draft may have overwritten the selected file. Read
         # again so the restored draft and the saved baseline reflect disk.
         try:
             value = read_candidate()
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
-            return
+            return False
+        self.documentLeaving.emit()
+        self._pending_issue_id = None
+        self._restore_serial += 1
         self._invalidate_report()
         self._stop_translation()
         self._clear_semantic()
@@ -2522,10 +2749,15 @@ class ManuscriptView(QWidget):
         self._set_review_state("history" if value["history"] else "none")
         self.status_label.setText(strings.MANUSCRIPT_OPENED)
         self._update_controls()
+        self.documentOpened.emit(name)
+        return True
 
-    def new_document(self, _checked: bool = False) -> None:
+    def new_document(self, _checked: bool = False) -> bool:
         if not self.confirm_discard():
-            return
+            return False
+        self.documentLeaving.emit()
+        self._pending_issue_id = None
+        self._restore_serial += 1
         self._invalidate_report()
         self._stop_translation()
         self._clear_semantic()
@@ -2542,3 +2774,243 @@ class ManuscriptView(QWidget):
         self._path = None
         self._set_review_state("none")
         self._update_controls()
+        return True
+
+    # -- file continuity: import, clipboard, work position -------------------
+    def _guard_text_inputs(self) -> None:
+        """Inspector text fields take a dropped file as a file, not as typed text.
+
+        QLineEdit and the adjust box accept drops by default and would type
+        the file's path into a field that can later be written into the draft.
+        """
+        for widget in (*self.findChildren(QLineEdit), self.adjust_edit):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+            files = LosslessEditor.local_files(event.mimeData())
+            if files:
+                event.acceptProposedAction()
+                if event.type() == QEvent.Type.Drop:
+                    self._files_dropped(files, "source")
+                return True
+        return super().eventFilter(watched, event)
+
+    def _files_dropped(self, paths: list[str], side: str) -> None:
+        QTimer.singleShot(0, lambda: self.import_files(paths, side))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if LosslessEditor.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if LosslessEditor.local_files(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        files = LosslessEditor.local_files(event.mimeData())
+        if not files:
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        self._files_dropped(files, "source")
+
+    def import_files(self, paths: list[str], side: str = "source") -> bool:
+        """What dropped files mean: .json opens, .txt/.md replace one side."""
+        if not self._input_ready():
+            return False
+        if len(paths) != 1:
+            self.status_label.setText(strings.IMPORT_ONE_FILE_ONLY)
+            return False
+        path = Path(paths[0])
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            return bool(self.open_path(path))
+        if suffix in _TEXT_SUFFIXES:
+            text = self._read_import_text(path)
+            return text is not None and self._replace_side(side, text)
+        self.status_label.setText(strings.IMPORT_UNSUPPORTED_TYPE)
+        return False
+
+    def _read_import_text(self, path: Path) -> str | None:
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(MAX_IMPORT_BYTES + 1)
+        except OSError as exc:
+            self.status_label.setText(strings.IMPORT_READ_FAILED.format(reason=exc.strerror or type(exc).__name__))
+            return None
+        if len(data) > MAX_IMPORT_BYTES:
+            self.status_label.setText(strings.IMPORT_TOO_LARGE)
+            return None
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            self.status_label.setText(strings.IMPORT_NOT_UTF8)
+            return None
+
+    def _replace_side(self, side: str, text: str) -> bool:
+        """Replace one whole side as a single undoable edit."""
+        editor = self.target_edit if side == "target" else self.source_edit
+        if not editor.can_display(text):
+            self.status_label.setText(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
+            return False
+        value = self._draft_snapshot()
+        if value[side] == text:
+            self.status_label.setText(strings.IMPORT_UNCHANGED)
+            return False
+        value[side] = text
+        if value["alignments"] is not None:
+            value["alignments"] = []
+        self._apply_edit(value)
+        self.status_label.setText(strings.IMPORT_REPLACED[side])
+        return True
+
+    @staticmethod
+    def _clipboard_files() -> list[str]:
+        """Local files on the clipboard, also when only spelled as file URLs.
+
+        Copying a file in Explorer puts its URL on the clipboard, and the
+        plain-text form of that is the full path. A path is never manuscript
+        text: it would be saved, exported and sent with the next review.
+        """
+        mime = QApplication.clipboard().mimeData()
+        files = LosslessEditor.local_files(mime)
+        if files or mime is None or not mime.hasText():
+            return files
+        lines = [line.strip() for line in mime.text().splitlines() if line.strip()]
+        if lines and all(line.lower().startswith("file:") for line in lines):
+            return [QUrl(line).toLocalFile() or line for line in lines]
+        return []
+
+    def paste_as(self, side: str) -> bool:
+        if not self._input_ready():
+            return False
+        files = self._clipboard_files()
+        if files:
+            # The same rules as dropping that file onto this side.
+            return self.import_files(files, side)
+        text = QApplication.clipboard().text()
+        if not text:
+            self.status_label.setText(strings.CLIPBOARD_EMPTY)
+            return False
+        return self._replace_side(side, text)
+
+    def copy_target(self) -> bool:
+        text = self.target_edit.raw_text()
+        if not text:
+            self.status_label.setText(strings.COPY_TARGET_EMPTY)
+            return False
+        QApplication.clipboard().setText(text)
+        self.status_label.setText(strings.COPY_TARGET_DONE)
+        return True
+
+    def new_from_clipboard(self) -> bool:
+        if not self._input_ready():
+            return False
+        files = self._clipboard_files()
+        if files:
+            if len(files) != 1 or Path(files[0]).suffix.lower() not in _TEXT_SUFFIXES:
+                # A workfile opens as itself; anything else is refused there.
+                return self.import_files(files, "source")
+            text = self._read_import_text(Path(files[0]))
+            if text is None:
+                return False
+        else:
+            text = QApplication.clipboard().text()
+        if not text:
+            self.status_label.setText(strings.CLIPBOARD_EMPTY)
+            return False
+        # Checked before the old draft is given up, not after.
+        if not self.source_edit.can_display(text):
+            self.status_label.setText(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
+            return False
+        if not self.new_document():
+            return False
+        return self._replace_side("source", text)
+
+    def work_position(self) -> dict:
+        """Where the owner was, as plain data for the recent list.
+
+        Pure reads of widget state; called on save, leave and close, never
+        while typing.
+        """
+        editor = self.source_edit if self._last_side == "source" else self.target_edit
+        issue = self._current_issue()
+        width = None
+        if not self.inspector.isHidden():
+            value = self.work_splitter.sizes()[1]
+            if MIN_PANEL_WIDTH <= value <= MAX_PANEL_WIDTH:
+                width = value
+        return {
+            "cursor": {"side": editor.side, "offset": editor.raw_cursor_offset()},
+            "scroll": {"source": self.source_edit.verticalScrollBar().value(),
+                       "target": self.target_edit.verticalScrollBar().value()},
+            "selected_issue_id": self._issue_anchor(issue) if issue is not None else self._pending_issue_id,
+            "panel_width": width,
+        }
+
+    def restore_work_position(self, entry: dict) -> None:
+        """Apply a stored position to the open document; clamps if it changed."""
+        cursor = entry.get("cursor")
+        if isinstance(cursor, dict) and cursor.get("side") in ("source", "target") \
+                and isinstance(cursor.get("offset"), int):
+            editor = self.source_edit if cursor["side"] == "source" else self.target_edit
+            editor.set_raw_cursor_offset(cursor["offset"])
+            self._last_side = cursor["side"]
+        width = entry.get("panel_width")
+        if isinstance(width, int) and not isinstance(width, bool) and not self.inspector.isHidden():
+            self.work_splitter.setSizes([max(1, sum(self.work_splitter.sizes()) - width), width])
+        issue_id = entry.get("selected_issue_id")
+        self._pending_issue_id = issue_id if isinstance(issue_id, str) else None
+        scroll = entry.get("scroll")
+        if isinstance(scroll, dict):
+            # After layout: before it the scrollbars have no range to clamp to,
+            # and setting the caret above scrolls to make it visible.
+            self._restore_serial += 1
+            serial = self._restore_serial
+            QTimer.singleShot(0, lambda: self._restore_scroll(serial, scroll))
+
+    def _restore_scroll(self, serial: int, scroll: dict) -> None:
+        if serial != self._restore_serial:
+            return
+        for side, editor in (("source", self.source_edit), ("target", self.target_edit)):
+            value = scroll.get(side)
+            if isinstance(value, int) and not isinstance(value, bool):
+                editor.verticalScrollBar().setValue(value)
+
+    def _texts_tag(self) -> str:
+        return sessions.revision(self._payload["source"] + "\0" + self._payload["target"])[:16]
+
+    @staticmethod
+    def _occurrence(issue: sessions.LiveIssue) -> str:
+        def bounds(span: dict | None) -> str:
+            return "-" if span is None else f'{span["start"]}-{span["end"]}'
+
+        return "|".join((issue.issue["fingerprint"], bounds(issue.source_span), bounds(issue.target_span)))
+
+    def _issue_anchor(self, issue: sessions.LiveIssue) -> str:
+        """One occurrence of an issue: the texts it was measured in, its
+        fingerprint and both spans in whole-text coordinates.
+
+        The fingerprint alone repeats for identical paragraphs, so restoring
+        by it selected the first copy rather than the one the owner was on.
+        """
+        return f"{self._texts_tag()}|{self._occurrence(issue)}"
+
+    def _select_pending_issue(self) -> None:
+        if self._pending_issue_id is None or self._current_issue() is not None or not self._issue_rows:
+            return
+        tag, _, occurrence = self._pending_issue_id.partition("|")
+        if tag != self._texts_tag():
+            # Other texts (or an older bare fingerprint): never guess.
+            self._pending_issue_id = None
+            return
+        matches = [row for row, issue in enumerate(self._issue_rows) if self._occurrence(issue) == occurrence]
+        # Only an exact, unique occurrence; otherwise nothing is selected.
+        if len(matches) == 1:
+            self._pending_issue_id = None
+            self.semantic_list.setCurrentRow(matches[0])

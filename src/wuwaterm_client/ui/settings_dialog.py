@@ -6,13 +6,13 @@ are applied only on acceptance; credential changes take effect immediately.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -47,6 +47,7 @@ from ..credentials import (
     store_token,
 )
 from .components import (
+    ChevronComboBox,
     Banner,
     FieldError,
     apply_credential_backend,
@@ -324,7 +325,7 @@ class SettingsDialog(QDialog):
         sidebar_layout.setContentsMargins(0, 0, 8, 0)
         sidebar_layout.setSpacing(4)
         self.category_buttons = []
-        self.category_combo = QComboBox(self)
+        self.category_combo = ChevronComboBox(self)
         self.category_combo.setAccessibleName(strings.SETTINGS_CATEGORY_LABEL)
         for index, (label, icon_name) in enumerate(categories):
             button = QPushButton(label, self.category_sidebar)
@@ -414,10 +415,12 @@ class SettingsDialog(QDialog):
         empty is valid; clearing a configured address is refused.
         """
         base_url = self.base_url_edit.text().strip() or None
-        return ClientConfig(
+        # `replace`, not a fresh ClientConfig: fields this dialog does not
+        # edit (the recent-files list) must survive an accepted dialog.
+        return dataclasses.replace(
+            self._config,
             base_url=base_url,
             request_timeout_seconds=self.timeout_spin.value(),
-            translate_timeout_seconds=self._config.translate_timeout_seconds,
             appearance=self.selected_appearance(),
         )
 

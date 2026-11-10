@@ -588,17 +588,12 @@ QComboBox::drop-down {
     background-color: transparent;
 }
 
-/* 零宽零高 + 三条边框 = 一个向下的三角。同样是纯几何,不引入位图。 */
+/* 箭头由 ChevronComboBox 用随包的 chevron 图标绘制:用边框拼的三角在 Qt
+   里画出来是一道横杠。这里只把样式表自己的箭头关掉。 */
 QComboBox::down-arrow {
+    image: none;
     width: 0px;
     height: 0px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 4px solid @text-secondary@;
-}
-
-QComboBox::down-arrow:disabled {
-    border-top: 4px solid @text-muted@;
 }
 
 QComboBox QAbstractItemView {
@@ -727,6 +722,35 @@ QRadioButton::indicator:checked {
 QRadioButton::indicator:disabled {
     background-color: @bg-sunken@;
     border: 1px solid @border-subtle@;
+}
+
+QCheckBox {
+    background-color: transparent;
+    color: @text-primary@;
+    spacing: 8px;
+    min-height: 24px;
+    padding: 2px 0px;
+}
+
+QCheckBox:disabled {
+    color: @text-muted@;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid @border-strong@;
+    border-radius: 4px;
+    background-color: @bg-surface@;
+}
+
+QCheckBox::indicator:hover {
+    border: 1px solid @accent@;
+}
+
+QCheckBox::indicator:checked {
+    background-color: @accent@;
+    border: 1px solid @accent@;
 }
 
 /* -------------------------------------------------------------- 表格 */
@@ -1106,11 +1130,21 @@ QDialogButtonBox {
     font-weight: 600;
 }
 
-#findingTitle,
-#findingPair {
+#findingTitle {
     background-color: transparent;
     color: @text-primary@;
     font-size: @font-size-context@;
+    font-weight: 600;
+}
+
+/* 当前条目的原文/译文片段:放进下沉的小框,与正文区分开。 */
+#findingPair {
+    background-color: @bg-sunken@;
+    color: @text-primary@;
+    border: 1px solid @border-subtle@;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: @font-size-body@;
     font-weight: 600;
 }
 
@@ -1151,4 +1185,89 @@ QDialogButtonBox {
     background-color: transparent;
     color: @text-secondary@;
     font-size: @font-size-secondary@;
+}
+
+#captionText {
+    background-color: transparent;
+    color: @text-muted@;
+    font-size: @font-size-caption@;
+}
+
+#suggestionText {
+    background-color: @accent-soft-bg@;
+    color: @accent-soft-fg@;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: @font-size-body@;
+}
+
+#noticeText {
+    background-color: transparent;
+    color: @warn@;
+    font-size: @font-size-secondary@;
+}
+
+#reviewInspector QListWidget:focus {
+    border: 2px solid @focus-ring@;
+}
+
+/* 审校状态卡:运行、暂停、限额与错误各有底色,全部可见于每个分组之上。
+   完成与未开始同样中性:没有疑点不等于通过。 */
+#reviewStatus {
+    background-color: @bg-sunken@;
+    border: 1px solid @border-subtle@;
+    border-radius: 6px;
+}
+
+#reviewStatus[tone="neutral"] {
+    background-color: @bg-sunken@;
+    border: 1px solid @border-subtle@;
+}
+
+#reviewStatus[tone="busy"] {
+    background-color: @accent-soft-bg@;
+    border: 1px solid @accent@;
+}
+
+#reviewStatus[tone="paused"] {
+    background-color: @info-soft@;
+    border: 1px solid @info@;
+}
+
+#reviewStatus[tone="warn"] {
+    background-color: @warn-soft@;
+    border: 1px solid @warn@;
+}
+
+#reviewStatus[tone="danger"] {
+    background-color: @danger-soft@;
+    border: 1px solid @danger@;
+}
+
+#statusText {
+    background-color: transparent;
+    color: @text-primary@;
+    font-size: @font-size-secondary@;
+}
+
+#reviewStatus #progressLine {
+    background-color: @border-subtle@;
+    border-radius: 2px;
+    min-height: 4px;
+    max-height: 4px;
+}
+
+#reviewStatus #progressLine::chunk {
+    background-color: @accent@;
+    border-radius: 2px;
+}
+
+/* 语义轨的"实验性"标记:中性小签,不用警示色,以免读成"出错"。 */
+#experimentalBadge {
+    background-color: @info-soft@;
+    color: @info@;
+    border: 1px solid @info@;
+    border-radius: 9px;
+    padding: 1px 8px;
+    font-size: @font-size-caption@;
 }

@@ -18,6 +18,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from wuwaterm_client import semantic, strings
+from wuwaterm_client import semantic_session as sessions
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.manuscript import WORKFILE_FORMAT_V2, empty_workfile, load_workfile
 from wuwaterm_client.segmentation import SEGMENT_LIMIT
@@ -166,6 +167,40 @@ def test_old_core_keeps_the_term_review_only(qapp) -> None:
         assert view._review_state == "current"
         assert view.semantic_progress.text() == strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE
         assert view.semantic_list.count() == 0
+        # Semantic review is off by default on servers: no empty track or card.
+        assert view.semantic_track_button.isHidden()
+        assert view.review_status.isHidden()
+    asyncio.run(scenario())
+
+
+def test_long_manuscript_without_semantic_shows_neutral_segment_progress(qapp) -> None:
+    """The usual production state: segments are reviewed for terms only, and
+    the progress says so without naming a semantic review that never ran."""
+    source = ("第一段。" * 100 + "\n\n" + "第二段。" * 100 + "\n\n" + "第三段。" * 100) * 2
+    target = ("One. " * 100 + "\n\n" + "Two. " * 100 + "\n\n" + "Three. " * 100) * 2
+
+    async def scenario():
+        server = Server(capabilities=("translation-context-v1",))
+        view = make_view(server, source, target)
+        view._start_review()
+        await settle(view)
+        assert "/v1/semantic-reviews" not in server.paths()
+        done, total = view._progress()
+        assert done == total >= 2
+        assert view.semantic_progress.text() == strings.MANUSCRIPT_SEGMENTS_PROGRESS.format(done=done, total=total)
+        assert not view.review_status.isHidden() and view.semantic_track_button.isHidden()
+    asyncio.run(scenario())
+
+
+def test_semantic_track_appears_with_the_capability_and_says_it_is_experimental(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        assert view.semantic_track_button.isHidden()
+        view._start_review()
+        await settle(view)
+        assert not view.semantic_track_button.isHidden()
+        assert view.semantic_badge.text() == strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL
+        assert strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL in view.semantic_progress.text()
     asyncio.run(scenario())
 
 
@@ -574,8 +609,34 @@ def test_translation_sends_context_only_when_the_server_lists_it(qapp) -> None:
             assert len(sent) == 2 and "context" not in sent[0]
             assert ("context" in sent[1]) is expect_context
             if expect_context:
-                assert set(sent[1]["context"]) == {"before"}, "no precedents until the M′ gates pass"
+                assert set(sent[1]["context"]) == {"before"}, "no human choices yet, so no precedents"
                 assert len(sent[1]["context"]["before"]["source"]) <= 400
+    asyncio.run(scenario())
+
+
+def test_precedents_go_with_translation_and_review_by_default_and_can_be_turned_off(qapp, monkeypatch) -> None:
+    """As on the Web: precedents are on by default for both (C2 M′ gates met)
+    and one option turns them off for both."""
+    source = ("第一句。" * 300) + "\n\n" + ("第二句。" * 300)
+    precedent = {"surface": "第一句", "choice": "not_a_term", "rendering": None, "snippet": "第一句。",
+                 "anchor": {"segment_index": 0, "source_start": 0, "source_end": 3}, "scope": "occurrence"}
+    monkeypatch.setattr(sessions, "precedent_candidates", lambda payload, pairs: [(3, dict(precedent))])
+
+    async def scenario():
+        for checked in (True, False):
+            server = Server(capabilities=("semantic-review-v1", "translation-context-v1"))
+            view = make_view(server, source, "", direction="en")
+            assert view.precedents_check.isChecked()
+            view.precedents_check.setChecked(checked)
+            view._translate()
+            await settle(view)
+            assert not view.precedents_check.isHidden()
+            second = server.sent("/v1/translations")[1]["context"]
+            assert ("precedents" in second) is checked
+            view._start_review()
+            await settle(view)
+            reviewed = server.sent("/v1/semantic-reviews")
+            assert reviewed and any(body["precedents"] for body in reviewed) is checked
     asyncio.run(scenario())
 
 
@@ -1244,3 +1305,27 @@ def test_status_queries_stay_fast_with_many_issues_and_decisions(qapp) -> None:
     keystroke = time.perf_counter() - started
     assert view._issue_state(view._issue_rows[0]) == "stale"
     assert rebuild < 0.2 and keystroke < 0.2, (rebuild, keystroke)
+
+
+def test_reopening_restores_the_selected_occurrence_of_a_repeated_issue(qapp) -> None:
+    """Identical paragraphs give identical fingerprints; the stored position
+    must bring back the copy the owner was on, not the first one."""
+    async def scenario():
+        source = "\n\n".join([SOURCE + "甲" * 1500] * 2)
+        target = "\n\n".join([TARGET + "A" * 1500] * 2)
+        view = make_view(Server(issues=two_issues), source, target)
+        view._start_review()
+        await settle(view)
+        assert len(view._issue_rows) == 4
+        view.semantic_list.setCurrentRow(3)
+        selected = view._current_issue()
+        assert selected.segment_index == 1
+        position = view.work_position()
+        reopened = make_view(Server(issues=two_issues), source, target)
+        reopened.restore_work_position(position)
+        reopened._start_review()
+        await settle(reopened)
+        restored = reopened._current_issue()
+        assert restored is not None and restored.segment_index == 1
+        assert restored.target_span == selected.target_span
+    asyncio.run(scenario())

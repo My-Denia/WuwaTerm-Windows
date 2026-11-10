@@ -9,6 +9,7 @@ it exclusively in the OS credential store.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import ipaddress
 import json
 import math
@@ -41,6 +42,115 @@ APPEARANCE_LIGHT = "light"
 APPEARANCE_DARK = "dark"
 APPEARANCE_VALUES = (APPEARANCE_SYSTEM, APPEARANCE_LIGHT, APPEARANCE_DARK)
 DEFAULT_APPEARANCE = APPEARANCE_SYSTEM
+
+
+# Recently opened manuscripts. The list lives here, in the per-user config,
+# and nowhere else: a full path is personal data and must never reach a
+# manuscript, an export, a log line or a request.
+MAX_RECENT = 10
+MAX_RECENT_PATH_CHARS = 4096
+# A fingerprint, a short text revision and two spans (see ManuscriptView).
+MAX_FINGERPRINT_CHARS = 160
+MIN_PANEL_WIDTH = 120
+MAX_PANEL_WIDTH = 2000
+# A scrollbar value or text offset beyond this is a corrupt file, not a position.
+_MAX_POSITION = 2**40
+CURSOR_SIDES = ("source", "target")
+
+
+@dataclasses.dataclass(frozen=True)
+class RecentCursor:
+    side: str
+    # Raw scalar index into that side's text, not a Qt UTF-16 position.
+    offset: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RecentScroll:
+    source: int = 0
+    target: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class RecentEntry:
+    path: str
+    opened_at: str
+    cursor: RecentCursor | None = None
+    scroll: RecentScroll = RecentScroll()
+    # One occurrence of a semantic issue: fingerprint, text revision and spans.
+    selected_issue_id: str | None = None
+    panel_width: int | None = None
+
+
+def recent_key(path: str) -> str:
+    """What makes two stored paths the same file on this platform."""
+    return os.path.normcase(path)
+
+
+def _count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= _MAX_POSITION else None
+
+
+def sanitize_recent_entry(raw: object) -> RecentEntry | None:
+    """One entry from untrusted data, or None; the same check the loader uses."""
+    if not isinstance(raw, dict):
+        return None
+    path = raw.get("path")
+    if (not isinstance(path, str) or not path or len(path) > MAX_RECENT_PATH_CHARS
+            or "\0" in path or not os.path.isabs(path)):
+        return None
+    opened_at = raw.get("opened_at")
+    if not isinstance(opened_at, str) or len(opened_at) > 64:
+        return None
+    try:
+        datetime.datetime.fromisoformat(opened_at)
+    except ValueError:
+        return None
+    # Position fields are a convenience: a bad one costs the position, not
+    # the entry.
+    cursor = None
+    raw_cursor = raw.get("cursor")
+    if isinstance(raw_cursor, dict):
+        offset = _count(raw_cursor.get("offset"))
+        if raw_cursor.get("side") in CURSOR_SIDES and offset is not None:
+            cursor = RecentCursor(raw_cursor["side"], offset)
+    scroll = RecentScroll()
+    raw_scroll = raw.get("scroll")
+    if isinstance(raw_scroll, dict):
+        source, target = _count(raw_scroll.get("source")), _count(raw_scroll.get("target"))
+        if source is not None and target is not None:
+            scroll = RecentScroll(source, target)
+    issue = raw.get("selected_issue_id")
+    if not isinstance(issue, str) or not issue or len(issue) > MAX_FINGERPRINT_CHARS:
+        issue = None
+    width = raw.get("panel_width")
+    if (isinstance(width, bool) or not isinstance(width, int)
+            or not MIN_PANEL_WIDTH <= width <= MAX_PANEL_WIDTH):
+        width = None
+    return RecentEntry(path, opened_at, cursor, scroll, issue, width)
+
+
+def _stored_recent(value: object) -> tuple[RecentEntry, ...]:
+    """The recent list from disk, entry by entry; never raises.
+
+    No ``exists()`` here: a network share or removed drive must not slow or
+    break start-up, and the menu checks when it is shown.
+    """
+    if not isinstance(value, list):
+        return ()
+    seen: set[str] = set()
+    entries: list[RecentEntry] = []
+    for raw in value:
+        entry = sanitize_recent_entry(raw)
+        if entry is None or recent_key(entry.path) in seen:
+            continue
+        seen.add(recent_key(entry.path))
+        entries.append(entry)
+        if len(entries) == MAX_RECENT:
+            break
+    return tuple(entries)
 
 
 def app_data_dir() -> Path:
@@ -203,6 +313,23 @@ def _stored_base_url(value: object) -> str | None:
     return value.strip()
 
 
+def stored_file_is_replaceable(base_dir: Path | None = None) -> bool:
+    """Whether a background write may replace the file on disk.
+
+    A file that exists but cannot be read as settings still holds the only
+    record of the owner's server address, which they can repair by hand. The
+    recent-files list must not overwrite it with defaults; an explicit
+    settings change still may. A missing file is fine to create.
+    """
+    try:
+        raw = json.loads(config_path(base_dir).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict)
+
+
 @dataclasses.dataclass(frozen=True)
 class ClientConfig:
     """Non-secret client settings.
@@ -221,6 +348,7 @@ class ClientConfig:
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     translate_timeout_seconds: float = DEFAULT_TRANSLATE_TIMEOUT_SECONDS
     appearance: str = DEFAULT_APPEARANCE
+    recent: tuple[RecentEntry, ...] = ()
 
     @property
     def is_configured(self) -> bool:
@@ -267,6 +395,9 @@ class ClientConfig:
             filtered["base_url"] = _stored_base_url(filtered["base_url"])
         if "appearance" in filtered:
             filtered["appearance"] = _stored_appearance(filtered["appearance"])
+        # Sanitised before construction: a hostile `recent` must not cost the
+        # address and the other settings.
+        filtered["recent"] = _stored_recent(filtered.get("recent"))
         try:
             return cls(**filtered)
         except TypeError:
