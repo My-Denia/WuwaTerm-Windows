@@ -31,7 +31,6 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -50,9 +49,9 @@ from .. import strings
 from ..api import ApiClient, TermsResult
 from ..errors import ERROR_CANCELLED, ClientError
 from .components import (
-    ChevronComboBox,
     NO_REQUEST,
     Banner,
+    ChevronComboBox,
     EmptyStateCard,
     FieldError,
     ProgressLine,

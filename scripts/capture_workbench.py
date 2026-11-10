@@ -52,17 +52,17 @@ os.chdir(_screen.parent)
 os.environ["QT_QPA_PLATFORM"] = "offscreen:configfile=offscreen.json"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import httpx  # noqa: E402
-import keyring  # noqa: E402
-from keyring.backend import KeyringBackend  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+import httpx
+import keyring
+from keyring.backend import KeyringBackend
+from PySide6.QtWidgets import QApplication
 
-from wuwaterm_client import semantic, theme  # noqa: E402
-from wuwaterm_client.api import ApiClient  # noqa: E402
-from wuwaterm_client.config import ClientConfig  # noqa: E402
-from wuwaterm_client.manuscript import empty_workfile  # noqa: E402
-from wuwaterm_client.ui import main_window as main_window_module  # noqa: E402
-from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC  # noqa: E402
+from wuwaterm_client import semantic, theme
+from wuwaterm_client.api import ApiClient
+from wuwaterm_client.config import ClientConfig
+from wuwaterm_client.manuscript import empty_workfile
+from wuwaterm_client.ui import main_window as main_window_module
+from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC
 
 
 class _MemoryKeyring(KeyringBackend):
@@ -324,8 +324,8 @@ def main() -> int:
     scale_tag = ARGS.scale.replace(".", "")
     for scheme in ARGS.themes.split(","):
         theme.apply_theme(app, scheme)
-        for mode, semantic in (("plain", False), ("semantic", True)):
-            for name, build in _states(semantic):
+        for mode, with_semantic in (("plain", False), ("semantic", True)):
+            for name, build in _states(with_semantic):
                 path = ARGS.out / f"{mode}-{name}-{scheme}-{scale_tag}x.png"
                 if not _capture(app, build, path):
                     return 1

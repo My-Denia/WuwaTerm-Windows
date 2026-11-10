@@ -847,7 +847,7 @@ class ChevronComboBox(QComboBox):
 
     ARROW_SIZE = 14
 
-    def paintEvent(self, event) -> None:  # noqa: N802
+    def paintEvent(self, event) -> None:
         super().paintEvent(event)
         option = QStyleOptionComboBox()
         self.initStyleOption(option)
