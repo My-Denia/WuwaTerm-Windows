@@ -355,8 +355,11 @@ def test_a_saved_workfile_never_contains_its_own_path(qapp, tmp_path) -> None:
     window.manuscript_view._path = path
     assert window.manuscript_view.save_document()
     raw = path.read_text(encoding="utf-8")
-    assert "private-folder-name" not in raw and str(tmp_path) not in raw
-    assert str(path) in (Path(__import__("os").environ["APPDATA"]) / "WuwaTerm" / "config.json").read_text(encoding="utf-8")
+    # JSON escapes Windows backslashes, so look for both spellings.
+    for text in ("private-folder-name", str(tmp_path)):
+        assert text not in raw and json.dumps(text)[1:-1] not in raw
+    stored = json.loads(config_path().read_text(encoding="utf-8"))["recent"]
+    assert [Path(entry["path"]) for entry in stored] == [path]
 
 
 def test_a_damaged_settings_file_is_not_overwritten_by_the_recent_list(qapp, tmp_path) -> None:
