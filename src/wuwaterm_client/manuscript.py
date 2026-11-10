@@ -6,6 +6,7 @@ not grant them runtime trust; a presentation layer must request a new review.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -15,12 +16,20 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .semantic import CATEGORIES, REVIEW_VERSION, valid_semantic_report
+
 WORKFILE_FORMAT = "wuwaterm-manuscript-v1"
+WORKFILE_FORMAT_V2 = "wuwaterm-manuscript-v2"
 MAX_WORKFILE_BYTES = 1_048_576
 MAX_CHOICES = 32
 MAX_HISTORY = 2
+MAX_SEMANTIC_DECISIONS = 128
+MAX_SEMANTIC_HISTORY = 2
 _HEX = re.compile(r"^[a-f0-9]{64}$")
 _TOP = {"format", "source", "target", "direction", "alignments", "choices", "history"}
+_TOP_V2 = _TOP | {"semantic_decisions", "semantic_history"}
+_DECISION_KEYS = {"issue_id", "fingerprint", "category", "segment_index", "source_revision",
+                  "target_revision", "source_span", "target_span", "decision", "applied_text", "basis"}
 _VERDICTS = {"verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated"}
 
 
@@ -217,6 +226,66 @@ def _snapshot(value: Any) -> bool:
             and ("resolutions" not in value or _resolutions(value["resolutions"])))
 
 
+def _strict_int(value: Any) -> bool:
+    return type(value) is int
+
+
+def _hex32(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{32}", value) is not None
+
+
+def _decision_span(span: Any) -> bool:
+    return (_keys(span, {"start", "end", "text"}) and _strict_int(span["start"])
+            and _strict_int(span["end"]) and 0 <= span["start"] < span["end"]
+            and _text(span["text"], 2000, False))
+
+
+def _decision(value: Any, source: str, target: str) -> bool:
+    """A recorded semantic decision. Spans are historical, but a decision made
+    against exactly the current text must still point at that text."""
+    if not _keys(value, _DECISION_KEYS):
+        return False
+    basis, kind, applied = value["basis"], value["decision"], value["applied_text"]
+    if not (_hex32(value["issue_id"]) and _hex32(value["fingerprint"])
+            and isinstance(value["category"], str) and value["category"] in CATEGORIES
+            and _strict_int(value["segment_index"]) and value["segment_index"] >= 0
+            and _hex(value["source_revision"]) and _hex(value["target_revision"])
+            and isinstance(kind, str) and kind in ("accepted", "adjusted", "ignored")
+            and _keys(basis, {"review_version", "term_basis"})
+            and basis["review_version"] == REVIEW_VERSION
+            and _keys(basis["term_basis"], {"dictionary_revision", "matcher_revision"})
+            and _hex(basis["term_basis"]["dictionary_revision"])
+            and _hex(basis["term_basis"]["matcher_revision"])):
+        return False
+    if kind == "ignored":
+        if applied is not None:
+            return False
+    elif not _text(applied, 2000):
+        # An accepted suggestion may be a deletion: Core allows an empty
+        # replacement, so the applied text may be empty too.
+        return False
+    spans = (value["source_span"], value["target_span"])
+    if spans[0] is None and spans[1] is None:
+        return False
+    for span, side, revision in ((spans[0], source, value["source_revision"]),
+                                 (spans[1], target, value["target_revision"])):
+        if span is None:
+            continue
+        if not _decision_span(span):
+            return False
+        if revision == hashlib.sha256(side.encode("utf-8")).hexdigest() and (
+                span["end"] > len(side) or side[span["start"]:span["end"]] != span["text"]):
+            return False
+    return True
+
+
+def _semantic_snapshot(value: Any) -> bool:
+    return (_keys(value, {"segment_index", "source", "target", "direction", "report"})
+            and _strict_int(value["segment_index"]) and value["segment_index"] >= 0
+            and _text(value["source"]) and _text(value["target"]) and _direction(value["direction"])
+            and valid_semantic_report(value["report"], value["source"], value["target"]))
+
+
 def _recovered_mention(choice: dict[str, Any], source: str) -> str | None:
     old, span = choice["source"], choice["source_span"]
     if old == source:
@@ -279,7 +348,8 @@ def parse_workfile(content: str) -> dict[str, Any]:
     except (ValueError, RecursionError) as exc:
         raise WorkfileError("workfile_not_json", "无法读取 JSON 稿件文件。") from exc
     _safe_tree(value)
-    if not _keys(value, _TOP) or value["format"] != WORKFILE_FORMAT:
+    v2 = isinstance(value, dict) and value.get("format") == WORKFILE_FORMAT_V2
+    if not _keys(value, _TOP_V2 if v2 else _TOP) or value["format"] not in (WORKFILE_FORMAT, WORKFILE_FORMAT_V2):
         raise WorkfileError("workfile_unsupported_format", "不支持此稿件格式或版本。")
     source, target, choices, history = value["source"], value["target"], value["choices"], value["history"]
     if (not _text(source, MAX_WORKFILE_BYTES) or not _text(target, MAX_WORKFILE_BYTES)
@@ -290,6 +360,13 @@ def parse_workfile(content: str) -> dict[str, Any]:
     original = [(c["source"], c["direction"], _mention(c["source_span"])) for c in choices]
     if len(set(original)) != len(original) or choice_conflict_groups(value):
         raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
+    if v2:
+        decisions, snapshots = value["semantic_decisions"], value["semantic_history"]
+        if (not isinstance(decisions, list) or len(decisions) > MAX_SEMANTIC_DECISIONS
+                or not all(_decision(d, source, target) for d in decisions)
+                or not isinstance(snapshots, list) or len(snapshots) > MAX_SEMANTIC_HISTORY
+                or not all(_semantic_snapshot(h) for h in snapshots)):
+            raise WorkfileError("workfile_invalid_semantic", "语义复审记录无效；当前稿件未被替换。")
     return value
 
 
@@ -298,7 +375,13 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
         raise WorkfileError("workfile_invalid_content", "稿件内容无效。")
     try:
         value = {key: payload[key] for key in ("source", "target", "direction", "alignments", "choices", "history")}
-        value = {"format": WORKFILE_FORMAT, **value}
+        decisions = payload.get("semantic_decisions") or []
+        snapshots = payload.get("semantic_history") or []
+        if decisions or snapshots:
+            value = {"format": WORKFILE_FORMAT_V2, **value,
+                     "semantic_decisions": decisions, "semantic_history": snapshots}
+        else:
+            value = {"format": WORKFILE_FORMAT, **value}
         content = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
         parse_workfile(content)
         return content
@@ -306,6 +389,15 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
         if isinstance(exc, WorkfileError):
             raise
         raise WorkfileError("workfile_invalid_content", "稿件内容无效，无法保存。") from exc
+
+
+def semantic_payload_fits(payload: Mapping[str, Any]) -> bool:
+    """Whether the payload can be saved: valid and within the 1 MiB file limit."""
+    try:
+        serialize_workfile(payload)
+    except WorkfileError:
+        return False
+    return True
 
 
 def load_workfile(path: str | Path) -> dict[str, Any]:

@@ -215,3 +215,11 @@ def test_actual_web_and_client_read_each_others_files(contract_source) -> None:
     recovered = manuscript.parse_workfile(manuscript.serialize_workfile(web_draft))
     assert recovered["choices"] == [payload["choices"][0]]
     assert recovered["history"] == payload["history"]
+
+
+@pytest.mark.skip(reason="等待 Web W1 合并：pin 的 Web 31ab4c98 不认识稿件 v2")
+def test_web_reads_and_resaves_v2_workfile_with_semantic_records(contract_source) -> None:
+    # Will check: a v2 file with decisions and history, written by manuscript.save_workfile,
+    # loads in the pinned Web importer, round-trips through its exporter, and parses back
+    # here with semantic_decisions/semantic_history unchanged.
+    contract_source("web")

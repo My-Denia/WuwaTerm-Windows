@@ -20,9 +20,16 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
-      - name: Resolve pinned Web source
+      - name: Resolve pinned Core and Web sources
         id: pins
-        run: echo "web=$(python -c 'import json; print(json.load(open("contracts/sources.json"))["web"]["commit"])')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "core=$(python -c 'import json; print(json.load(open("contracts/sources.json"))["core"]["commit"])')" >> "$GITHUB_OUTPUT"
+          echo "web=$(python -c 'import json; print(json.load(open("contracts/sources.json"))["web"]["commit"])')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: My-Denia/WuwaTerm
+          ref: ${{ steps.pins.outputs.core }}
+          path: .contract-sources/core
       - uses: actions/checkout@v7
         with:
           repository: My-Denia/WuwaTerm-Web
@@ -32,11 +39,12 @@ jobs:
       - name: Run without desktop dependencies
         env:
           PYTHONPATH: src
+          WUWATERM_CORE_ROOT: ${{ github.workspace }}/.contract-sources/core
           WUWATERM_WEB_ROOT: ${{ github.workspace }}/.contract-sources/web
           WUWATERM_CONTRACTS_REQUIRED: '1'
         run: |
           python -c "import importlib.util as u; assert u.find_spec('PySide6') is None and u.find_spec('keyring') is None"
-          python -m pytest tests/test_manuscript.py
+          python -m pytest tests/test_manuscript.py tests/test_segmentation.py tests/test_semantic_contract.py
   windows:
     name: Windows build and contracts
     uses: ./.github/workflows/windows-build.yml

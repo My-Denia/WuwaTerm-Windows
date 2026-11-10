@@ -1,10 +1,31 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "cc5743df0e807c42e4b669564fd8b4d0a465b79c",
+    "commit": "7122ea7cb41e5987aac80b23fc27bd071fcfa22b",
     "files": {
       "src/wuwaterm_api/__init__.py": "e0372e6495d03878ee3c76ac87c5e0cb334d31403c776c90bac1e80687222502",
-      "docs/api/openapi.json": "8e5aa34987b8bc1d13174a0bd3116d53778d7b32d77321fe67265c9be891fe84"
+      "docs/api/openapi.json": "e927f51a9aa125bc3b4873f6c9d9cd79c109a607bc1072d8c0bda1572b9acf37",
+      "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
+      "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
+      "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
+      "contracts/semantic-review-v1/cases.json": "7266fcfbb40b94b195b3b05ae97afbee2f545fd814cb52b07f015c98053a5a0c",
+      "contracts/semantic-review-v1/dropped-unanchored-request.json": "4245a675386b64f75ea979d49e9025675969d5364a2c9c8b35edeebcba8d0108",
+      "contracts/semantic-review-v1/dropped-unanchored-response.json": "7cc279b6db7ace1a4c20797e96e0a49b23ee849535a061b4b2967a72c74e596d",
+      "contracts/semantic-review-v1/issue-limit-request.json": "8af3bdc3ce5f9bdef87ce33a1d21e4ad7e0c129b62cf85de655dc8e3744f7841",
+      "contracts/semantic-review-v1/issue-limit-response.json": "59e3d3a2c500f2d0bc5fb8de293639b135e67dd2667e4474a43891162deb3dfc",
+      "contracts/semantic-review-v1/max-request.json": "931559608b3d98eeb9c3844b9dfa0607e6dff9da22254f5aeb7cd4da2f0ac997",
+      "contracts/semantic-review-v1/max-response.json": "62e1a09b347f597471b8d91b11e3118546fe02b1591bbb974c29d075ddab12fa",
+      "contracts/semantic-review-v1/minimal-request.json": "96043056c1bd6930a6aa5a0254af59578519c6f69fc222c07bb153a2ce79bae1",
+      "contracts/semantic-review-v1/minimal-response.json": "8918e9165cd458d35c3b9c6b33806c7cbe5e477b2e56869cf81a6dddf65627c9",
+      "contracts/semantic-review-v1/near-limit-request.json": "b0e899aca3d37a18bf7c8872368c6aa0381b1789b617b746aab9dab9e8d0f687",
+      "contracts/semantic-review-v1/not-reviewed-request.json": "4245a675386b64f75ea979d49e9025675969d5364a2c9c8b35edeebcba8d0108",
+      "contracts/semantic-review-v1/not-reviewed-response.json": "075fd94269793b6b7337f65e2b669fbc230dcca799fa60441b8db8dec6a8fcdb",
+      "contracts/semantic-review-v1/suggestion-boundary-request.json": "809ccfc4fb91ca46b57d829e33f77d9f3a6c82df74f72f8fa9615e43bd9e4be8",
+      "contracts/semantic-review-v1/suggestion-boundary-response.json": "0ef8d38db06420394f6d72f60fcb990efa36e659cbd3dba53efa6f85a8e57adb",
+      "contracts/semantic-review-v1/suggestion-replacement-too-long-request.json": "7de6ca821cee1dcba97cf35ff1678d8593e4307b57d13ac09c35e982d8ba13b3",
+      "contracts/semantic-review-v1/suggestion-replacement-too-long-response.json": "b387c2921a9a6939e4cdf336223c5d1ea56cc08c8aff2c59187a36e25d4871ac",
+      "contracts/semantic-review-v1/suggestion-span-too-long-request.json": "f3106c04f22cb8c8cba95b8c481533adc0a9beed9e8492cf37865a9271a12207",
+      "contracts/semantic-review-v1/suggestion-span-too-long-response.json": "aec473e3986f6e43b7baa032897c40170b160ad1acda3718048275579f6044c0"
     }
   },
   "web": {

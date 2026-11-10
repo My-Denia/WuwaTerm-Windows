@@ -11,20 +11,60 @@ import copy
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, Signal
-from PySide6.QtGui import QKeySequence, QPalette, QTextCursor
+from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QTextEdit, QVBoxLayout, QWidget,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from .. import strings
-from ..errors import ClientError
+from .. import semantic, strings
+from .. import semantic_session as sessions
+from ..errors import (
+    ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_LLM_BUDGET_EXHAUSTED,
+    ERROR_NOT_CONFIGURED, ERROR_OFFLINE, ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
+)
 from ..manuscript import (
-    WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
-    save_workfile, serialize_workfile,
+    MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, WorkfileError, choice_conflict_groups,
+    empty_workfile, load_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
+)
+from ..segmentation import (
+    SEGMENT_LIMIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
+    pair_segments, segment_text,
 )
 from .icons import icon
+
+# The whole-manuscript term review keeps its historical request shape; above
+# this length each side is reviewed per segmentation-v1 pair instead.
+_DOCUMENT_REVIEW_LIMIT = 2000
+# A pause, not a failure: the run keeps its results and can continue later.
+_QUOTA_CODES = frozenset({ERROR_RATE_LIMITED, ERROR_LLM_BUDGET_EXHAUSTED})
+# Nothing else can succeed until the owner fixes these, so the run stops.
+_FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGURED,
+                          ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE})
+TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
+_DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
+_REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
+
+
+def _normalize_semantic(payload: dict) -> dict:
+    """Semantic keys are present together, and only with semantic data.
+
+    A manuscript without semantic data stays byte-for-byte a v1 workfile, so
+    an untouched draft never looks edited because of an empty list.
+    """
+    decisions = payload.get("semantic_decisions") or []
+    history = payload.get("semantic_history") or []
+    if decisions or history:
+        payload["semantic_decisions"], payload["semantic_history"] = decisions, history
+    else:
+        payload.pop("semantic_decisions", None)
+        payload.pop("semantic_history", None)
+    return payload
+
+
+def _blank(text: str) -> bool:
+    return all(char in WHITESPACE for char in text)
 
 
 def _display_map(raw: str) -> tuple[str, list[int]]:
@@ -339,6 +379,24 @@ class ManuscriptView(QWidget):
         self._document_revision = 0
         self._compact = False
         self._inspector_requested = True
+        # Semantic review (semantic-review-v1). Capabilities are probed only
+        # when the owner starts a review or a translation, never on startup.
+        self._capabilities: frozenset[str] | None = None
+        self._session = sessions.Session()
+        self._semantic_task: asyncio.Task | None = None
+        self._semantic_generation = 0
+        self._semantic_state = "none"
+        self._semantic_detail = ""
+        self._segment_failures: dict[tuple[str, str], str] = {}
+        self._segment_notes: dict[tuple[str, str], list[str]] = {}
+        self._term_mode = "document"
+        self._pairs_key: tuple | None = None
+        self._pairs: list = []
+        self._issue_rows: list[sessions.LiveIssue] = []
+        self._segment_rows: list = []
+        self._refreshing_lists = False
+        self._translate_task: asyncio.Task | None = None
+        self._translate_generation = 0
 
         self.source_edit = LosslessEditor(self)
         self.target_edit = LosslessEditor(self)
@@ -409,6 +467,9 @@ class ManuscriptView(QWidget):
         self.remove_choice_button.clicked.connect(self._remove_conflicting_choice)
         for widget in (self.conflict_label, self.conflict_list, self.remove_choice_button):
             widget.setVisible(False)
+        self.translate_button = QPushButton(self)
+        self.translate_button.clicked.connect(self._translate)
+        self._build_semantic_widgets()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -450,6 +511,14 @@ class ManuscriptView(QWidget):
             toolbar.addWidget(button)
         self.direction_combo.setAccessibleName(strings.DIRECTION_LABEL)
         toolbar.addWidget(self.direction_combo)
+        self.translate_button.setObjectName("commandButton")
+        self.translate_button.setIcon(icon("languages"))
+        self.translate_button.setIconSize(QSize(18, 18))
+        self.translate_button.setFixedWidth(34)
+        translate_description = f"{strings.MANUSCRIPT_TRANSLATE}（Ctrl+Shift+T）"
+        self.translate_button.setToolTip(translate_description)
+        self.translate_button.setAccessibleName(strings.MANUSCRIPT_TRANSLATE)
+        self.review_button.setToolTip(f"{strings.MANUSCRIPT_REVIEW}（Ctrl+Shift+R）")
         toolbar.addWidget(self.review_button)
         toolbar.addWidget(self.cancel_button)
         self.inspector_button = QPushButton(self.toolbar)
@@ -481,6 +550,20 @@ class ManuscriptView(QWidget):
                 self.target_header_label = label
             header_layout.addWidget(label)
             header_layout.addStretch(1)
+            if editor is self.target_edit:
+                # Translation only ever fills this side, so its action lives here.
+                header_layout.addWidget(self.translate_button)
+            else:
+                # An invisible twin keeps both headers the same height in every style.
+                twin = QPushButton(header)
+                twin.setObjectName("commandButton")
+                twin.setFixedWidth(34)
+                twin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                policy = twin.sizePolicy()
+                policy.setRetainSizeWhenHidden(True)
+                twin.setSizePolicy(policy)
+                twin.hide()
+                header_layout.addWidget(twin)
             column.addWidget(header)
             column.addWidget(editor, 1)
             self.editor_splitter.addWidget(surface)
@@ -498,7 +581,7 @@ class ManuscriptView(QWidget):
         inspector_header.setObjectName("editorHeader")
         inspector_heading = QHBoxLayout(inspector_header)
         inspector_heading.setContentsMargins(14, 4, 8, 4)
-        heading = QLabel(strings.MANUSCRIPT_INSPECTOR_TITLE, inspector_header)
+        heading = QLabel(strings.MANUSCRIPT_PANEL_TITLE, inspector_header)
         heading.setObjectName("contextTitle")
         self.finding_count = QLabel(inspector_header)
         inspector_heading.addWidget(heading, 1)
@@ -512,6 +595,22 @@ class ManuscriptView(QWidget):
         details = QVBoxLayout(inspector_body)
         details.setContentsMargins(18, 18, 18, 18)
         details.setSpacing(12)
+        tracks = QHBoxLayout()
+        tracks.setSpacing(4)
+        for button in (self.terms_track_button, self.semantic_track_button, self.segments_track_button):
+            tracks.addWidget(button)
+        tracks.addStretch(1)
+        details.addLayout(tracks)
+        self.track_stack = QStackedWidget(inspector_body)
+        term_page = QWidget(self.track_stack)
+        term_page.setObjectName("inspectorBody")
+        term_details = QVBoxLayout(term_page)
+        term_details.setContentsMargins(0, 0, 0, 0)
+        term_details.setSpacing(12)
+        self.terms_note = QLabel(strings.MANUSCRIPT_TERMS_NOTE, term_page)
+        self.terms_note.setObjectName("secondaryText")
+        self.terms_note.setWordWrap(True)
+        term_details.addWidget(self.terms_note)
         summary = QHBoxLayout()
         pair = QVBoxLayout()
         self.finding_title = QLabel(strings.MANUSCRIPT_FINDING_PROMPT, inspector_body)
@@ -528,7 +627,7 @@ class ManuscriptView(QWidget):
         self.finding_verdict.setObjectName("findingVerdict")
         self.finding_verdict.setWordWrap(True)
         summary.addWidget(self.finding_verdict, 0, Qt.AlignmentFlag.AlignTop)
-        details.addLayout(summary)
+        term_details.addLayout(summary)
         self.finding_rule = QLabel(inspector_body)
         self.finding_rule.setObjectName("secondaryText")
         self.finding_rule.setWordWrap(True)
@@ -537,19 +636,19 @@ class ManuscriptView(QWidget):
         self.finding_positions.setWordWrap(True)
         self.candidates_label = QLabel(inspector_body)
         self.candidates_label.setWordWrap(True)
-        details.addWidget(self.candidates_label)
+        term_details.addWidget(self.candidates_label)
         self.lookup_button = QPushButton(strings.NAV_ITEM_TERMS, inspector_body)
         self.lookup_button.setIcon(icon("external-link"))
         self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.lookup_button.clicked.connect(self._request_lookup)
-        details.addWidget(self.lookup_button)
+        term_details.addWidget(self.lookup_button)
         self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
         self.manual_edit_label.setWordWrap(True)
-        details.addWidget(self.manual_edit_label)
+        term_details.addWidget(self.manual_edit_label)
         self.replace_toggle = QPushButton(strings.MANUSCRIPT_REPLACE, inspector_body)
         self.replace_toggle.setCheckable(True)
         self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        details.addWidget(self.replace_toggle)
+        term_details.addWidget(self.replace_toggle)
         self.replacement_area = QWidget(inspector_body)
         self.replacement_area.setObjectName("inspectorBody")
         replacement = QVBoxLayout(self.replacement_area)
@@ -560,8 +659,13 @@ class ManuscriptView(QWidget):
         replacement.addWidget(self.replacement_edit)
         replacement.addWidget(self.replace_button)
         self.replace_toggle.toggled.connect(self.replacement_area.setVisible)
-        details.addWidget(self.replacement_area)
-        details.addWidget(self.findings)
+        term_details.addWidget(self.replacement_area)
+        term_details.addWidget(self.findings)
+        term_details.addStretch(1)
+        self.track_stack.addWidget(term_page)
+        self.track_stack.addWidget(self.semantic_page)
+        self.track_stack.addWidget(self.segments_page)
+        details.addWidget(self.track_stack)
         details.addWidget(self.conflict_label)
         details.addWidget(self.conflict_list)
         details.addWidget(self.remove_choice_button)
@@ -615,8 +719,597 @@ class ManuscriptView(QWidget):
         footer_layout.addWidget(self.status_label, 1)
         outer.addWidget(footer)
         self._render_finding(-1)
+        self._build_shortcuts()
+        self._render_issue(None)
         self._update_inspector_button()
         self._update_controls()
+
+    # -- semantic review: widgets -------------------------------------------
+    def _build_semantic_widgets(self) -> None:
+        """The two tracks stay apart: deterministic term constraints, and
+        model suspicions that say they may be wrong. Segments get their own
+        list so long manuscripts can be navigated and their gaps explained."""
+        self.track_group = QButtonGroup(self)
+        self.track_group.setExclusive(True)
+        self.terms_track_button = QPushButton(self)
+        self.semantic_track_button = QPushButton(self)
+        self.segments_track_button = QPushButton(self)
+        for index, button in enumerate((self.terms_track_button, self.semantic_track_button,
+                                        self.segments_track_button)):
+            button.setObjectName("activityItem")
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            self.track_group.addButton(button, index)
+        self.terms_track_button.setChecked(True)
+        self.track_group.idClicked.connect(self._show_track)
+
+        page = QWidget(self)
+        page.setObjectName("inspectorBody")
+        self.semantic_page = page
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
+        self.semantic_progress = QLabel(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, page)
+        for label in (self.semantic_note, self.semantic_progress):
+            label.setObjectName("secondaryText")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        heading = QHBoxLayout()
+        self.issue_title = QLabel(strings.MANUSCRIPT_SEMANTIC_PROMPT, page)
+        self.issue_title.setObjectName("findingTitle")
+        self.issue_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.issue_title.setWordWrap(True)
+        heading.addWidget(self.issue_title, 1)
+        self.issue_state = QLabel(page)
+        self.issue_state.setObjectName("findingVerdict")
+        self.issue_state.setProperty("verdict", "not_evaluated")
+        heading.addWidget(self.issue_state, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(heading)
+        self.issue_confidence = QLabel(page)
+        self.issue_confidence.setObjectName("secondaryText")
+        self.issue_confidence.setToolTip(strings.MANUSCRIPT_CONFIDENCE_NOTE)
+        self.issue_excerpts = QLabel(page)
+        self.issue_excerpts.setObjectName("findingPair")
+        self.issue_rationale = QLabel(page)
+        self.issue_suggestion = QLabel(page)
+        self.issue_term_effect = QLabel(page)
+        self.issue_term_effect.setObjectName("secondaryText")
+        self.issue_notice = QLabel(page)
+        for label in (self.issue_confidence, self.issue_excerpts, self.issue_rationale,
+                      self.issue_suggestion, self.issue_term_effect, self.issue_notice):
+            # Model text is untrusted: never rendered as rich text.
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        self.issue_alternative_button = QPushButton(page)
+        self.issue_alternative_button.setObjectName("commandButton")
+        self.issue_alternative_button.setCheckable(True)
+        self.issue_alternative_button.toggled.connect(self._alternative_toggled)
+        self.issue_alternative_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.issue_alternative_button, 0, Qt.AlignmentFlag.AlignLeft)
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        self.accept_button = QPushButton(strings.MANUSCRIPT_ACCEPT, page)
+        self.accept_button.setObjectName("primaryButton")
+        self.accept_button.setToolTip(f"{strings.MANUSCRIPT_ACCEPT}（Ctrl+Enter）")
+        self.accept_button.clicked.connect(self._accept_current)
+        self.adjust_button = QPushButton(strings.MANUSCRIPT_ADJUST, page)
+        self.adjust_button.setToolTip(f"{strings.MANUSCRIPT_ADJUST}（Ctrl+Shift+E）")
+        self.adjust_button.clicked.connect(self._adjust_current)
+        self.ignore_button = QPushButton(strings.MANUSCRIPT_IGNORE, page)
+        self.ignore_button.setToolTip(f"{strings.MANUSCRIPT_IGNORE}（Ctrl+Shift+I）")
+        self.ignore_button.clicked.connect(self._ignore_current)
+        for button in (self.accept_button, self.adjust_button, self.ignore_button):
+            # Keep an IME composition in the editor when an action is clicked.
+            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.adjust_area = QWidget(page)
+        self.adjust_area.setObjectName("inspectorBody")
+        adjust = QVBoxLayout(self.adjust_area)
+        adjust.setContentsMargins(0, 0, 0, 0)
+        adjust_label = QLabel(strings.MANUSCRIPT_ADJUST_LABEL, self.adjust_area)
+        self.adjust_edit = QPlainTextEdit(self.adjust_area)
+        self.adjust_edit.setMaximumHeight(90)
+        self.adjust_edit.setAccessibleName(strings.MANUSCRIPT_ADJUST_LABEL)
+        adjust_label.setBuddy(self.adjust_edit)
+        self.adjust_apply_button = QPushButton(strings.MANUSCRIPT_ADJUST_APPLY, self.adjust_area)
+        self.adjust_apply_button.clicked.connect(self._apply_adjustment)
+        adjust.addWidget(adjust_label)
+        adjust.addWidget(self.adjust_edit)
+        adjust.addWidget(self.adjust_apply_button)
+        self.adjust_area.hide()
+        layout.addWidget(self.adjust_area)
+        self.semantic_list = QListWidget(page)
+        self.semantic_list.setMinimumHeight(76)
+        self.semantic_list.setMaximumHeight(180)
+        self.semantic_list.setWordWrap(True)
+        self.semantic_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.semantic_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEMANTIC.format(count="").strip())
+        self.semantic_list.currentRowChanged.connect(self._select_issue)
+        layout.addWidget(self.semantic_list)
+        self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
+        self.shortcuts_label.setObjectName("secondaryText")
+        self.shortcuts_label.setWordWrap(True)
+        layout.addWidget(self.shortcuts_label)
+        layout.addStretch(1)
+
+        page = QWidget(self)
+        page.setObjectName("inspectorBody")
+        self.segments_page = page
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.segments_note = QLabel(strings.MANUSCRIPT_SEGMENTS_NOTE, page)
+        self.segments_note.setObjectName("secondaryText")
+        self.segments_note.setWordWrap(True)
+        layout.addWidget(self.segments_note)
+        self.segment_list = QListWidget(page)
+        self.segment_list.setMinimumHeight(76)
+        self.segment_list.setMaximumHeight(220)
+        self.segment_list.setWordWrap(True)
+        self.segment_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.segment_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEGMENTS.format(count="").strip())
+        self.segment_list.currentRowChanged.connect(self._select_segment)
+        layout.addWidget(self.segment_list)
+        self.segment_hint = QLabel(page)
+        self.segment_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.segment_hint.setWordWrap(True)
+        layout.addWidget(self.segment_hint)
+        self.translate_segment_button = QPushButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
+        self.translate_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.translate_segment_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.translate_segment_button.clicked.connect(self._translate)
+        layout.addWidget(self.translate_segment_button)
+        layout.addStretch(1)
+
+    def _build_shortcuts(self) -> None:
+        self._manuscript_shortcuts: list[QShortcut] = []
+        for sequence, handler in (
+            ("F8", lambda: self._step_issue(1)),
+            ("Shift+F8", lambda: self._step_issue(-1)),
+            ("Ctrl+Return", self._accept_current),
+            ("Ctrl+Enter", self._accept_current),
+            ("Ctrl+Shift+E", self._adjust_current),
+            ("Ctrl+Shift+I", self._ignore_current),
+            ("Ctrl+Shift+R", self._start_review),
+            ("Ctrl+Shift+T", self._translate),
+        ):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(handler)
+            self._manuscript_shortcuts.append(shortcut)
+
+    def _show_track(self, index: int) -> None:
+        button = self.track_group.button(index)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        self.track_stack.setCurrentIndex(index)
+        if index == TRACK_SEGMENTS:
+            self._refresh_segments()
+        self._update_tracks()
+
+    # -- semantic review: derived state --------------------------------------
+    def _decisions(self) -> list[dict]:
+        return self._payload.get("semantic_decisions", [])
+
+    def _issue_state(self, issue: sessions.LiveIssue) -> str:
+        return sessions.state_of(issue, self._decisions(), self._payload["source"], self._payload["target"])
+
+    def _current_pairs(self) -> list:
+        source, target = self._payload["source"], self._payload["target"]
+        alignments = self._payload["alignments"] or None
+        key = (source, target, repr(alignments))
+        if key != self._pairs_key:
+            try:
+                pairs = pair_segments(source, target, SEGMENT_LIMIT, alignments)
+            except (ValueError, TypeError, AssertionError):
+                # Alignments the rule cannot use fall back to automatic pairing.
+                pairs = pair_segments(source, target, SEGMENT_LIMIT, None)
+            self._pairs_key, self._pairs = key, pairs
+        return self._pairs
+
+    def _segment_key(self, pair) -> tuple[str, str]:
+        source, target = self._payload["source"], self._payload["target"]
+        return (source[pair.source.core_start:pair.source.core_end],
+                target[pair.target.core_start:pair.target.core_end])
+
+    def _segment_status(self, pair) -> str:
+        if pair.status != STATUS_READY:
+            return pair.status
+        if self._session.result_for(pair, self._payload["source"], self._payload["target"]) is not None:
+            return "reviewed"
+        return self._segment_failures.get(self._segment_key(pair), "pending")
+
+    def _progress(self) -> tuple[int, int]:
+        ready = [pair for pair in self._current_pairs() if pair.status == STATUS_READY]
+        done = sum(1 for pair in ready if self._segment_status(pair) == "reviewed")
+        return done, len(ready)
+
+    def _semantic_available(self) -> bool:
+        return self._capabilities is not None and semantic.CAPABILITY_SEMANTIC_REVIEW in self._capabilities
+
+    def _semantic_running(self) -> bool:
+        return self._semantic_task is not None and not self._semantic_task.done()
+
+    def _translating(self) -> bool:
+        return self._translate_task is not None and not self._translate_task.done()
+
+    def _busy(self) -> bool:
+        return self._review_state == "reviewing" or self._semantic_running() or self._translating()
+
+    # -- semantic review: rendering ------------------------------------------
+    def _refresh_semantic(self) -> None:
+        if self._refreshing_lists:
+            return
+        current = self._current_issue()
+        rows = sorted(self._session.issues(), key=lambda issue: (
+            issue.segment_index,
+            (issue.source_span or issue.target_span or {"start": 0})["start"]))
+        self._refreshing_lists = True
+        try:
+            self._issue_rows = rows
+            self.semantic_list.clear()
+            for issue in rows:
+                record = issue.issue
+                self.semantic_list.addItem(strings.MANUSCRIPT_ISSUE_ITEM.format(
+                    state=strings.MANUSCRIPT_ISSUE_STATE[self._issue_state(issue)],
+                    category=strings.MANUSCRIPT_CATEGORY.get(record["category"], record["category"]),
+                    source=record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE,
+                    target=record["target_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE))
+            row = rows.index(current) if current in rows else -1
+            self.semantic_list.setCurrentRow(row)
+        finally:
+            self._refreshing_lists = False
+        self.semantic_list.setVisible(bool(rows))
+        self._render_issue(self._current_issue())
+        self._render_semantic_progress()
+
+    def _render_semantic_progress(self) -> None:
+        done, total = self._progress()
+        pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        if self._semantic_running():
+            text = strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=done + 1, done=done, total=total)
+        elif self._semantic_state == "paused":
+            text = strings.MANUSCRIPT_SEMANTIC_PAUSED.format(done=done, total=total)
+        elif self._semantic_state == "quota":
+            text = strings.MANUSCRIPT_SEMANTIC_QUOTA.format(done=done, total=total)
+        elif self._semantic_state == "error":
+            text = self._semantic_detail
+        elif self._capabilities is not None and not self._semantic_available():
+            text = strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE
+        elif self._semantic_state == "none" and not self._session.results:
+            text = strings.MANUSCRIPT_SEMANTIC_NOT_RUN
+        else:
+            text = strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending)
+            failed = sum(1 for pair in self._current_pairs() if self._segment_status(pair) in ("failed", "not_reviewed"))
+            if failed:
+                text += "\n" + strings.MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS.format(count=failed)
+            if not self._session.issues() and done:
+                text += "\n" + strings.MANUSCRIPT_SEMANTIC_NONE
+        self.semantic_progress.setText(text)
+
+    def _current_issue(self) -> sessions.LiveIssue | None:
+        row = self.semantic_list.currentRow()
+        return self._issue_rows[row] if 0 <= row < len(self._issue_rows) else None
+
+    def _selected_option(self, issue: sessions.LiveIssue) -> tuple[str, str] | None:
+        """(replacement, term_effect) of the suggestion or its chosen alternative."""
+        suggestion = issue.issue["suggestion"]
+        if suggestion is None:
+            return None
+        alternatives = issue.issue["alternatives"]
+        if self.issue_alternative_button.isChecked() and alternatives:
+            return alternatives[0]["replacement"], alternatives[0]["term_effect"]
+        return suggestion["replacement"], suggestion["term_effect"]
+
+    def _render_issue(self, issue: sessions.LiveIssue | None) -> None:
+        widgets = (self.issue_confidence, self.issue_excerpts, self.issue_rationale, self.issue_suggestion,
+                   self.issue_term_effect, self.issue_notice)
+        if issue is None:
+            self.issue_title.setText(strings.MANUSCRIPT_SEMANTIC_PROMPT if self._issue_rows else "")
+            self.issue_state.hide()
+            for widget in widgets:
+                widget.clear()
+                widget.hide()
+            for widget in (self.issue_alternative_button, self.accept_button, self.adjust_button,
+                           self.ignore_button, self.adjust_area):
+                widget.hide()
+            return
+        record = issue.issue
+        state = self._issue_state(issue)
+        self.issue_title.setText(strings.MANUSCRIPT_CATEGORY.get(record["category"], record["category"]))
+        self.issue_state.setText(strings.MANUSCRIPT_ISSUE_STATE[state])
+        self.issue_state.show()
+        self.issue_confidence.setText(strings.MANUSCRIPT_CONFIDENCE.get(record["confidence"], record["confidence"]))
+        self.issue_excerpts.setText(f'{record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE}\n'
+                                    f'→ {record["target_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE}')
+        self.issue_rationale.setText(strings.MANUSCRIPT_ISSUE_RATIONALE.format(rationale=record["rationale"]))
+        suggestion = record["suggestion"]
+        alternatives = record["alternatives"]
+        self.issue_alternative_button.blockSignals(True)
+        if suggestion is None or not alternatives:
+            self.issue_alternative_button.setChecked(False)
+        self.issue_alternative_button.blockSignals(False)
+        option = self._selected_option(issue)
+        if suggestion is not None and option is not None:
+            self.issue_suggestion.setText(strings.MANUSCRIPT_ISSUE_SUGGESTION.format(
+                old=suggestion["target_span"]["text"], new=option[0]))
+            self.issue_term_effect.setText(strings.MANUSCRIPT_TERM_EFFECT.get(option[1], ""))
+        else:
+            self.issue_suggestion.clear()
+            self.issue_term_effect.clear()
+        if alternatives and suggestion is not None:
+            self.issue_alternative_button.setText(
+                strings.MANUSCRIPT_ISSUE_PRIMARY if self.issue_alternative_button.isChecked()
+                else strings.MANUSCRIPT_ISSUE_ALTERNATIVE.format(new=alternatives[0]["replacement"]))
+        notices = []
+        if record["suggestion_withheld"] is not None:
+            notices.append(strings.MANUSCRIPT_ISSUE_WITHHELD)
+        elif suggestion is None and issue.target_span is None:
+            notices.append(strings.MANUSCRIPT_ISSUE_NO_TARGET)
+        elif suggestion is None:
+            notices.append(strings.MANUSCRIPT_ISSUE_NO_SUGGESTION)
+        if state == sessions.STATE_STALE:
+            notices.append(strings.MANUSCRIPT_ISSUE_STALE)
+        elif state == sessions.STATE_NEEDS_RECONFIRM and issue.previous is not None:
+            notices.append(strings.MANUSCRIPT_ISSUE_RECONFIRM.format(
+                decision=strings.MANUSCRIPT_ISSUE_STATE[issue.previous["decision"]]))
+        elif state == sessions.STATE_IGNORED_CARRIED:
+            notices.append(strings.MANUSCRIPT_ISSUE_CARRIED)
+        if issue.previously_applied and state in sessions.UNHANDLED:
+            notices.append(strings.MANUSCRIPT_ISSUE_PREVIOUSLY_APPLIED)
+        self.issue_notice.setText("\n".join(notices))
+        for widget in widgets:
+            widget.setVisible(bool(widget.text()))
+        self.issue_alternative_button.setVisible(bool(alternatives) and suggestion is not None)
+        for button in (self.accept_button, self.adjust_button, self.ignore_button):
+            button.show()
+        # suggestion_withheld leaves only adjust and ignore (plan §2.3).
+        self.accept_button.setVisible(suggestion is not None)
+        self.adjust_area.setVisible(self.adjust_area.isVisible() and self._can_adjust(issue))
+        self._update_semantic_actions()
+
+    def _can_accept(self, issue: sessions.LiveIssue | None) -> bool:
+        return (issue is not None and issue.issue["suggestion"] is not None
+                and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
+                and sessions.span_live(issue.suggestion_span, self._payload["target"]))
+
+    def _can_adjust(self, issue: sessions.LiveIssue | None) -> bool:
+        return (issue is not None and issue.edit_span() is not None
+                and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
+                and sessions.span_live(issue.edit_span(), self._payload["target"]))
+
+    def _update_semantic_actions(self) -> None:
+        issue = self._current_issue()
+        composing = self.source_edit._ime_active or self.target_edit._ime_active
+        free = not composing and not self._translating()
+        self.accept_button.setEnabled(free and self._can_accept(issue))
+        self.adjust_button.setEnabled(free and self._can_adjust(issue))
+        self.ignore_button.setEnabled(free and issue is not None and self._issue_state(issue) in sessions.UNHANDLED)
+        self.adjust_apply_button.setEnabled(free and self._can_adjust(issue))
+        self.semantic_list.setEnabled(not composing)
+
+    def _alternative_toggled(self, _checked: bool) -> None:
+        self._render_issue(self._current_issue())
+
+    def _select_issue(self, _row: int) -> None:
+        if self._refreshing_lists:
+            return
+        issue = self._current_issue()
+        self.issue_alternative_button.blockSignals(True)
+        self.issue_alternative_button.setChecked(False)
+        self.issue_alternative_button.blockSignals(False)
+        self.adjust_area.hide()
+        self._render_issue(issue)
+        self._update_tracks()
+        if issue is None:
+            return
+        source_ok = self.source_edit.select_raw_span(issue.source_span) if issue.source_span else False
+        target_ok = self.target_edit.select_raw_span(issue.target_span) if issue.target_span else False
+        if issue.source_span is None:
+            self.source_edit.setExtraSelections([])
+        if issue.target_span is None:
+            self.target_edit.setExtraSelections([])
+        located = (source_ok or issue.source_span is None) and (target_ok or issue.target_span is None)
+        self.status_label.setText(strings.MANUSCRIPT_LOCATED if located else strings.MANUSCRIPT_PARTIAL_LOCATION)
+
+    def _step_issue(self, step: int) -> None:
+        """F8 / Shift+F8: the next or previous issue still waiting for a decision."""
+        if not self._input_ready() or not self._issue_rows:
+            return
+        self._show_track(TRACK_SEMANTIC)
+        count = len(self._issue_rows)
+        start = self.semantic_list.currentRow()
+        for offset in range(1, count + 1):
+            row = (start + step * offset) % count if start >= 0 else (offset - 1 if step > 0 else count - offset)
+            if self._issue_state(self._issue_rows[row]) in sessions.UNHANDLED:
+                self.semantic_list.setCurrentRow(row)
+                return
+        self.status_label.setText(strings.MANUSCRIPT_ALL_HANDLED)
+
+    def _advance_after_decision(self, handled: sessions.LiveIssue) -> None:
+        rows = self._issue_rows
+        if handled in rows:
+            index = rows.index(handled)
+            for row in list(range(index + 1, len(rows))) + list(range(0, index)):
+                if self._issue_state(rows[row]) in sessions.UNHANDLED:
+                    self.semantic_list.setCurrentRow(row)
+                    return
+        self.status_label.setText(self.status_label.text() + " " + strings.MANUSCRIPT_ALL_HANDLED)
+
+    # -- semantic review: decisions ------------------------------------------
+    def _record_decision(self, issue: sessions.LiveIssue, decision: str, *,
+                         applied_text: str | None = None, target: str | None = None) -> bool:
+        """Apply one decision as one undoable edit, after a save preflight."""
+        record = sessions.make_decision(issue, decision, applied_text)
+        decisions = sessions.with_decision(self._decisions(), issue, record)
+        value = self._draft_snapshot()
+        value["semantic_decisions"] = decisions
+        if target is not None:
+            value["target"] = target
+            if value["alignments"] is not None:
+                value["alignments"] = []
+        candidate = copy.deepcopy(self._payload)
+        candidate.update(copy.deepcopy(value))
+        candidate.setdefault("semantic_history", [])
+        _normalize_semantic(candidate)
+        if len(decisions) > MAX_SEMANTIC_DECISIONS or not semantic_payload_fits(candidate):
+            self.status_label.setText(strings.MANUSCRIPT_DECISIONS_FULL)
+            return False
+        self._apply_edit(value)
+        return True
+
+    def _accept_current(self) -> None:
+        if self.adjust_area.isVisible() and self.adjust_edit.hasFocus():
+            self._apply_adjustment()
+            return
+        if not self._input_ready():
+            return
+        issue = self._current_issue()
+        if issue is None or not self.accept_button.isEnabled():
+            return
+        replacement, _effect = self._selected_option(issue)
+        try:
+            # The executable range must still be exactly what was reported.
+            changed = semantic.apply_span(self._payload["target"], issue.suggestion_span, replacement)
+        except semantic.StaleSpan:
+            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
+            self._refresh_semantic()
+            return
+        if not self.target_edit.can_display(changed):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        if self._record_decision(issue, "accepted", applied_text=replacement, target=changed):
+            self.status_label.setText(strings.MANUSCRIPT_ACCEPTED)
+            self._advance_after_decision(issue)
+
+    def _adjust_current(self) -> None:
+        if not self._input_ready():
+            return
+        issue = self._current_issue()
+        if issue is None or not self.adjust_button.isEnabled():
+            return
+        option = self._selected_option(issue)
+        self.adjust_edit.setPlainText(option[0] if option is not None else issue.edit_span()["text"])
+        self.adjust_area.show()
+        self.adjust_edit.setFocus()
+        self.adjust_edit.selectAll()
+
+    def _apply_adjustment(self) -> None:
+        if not self._input_ready():
+            return
+        issue = self._current_issue()
+        if issue is None or not self._can_adjust(issue):
+            return
+        text = self.adjust_edit.toPlainText()
+        if len(text) > semantic.MAX_SIDE_SCALARS:
+            return
+        try:
+            changed = semantic.apply_span(self._payload["target"], issue.edit_span(), text)
+        except semantic.StaleSpan:
+            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
+            self._refresh_semantic()
+            return
+        if not self.target_edit.can_display(changed):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        if self._record_decision(issue, "adjusted", applied_text=text, target=changed):
+            self.adjust_area.hide()
+            self.status_label.setText(strings.MANUSCRIPT_ADJUSTED)
+            self._advance_after_decision(issue)
+
+    def _ignore_current(self) -> None:
+        if not self._input_ready():
+            return
+        issue = self._current_issue()
+        if issue is None or not self.ignore_button.isEnabled():
+            return
+        if self._record_decision(issue, "ignored"):
+            self.status_label.setText(strings.MANUSCRIPT_IGNORED)
+            self._advance_after_decision(issue)
+
+    # -- segments --------------------------------------------------------------
+    def _refresh_segments(self) -> None:
+        if self._refreshing_lists:
+            return
+        pairs = self._current_pairs()
+        row = self.segment_list.currentRow()
+        self._refreshing_lists = True
+        try:
+            self._segment_rows = list(pairs)
+            self.segment_list.clear()
+            for pair in pairs:
+                status = strings.MANUSCRIPT_SEGMENT_STATUS[self._segment_status(pair)]
+                if pair.hard_cut:
+                    status += strings.MANUSCRIPT_SEGMENT_HARD_CUT
+                self.segment_list.addItem(strings.MANUSCRIPT_SEGMENT_ITEM.format(
+                    number=pair.index + 1, status=status,
+                    source=pair.source.core_end - pair.source.core_start,
+                    target=pair.target.core_end - pair.target.core_start))
+            self.segment_list.setCurrentRow(row if row < len(pairs) else -1)
+        finally:
+            self._refreshing_lists = False
+        self._render_segment(self._current_segment())
+
+    def _current_segment(self):
+        row = self.segment_list.currentRow()
+        return self._segment_rows[row] if 0 <= row < len(self._segment_rows) else None
+
+    def _render_segment(self, pair) -> None:
+        if pair is None:
+            self.segment_hint.clear()
+            self.translate_segment_button.hide()
+            return
+        status = self._segment_status(pair)
+        hints = []
+        if status in strings.MANUSCRIPT_SEGMENT_HINT:
+            hints.append(strings.MANUSCRIPT_SEGMENT_HINT[status])
+        if pair.hard_cut:
+            hints.append(strings.MANUSCRIPT_SEGMENT_HINT["hard_cut"])
+        hints.extend(self._segment_notes.get(self._segment_key(pair), []))
+        self.segment_hint.setText("\n".join(hints))
+        self.translate_segment_button.setVisible(pair.status == STATUS_UNTRANSLATED)
+        self.translate_segment_button.setEnabled(self._translate_ready())
+
+    def _select_segment(self, _row: int) -> None:
+        if self._refreshing_lists:
+            return
+        pair = self._current_segment()
+        self._render_segment(pair)
+        self._update_tracks()
+        if pair is None:
+            return
+        source, target = self._payload["source"], self._payload["target"]
+        for editor, text, region in ((self.source_edit, source, pair.source), (self.target_edit, target, pair.target)):
+            if region.core_end > region.core_start:
+                editor.select_raw_span({"start": region.core_start, "end": region.core_end,
+                                        "text": text[region.core_start:region.core_end]})
+            else:
+                editor.setExtraSelections([])
+
+    def _update_tracks(self) -> None:
+        term_total = len(self._report["findings"]) if self._report is not None else 0
+        pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        for button, text in (
+            (self.terms_track_button, strings.MANUSCRIPT_TRACK_TERMS.format(count=term_total)),
+            (self.semantic_track_button, strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=pending)),
+            (self.segments_track_button, strings.MANUSCRIPT_TRACK_SEGMENTS.format(count=len(self._current_pairs()))),
+        ):
+            button.setText(text)
+            button.setAccessibleName(text)
+        self.segments_track_button.setToolTip(strings.MANUSCRIPT_SEGMENTS_NOTE)
+        track = self.track_stack.currentIndex()
+        if track == TRACK_SEMANTIC:
+            current, total = self.semantic_list.currentRow(), len(self._issue_rows)
+        elif track == TRACK_SEGMENTS:
+            current, total = self.segment_list.currentRow(), len(self._segment_rows)
+        else:
+            current, total = self.findings.currentRow(), term_total
+        self.finding_count.setText(strings.MANUSCRIPT_FINDING_COUNT.format(
+            current=current + 1 if 0 <= current < total else 0, total=total))
 
     def focus_input(self) -> None:
         self.source_edit.setFocus()
@@ -751,13 +1444,21 @@ class ManuscriptView(QWidget):
                 self.lookup_requested.emit(term)
 
     def _update_controls(self) -> None:
-        busy = self._review_state == "reviewing"
+        busy = self._busy()
         composing = self.source_edit._ime_active or self.target_edit._ime_active
-        valid = all(0 < len(value) <= 2000 for value in (self._payload["source"], self._payload["target"]))
+        # Long manuscripts are reviewed per segmentation-v1 pair, so any
+        # non-empty pair of sides can start a review.
+        valid = all(len(value) > 0 for value in (self._payload["source"], self._payload["target"]))
         self.review_button.setEnabled(bool(self._api_client.is_configured and valid and not busy and not composing))
         self.review_button.setVisible(not busy)
+        done, total = self._progress() if self._session.results or self._semantic_state != "none" else (0, 0)
+        partial = self._semantic_state in ("paused", "quota") or (self._session.results and done < total)
+        self.review_button.setText(strings.MANUSCRIPT_REVIEW_CONTINUE if partial else strings.MANUSCRIPT_REVIEW)
         self.cancel_button.setEnabled(busy)
         self.cancel_button.setVisible(busy)
+        self.cancel_button.setText(strings.MANUSCRIPT_REVIEW_PAUSE if self._semantic_running() else strings.CANCEL_BUTTON)
+        self.translate_button.setEnabled(self._translate_ready())
+        self.translate_segment_button.setEnabled(self._translate_ready())
         self.auto_align_button.setEnabled(self._payload["alignments"] is not None)
         self.findings.setEnabled(not composing)
         self.lookup_button.setEnabled(not composing)
@@ -773,7 +1474,7 @@ class ManuscriptView(QWidget):
         source_language, target_language = (("EN", "ZH") if self._payload["direction"] == "zh" else ("ZH", "EN"))
         self.source_header_label.setText(f"{strings.INPUT_LABEL} · {source_language}")
         self.target_header_label.setText(f"{strings.RESULT_LABEL} · {target_language}")
-        self.limit_label.setVisible(any(len(self._payload[key]) > 2000 for key in ("source", "target")))
+        self.limit_label.setVisible(any(len(self._payload[key]) > _DOCUMENT_REVIEW_LIMIT for key in ("source", "target")))
         self.document_label.set_full_text(self.document_title + (" *" if self.document_dirty else ""))
         state = (self._path, self.document_dirty, self._document_revision)
         if state != self._document_state:
@@ -783,6 +1484,9 @@ class ManuscriptView(QWidget):
         self.history_label.setVisible(bool(choices or history))
         self.history_label.setText(strings.MANUSCRIPT_SAVED_DETAILS.format(choices=choices, history=history))
         self._render_review_state()
+        self._update_tracks()
+        self._update_semantic_actions()
+        self._render_semantic_progress()
 
     def _render_review_state(self) -> None:
         labels = {
@@ -812,24 +1516,51 @@ class ManuscriptView(QWidget):
             self._render_finding(-1)
 
     def _draft_snapshot(self) -> dict:
-        return copy.deepcopy({key: self._payload[key] for key in ("source", "target", "direction", "alignments", "choices")})
+        value = {key: self._payload[key] for key in _DRAFT_KEYS}
+        # Decisions are part of the draft, so undo and redo take them back too.
+        value["semantic_decisions"] = self._payload.get("semantic_decisions", [])
+        return copy.deepcopy(value)
+
+    def _restore_draft(self, value: dict) -> None:
+        value = copy.deepcopy(value)
+        decisions = value.pop("semantic_decisions", [])
+        self._payload.update(value)
+        self._payload["semantic_decisions"] = decisions
+        self._payload.setdefault("semantic_history", [])
+        _normalize_semantic(self._payload)
+
+    def _after_draft_change(self, before: dict, after: dict) -> None:
+        """Keep model results across edits, and expire only what an edit touched."""
+        if before["direction"] != after["direction"]:
+            if self._session.results or self._semantic_running():
+                self._clear_semantic()
+                self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED)
+        else:
+            self._session.text_changed("source", before["source"], after["source"])
+            self._session.text_changed("target", before["target"], after["target"])
+        if any(before[key] != after[key] for key in _REVIEW_KEYS):
+            self._invalidate_report()
+        if self._conflict_mode:
+            self._refresh_conflicts()
+        self._refresh_semantic()
+        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._refresh_segments()
+        self._update_controls()
 
     def _apply_edit(self, value: dict, *, editors_already_updated: bool = False) -> None:
         before = self._draft_snapshot()
+        value = {**before, **copy.deepcopy(value)}
         if value == before:
             return
         self._undo_history = (self._undo_history + [before])[-20:]
         self._redo_history.clear()
-        self._payload.update(copy.deepcopy(value))
+        self._restore_draft(value)
         self._document_revision += 1
         if self.status_label.text() == strings.MANUSCRIPT_SAVE_DONE:
             self.status_label.setText(strings.MANUSCRIPT_UNSAVED)
         if not editors_already_updated:
             self._set_payload(self._payload)
-        self._invalidate_report()
-        if self._conflict_mode:
-            self._refresh_conflicts()
-        self._update_controls()
+        self._after_draft_change(before, value)
 
     def _apply_endpoint_state(self) -> None:
         self._update_controls()
@@ -861,6 +1592,12 @@ class ManuscriptView(QWidget):
         if task is not None and not task.done():
             task.cancel()
 
+    def cancel_background_work(self) -> None:
+        """Stop every request this view started (window close)."""
+        self._cancel_pending()
+        self._stop_semantic()
+        self._stop_translation()
+
     def _invalidate_report(self) -> None:
         previous = self._review_state
         self._cancel_pending()
@@ -879,6 +1616,9 @@ class ManuscriptView(QWidget):
 
     def reset_for_endpoint_change(self) -> None:
         self._invalidate_report()
+        self._stop_translation()
+        self._clear_semantic()
+        self._capabilities = None
         self.status_label.setText(strings.MANUSCRIPT_ENDPOINT_CHANGED)
         self._update_controls()
 
@@ -897,15 +1637,19 @@ class ManuscriptView(QWidget):
         self._apply_edit(value, editors_already_updated=True)
 
     def _start_review(self) -> None:
-        if not self.review_button.isEnabled():
+        if not self.review_button.isEnabled() or not self._input_ready():
             return
         self._cancel_pending()
+        self._stop_semantic()
         generation = self._generation
         source, target = self._payload["source"], self._payload["target"]
         direction = self._payload["direction"]
         alignments = copy.deepcopy(self._payload["alignments"])
         self._report = None
         self.findings.clear()
+        # A new run retries the segments that failed before.
+        self._segment_failures.clear()
+        self._semantic_state = "none"
         self._set_review_state("reviewing")
         self._task = asyncio.ensure_future(self._run_review(generation, source, target, direction, alignments))
         self._task.add_done_callback(lambda task: self._task_finished(task, generation))
@@ -922,49 +1666,99 @@ class ManuscriptView(QWidget):
 
     async def _run_review(self, generation, source, target, direction, alignments) -> None:
         try:
+            # Old servers answer 404 and the client keeps its previous
+            # behaviour: the deterministic review only.
+            capabilities = await self._api_client.get_capabilities()
+        except ClientError as exc:
+            if generation == self._generation:
+                self._set_review_state("error", detail=exc.message, request_id=exc.request_id)
+            return
+        except asyncio.CancelledError:
+            if generation == self._generation:
+                self._set_review_state("cancelled")
+            return
+        if generation != self._generation:
+            return
+        self._capabilities = capabilities
+        document = len(source) <= _DOCUMENT_REVIEW_LIMIT and len(target) <= _DOCUMENT_REVIEW_LIMIT
+        self._term_mode = "document" if document else "segments"
+        if document and not await self._run_document_review(generation, source, target, direction, alignments):
+            return
+        if generation != self._generation:
+            return
+        if not document:
+            self._set_review_state("none")
+        if not document or self._semantic_available():
+            self._start_semantic_run()
+        self._update_controls()
+
+    async def _run_document_review(self, generation, source, target, direction, alignments) -> bool:
+        try:
             report = await self._api_client.review_pair(source, target, direction, alignments=alignments)
         except ClientError as exc:
             if generation == self._generation:
                 self._set_review_state("error", detail=exc.message, request_id=exc.request_id)
+            return False
         except asyncio.CancelledError:
             if generation == self._generation:
                 self._set_review_state("cancelled")
+            return False
+        if generation != self._generation:
+            return False
+        snapshot = {"source": source, "target": target, "direction": direction,
+                    "alignments": alignments, "report": report}
+        candidate = copy.deepcopy(self._payload)
+        candidate["history"] = (candidate["history"] + [snapshot])[-2:]
+        try:
+            serialize_workfile(candidate)
+        except WorkfileError as exc:
+            self._set_review_state("error", detail=strings.MANUSCRIPT_REPORT_UNSAVEABLE)
+            if exc.code == "workfile_duplicate_choices":
+                self._conflict_mode = True
+                self._refresh_conflicts()
+            return False
+        self._payload = candidate
+        self._document_revision += 1
+        self._show_term_report(report)
+        self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
+        self._update_controls()
+        return True
+
+    def _show_term_report(self, report: dict) -> None:
+        row = self.findings.currentRow()
+        self._report = report
+        self._set_review_state("current", request_id=report["request_id"])
+        self.findings.clear()
+        verdicts = {"verified_constraint": strings.MANUSCRIPT_VERDICT_VERIFIED,
+                    "confirmed_conflict": strings.MANUSCRIPT_VERDICT_CONFLICT,
+                    "needs_review": strings.MANUSCRIPT_VERDICT_NEEDS_REVIEW,
+                    "not_evaluated": strings.MANUSCRIPT_VERDICT_NOT_EVALUATED}
+        for finding in report["findings"]:
+            source_span = finding.get("source_span") or {}
+            target_span = finding.get("target_span") or {}
+            target_text = target_span.get("text")
+            verdict = verdicts[finding["verdict"]]
+            second_line = f"{target_text} · {verdict}" if target_text else verdict
+            self.findings.addItem(f'{source_span.get("text", "")}\n{second_line}')
+        if self.findings.count():
+            self.findings.setCurrentRow(row if 0 <= row < self.findings.count() and self._term_mode == "segments" else 0)
         else:
-            if generation != self._generation:
-                return
-            snapshot = {"source": source, "target": target, "direction": direction,
-                        "alignments": alignments, "report": report}
-            candidate = copy.deepcopy(self._payload)
-            candidate["history"] = (candidate["history"] + [snapshot])[-2:]
-            try:
-                serialize_workfile(candidate)
-            except WorkfileError as exc:
-                self._set_review_state("error", detail=strings.MANUSCRIPT_REPORT_UNSAVEABLE)
-                if exc.code == "workfile_duplicate_choices":
-                    self._conflict_mode = True
-                    self._refresh_conflicts()
-                return
-            self._payload = candidate
-            self._document_revision += 1
-            self._report = report
-            self._set_review_state("current", request_id=report["request_id"])
-            for finding in report["findings"]:
-                source_span = finding.get("source_span") or {}
-                target_span = finding.get("target_span") or {}
-                verdicts = {"verified_constraint": strings.MANUSCRIPT_VERDICT_VERIFIED,
-                            "confirmed_conflict": strings.MANUSCRIPT_VERDICT_CONFLICT,
-                            "needs_review": strings.MANUSCRIPT_VERDICT_NEEDS_REVIEW,
-                            "not_evaluated": strings.MANUSCRIPT_VERDICT_NOT_EVALUATED}
-                target_text = target_span.get("text")
-                verdict = verdicts[finding["verdict"]]
-                second_line = f"{target_text} · {verdict}" if target_text else verdict
-                self.findings.addItem(f'{source_span.get("text", "")}\n{second_line}')
-            if self.findings.count():
-                self.findings.setCurrentRow(0)
-            else:
-                self._render_finding(-1)
-            self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
-            self._update_controls()
+            self._render_finding(-1)
+
+    def _show_segment_term_report(self) -> None:
+        """Long manuscripts: one display report from every segment still current."""
+        source, target = self._payload["source"], self._payload["target"]
+        reports = [r.term_report for r in self._session.results if r.term_report is not None and r.current(source, target)]
+        if not reports:
+            return
+        self._show_term_report({
+            "request_id": reports[-1]["request_id"],
+            "findings": self._session.term_findings(source, target)[:256],
+            "coverage": {"evaluated": sum(r["coverage"]["evaluated"] for r in reports),
+                         "not_evaluated": sum(r["coverage"]["not_evaluated"] for r in reports),
+                         "rules": reports[-1]["coverage"]["rules"]},
+            "truncated": any(r["truncated"] for r in reports),
+        })
 
     def _task_finished(self, task: asyncio.Task, generation: int) -> None:
         if generation != self._generation:
@@ -975,10 +1769,275 @@ class ManuscriptView(QWidget):
         self._update_controls()
 
     def _cancel_review(self) -> None:
+        if self._translating():
+            self._stop_translation()
+            self.status_label.setText(strings.STATUS_CANCELLED_NOTE)
+            self._update_controls()
+            return
+        if self._semantic_running():
+            self._stop_semantic("paused")
+            self._refresh_semantic()
+            self._update_controls()
+            return
         if self._task is None:
             return
         self._cancel_pending()
         self._set_review_state("cancelled")
+        self._update_controls()
+
+    # -- segmented semantic run ------------------------------------------------
+    def _start_semantic_run(self) -> None:
+        self._stop_semantic()
+        self._semantic_state = "running"
+        generation = self._semantic_generation
+        self._semantic_task = asyncio.ensure_future(self._run_segments(generation))
+        self._semantic_task.add_done_callback(lambda task: self._semantic_finished(task, generation))
+        self._render_semantic_progress()
+
+    def _stop_semantic(self, state: str | None = None) -> None:
+        self._semantic_generation += 1
+        task, self._semantic_task = self._semantic_task, None
+        self._session.pending = None
+        if task is not None and not task.done():
+            task.cancel()
+        if state is not None:
+            self._semantic_state = state
+
+    def _clear_semantic(self) -> None:
+        self._stop_semantic("none")
+        self._session.clear()
+        self._segment_failures.clear()
+        self._segment_notes.clear()
+        self._refresh_semantic()
+        self._refresh_segments()
+
+    def _semantic_finished(self, task: asyncio.Task, generation: int) -> None:
+        if generation != self._semantic_generation:
+            return
+        self._semantic_task = None
+        if task.cancelled():
+            self._semantic_state = "paused"
+        elif task.exception() is not None:
+            self._semantic_state = "error"
+            self._semantic_detail = strings.ERROR_MSG_UNKNOWN
+        self._refresh_semantic()
+        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._refresh_segments()
+        self._update_controls()
+
+    def _next_pair(self, attempted: set) -> object | None:
+        source, target = self._payload["source"], self._payload["target"]
+        for pair in self._current_pairs():
+            if (pair.status == STATUS_READY and self._session.result_for(pair, source, target) is None
+                    and self._segment_key(pair) not in attempted):
+                return pair
+        return None
+
+    def _context_for(self, pair) -> dict | None:
+        if pair.index == 0:
+            return None
+        previous = self._current_pairs()[pair.index - 1]
+        source, target = self._payload["source"], self._payload["target"]
+        return semantic.context_before(source[previous.source.core_start:previous.source.core_end],
+                                       target[previous.target.core_start:previous.target.core_end])
+
+    async def _run_segments(self, generation: int) -> None:
+        """Serial, one request in flight. A segment edited while its request
+        is in flight is discarded and picked again with its new text."""
+        attempted: set[tuple[str, str]] = set()
+        while generation == self._semantic_generation:
+            segments = self._term_mode == "segments"
+            semantic_on = self._semantic_available()
+            pair = self._next_pair(attempted)
+            if pair is None or not (segments or semantic_on):
+                break
+            source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
+            key = self._segment_key(pair)
+            attempted.add(key)
+            if not pair_is_sendable(pair, source, target):
+                # The final pre-send assertion: never send an oversized pair.
+                self._segment_failures[key] = "needs_manual_split"
+                continue
+            self._session.pending = sessions.SegmentResult(
+                sent_source=key[0], sent_target=key[1],
+                source_core=(pair.source.core_start, pair.source.core_end),
+                target_core=(pair.target.core_start, pair.target.core_end),
+                hard_cut=pair.hard_cut, report=None)
+            before = self._context_for(pair)
+            precedents = semantic.select_precedents(
+                sessions.precedent_candidates(self._payload, self._current_pairs()), key[0], pair.source.core_start)
+            self._render_semantic_progress()
+            term_report = report = None
+            try:
+                if segments:
+                    term_report = await self._api_client.review_pair(key[0], key[1], direction)
+                if semantic_on and generation == self._semantic_generation:
+                    report = await self._api_client.semantic_review(
+                        key[0], key[1], direction, before=before, precedents=precedents)
+            except ClientError as exc:
+                if generation == self._semantic_generation:
+                    self._session.pending = None
+                if generation != self._semantic_generation or exc.code == ERROR_CANCELLED:
+                    return
+                if exc.code in _QUOTA_CODES:
+                    self._semantic_state = "quota"
+                    return
+                if exc.code in _FATAL_CODES:
+                    self._semantic_state = "error"
+                    self._semantic_detail = exc.message
+                    return
+                self._segment_failures[key] = "failed"
+                self._refresh_semantic()
+                continue
+            if generation != self._semantic_generation:
+                return
+            pending, self._session.pending = self._session.pending, None
+            source, target = self._payload["source"], self._payload["target"]
+            if pending is None or not pending.current(source, target):
+                continue
+            if report is not None and report["status"] != "complete":
+                self._segment_failures[key] = "not_reviewed"
+                continue
+            self._store_segment(pair.index, pending, report, term_report, direction)
+        if generation == self._semantic_generation:
+            self._semantic_state = "done"
+
+    def _store_segment(self, index: int, pending: sessions.SegmentResult, report: dict | None,
+                       term_report: dict | None, direction: str) -> None:
+        source, target = self._payload["source"], self._payload["target"]
+        result = sessions.SegmentResult(
+            sent_source=pending.sent_source, sent_target=pending.sent_target,
+            source_core=pending.source_core, target_core=pending.target_core,
+            hard_cut=pending.hard_cut, report=report)
+        key = (pending.sent_source, pending.sent_target)
+        notes = []
+        if report is not None:
+            result.issues = sessions.live_issues_from_report(
+                report, segment_index=index, source_offset=pending.source_core[0],
+                target_offset=pending.target_core[0], source_revision=sessions.revision(source),
+                target_revision=sessions.revision(target))
+            sessions.apply_reconcile(result.issues, self._decisions(), source, target)
+            if report["omitted_issues"]:
+                notes.append(strings.MANUSCRIPT_SEGMENT_HINT["truncated"].format(count=report["omitted_issues"]))
+            if report["dropped_unanchored"]:
+                notes.append(strings.MANUSCRIPT_SEGMENT_HINT["dropped"].format(count=report["dropped_unanchored"]))
+        if term_report is not None:
+            result.term_report = term_report
+            result.term_findings = sessions.term_findings_from_report(
+                term_report, source_offset=pending.source_core[0], target_offset=pending.target_core[0])
+        self._segment_failures.pop(key, None)
+        self._segment_notes[key] = notes
+        self._session.replace_result(result)
+        if report is not None:
+            self._remember_semantic_report(index, pending.sent_source, pending.sent_target, direction, report)
+        if term_report is not None:
+            self._show_segment_term_report()
+        self._refresh_semantic()
+        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._refresh_segments()
+        self._update_controls()
+
+    def _remember_semantic_report(self, index: int, source: str, target: str, direction: str, report: dict) -> None:
+        """Keep the last two segment reports as untrusted history, if they fit."""
+        snapshot = {"segment_index": index, "source": source, "target": target,
+                    "direction": direction, "report": report}
+        candidate = copy.deepcopy(self._payload)
+        candidate["semantic_history"] = (candidate.get("semantic_history", []) + [snapshot])[-MAX_SEMANTIC_HISTORY:]
+        candidate.setdefault("semantic_decisions", [])
+        if semantic_payload_fits(_normalize_semantic(candidate)):
+            self._payload = candidate
+            self._document_revision += 1
+
+    # -- translation in the manuscript ---------------------------------------
+    def _translate_ready(self) -> bool:
+        composing = self.source_edit._ime_active or self.target_edit._ime_active
+        return bool(self._api_client.is_configured and not self._busy() and not composing
+                    and not _blank(self._payload["source"]))
+
+    def _stop_translation(self) -> None:
+        self._translate_generation += 1
+        task, self._translate_task = self._translate_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _translate(self) -> None:
+        """Translate a blank translation or one untranslated segment; never
+        overwrite text the owner already has."""
+        if not self._input_ready() or not self._translate_ready():
+            return
+        source, target = self._payload["source"], self._payload["target"]
+        pair = None
+        if not _blank(target):
+            pair = self._current_segment() if self.track_stack.currentIndex() == TRACK_SEGMENTS else None
+            if pair is None or pair.status != STATUS_UNTRANSLATED:
+                self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
+                return
+        self._stop_translation()
+        generation = self._translate_generation
+        self._translate_task = asyncio.ensure_future(
+            self._run_translation(generation, pair, source, target, self._payload["direction"]))
+        self._translate_task.add_done_callback(lambda _task: self._update_controls())
+        self._update_controls()
+
+    async def _run_translation(self, generation: int, pair, source: str, target: str, direction: str) -> None:
+        try:
+            if self._capabilities is None:
+                self._capabilities = await self._api_client.get_capabilities()
+            context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
+            if pair is None:
+                text = source
+            else:
+                text = source[pair.source.core_start:pair.source.core_end]
+            pieces = segment_text(text, SEGMENT_LIMIT)
+            count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
+            out: list[str] = []
+            previous: tuple[str, str] | None = None
+            done = 0
+            for piece in pieces:
+                core = text[piece.core_start:piece.core_end]
+                if not core:
+                    out.append(text[piece.start:piece.end])
+                    continue
+                done += 1
+                self.status_label.setText(strings.MANUSCRIPT_TRANSLATING.format(index=done, total=count))
+                context = None
+                if context_on and previous is not None:
+                    # Precedents stay off until the ADR 0019 M′ gates pass.
+                    before = semantic.context_before(*previous)
+                    context = {"before": before} if before is not None else None
+                result = await self._api_client.translate(core, to=direction, context=context)
+                if generation != self._translate_generation:
+                    return
+                out.append(text[piece.start:piece.core_start] + result.text + text[piece.core_end:piece.end])
+                previous = (core, result.text)
+        except ClientError as exc:
+            if generation == self._translate_generation and exc.code != ERROR_CANCELLED:
+                self.status_label.setText(exc.message)
+            return
+        if generation != self._translate_generation:
+            return
+        self._translate_task = None
+        if (self._payload["source"] != source or self._payload["target"] != target
+                or self._payload["direction"] != direction):
+            self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+            return
+        translated = "".join(out)
+        if pair is None:
+            changed = translated
+        else:
+            position = pair.target.core_start
+            left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
+            right = "\n\n" if position < len(target) and target[position] not in WHITESPACE else ""
+            changed = target[:position] + left + translated + right + target[position:]
+        if not self.target_edit.can_display(changed):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        value = self._draft_snapshot()
+        value["target"] = changed
+        if value["alignments"] is not None:
+            value["alignments"] = []
+        self._apply_edit(value)
+        self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
         self._update_controls()
 
     def _select_finding(self, index: int) -> None:
@@ -1027,12 +2086,11 @@ class ManuscriptView(QWidget):
         if not self._undo_history or not self._input_ready():
             return
         value = self._undo_history.pop()
-        self._redo_history = (self._redo_history + [self._draft_snapshot()])[-20:]
-        self._payload.update(copy.deepcopy(value))
+        before = self._draft_snapshot()
+        self._redo_history = (self._redo_history + [before])[-20:]
+        self._restore_draft(value)
         self._set_payload(self._payload)
-        self._invalidate_report()
-        if self._conflict_mode:
-            self._refresh_conflicts()
+        self._after_draft_change(before, value)
         self.status_label.setText(strings.MANUSCRIPT_UNDONE)
         self._update_controls()
 
@@ -1040,12 +2098,11 @@ class ManuscriptView(QWidget):
         if not self._redo_history or not self._input_ready():
             return
         value = self._redo_history.pop()
-        self._undo_history = (self._undo_history + [self._draft_snapshot()])[-20:]
-        self._payload.update(copy.deepcopy(value))
+        before = self._draft_snapshot()
+        self._undo_history = (self._undo_history + [before])[-20:]
+        self._restore_draft(value)
         self._set_payload(self._payload)
-        self._invalidate_report()
-        if self._conflict_mode:
-            self._refresh_conflicts()
+        self._after_draft_change(before, value)
         self.status_label.setText(strings.MANUSCRIPT_REDONE)
         self._update_controls()
 
@@ -1055,7 +2112,7 @@ class ManuscriptView(QWidget):
             self.source_edit.set_raw_text(value["source"])
             self.target_edit.set_raw_text(value["target"])
             self.direction_combo.setCurrentIndex(self.direction_combo.findData(value["direction"]))
-            self._payload = copy.deepcopy(value)
+            self._payload = _normalize_semantic(copy.deepcopy(value))
             self._document_revision += 1
         finally:
             self._updating = False
@@ -1168,13 +2225,15 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
             return
         self._invalidate_report()
+        self._stop_translation()
+        self._clear_semantic()
         self._undo_history.clear()
         self._redo_history.clear()
         self._conflict_mode = False
         self._refresh_conflicts()
         self._set_payload(value)
         self._path = Path(name)
-        self._saved_payload = copy.deepcopy(value)
+        self._saved_payload = copy.deepcopy(self._payload)
         self._set_review_state("history" if value["history"] else "none")
         self.status_label.setText(strings.MANUSCRIPT_OPENED)
         self._update_controls()
@@ -1183,6 +2242,8 @@ class ManuscriptView(QWidget):
         if not self.confirm_discard():
             return
         self._invalidate_report()
+        self._stop_translation()
+        self._clear_semantic()
         self._undo_history.clear()
         self._redo_history.clear()
         self._conflict_mode = False
