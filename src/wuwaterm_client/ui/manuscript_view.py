@@ -14,7 +14,7 @@ from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, 
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -32,6 +32,7 @@ from ..segmentation import (
     SEGMENT_LIMIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
     pair_segments, segment_text,
 )
+from .components import ChevronComboBox
 from .icons import icon
 
 # The whole-manuscript term review keeps its historical request shape; above
@@ -460,7 +461,7 @@ class ManuscriptView(QWidget):
             editor.redoRequested.connect(self._redo_edit)
             editor.compositionChanged.connect(self._on_composition_changed)
             editor.editRejected.connect(lambda: self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED))
-        self.direction_combo = QComboBox(self)
+        self.direction_combo = ChevronComboBox(self)
         self.direction_combo.addItem(strings.DIRECTION_TO_EN, "en")
         self.direction_combo.addItem(strings.DIRECTION_TO_ZH, "zh")
         self.direction_combo.currentIndexChanged.connect(self._on_edit)
@@ -643,8 +644,22 @@ class ManuscriptView(QWidget):
         inspector_body = QWidget(inspector_scroll)
         inspector_body.setObjectName("inspectorBody")
         details = QVBoxLayout(inspector_body)
-        details.setContentsMargins(18, 18, 18, 18)
+        details.setContentsMargins(16, 14, 16, 16)
         details.setSpacing(12)
+        self.review_status = QFrame(inspector_body)
+        self.review_status.setObjectName("reviewStatus")
+        self.review_status.setProperty("tone", "neutral")
+        status_layout = QVBoxLayout(self.review_status)
+        status_layout.setContentsMargins(12, 8, 12, 10)
+        status_layout.setSpacing(6)
+        self.semantic_progress.setParent(self.review_status)
+        status_layout.addWidget(self.semantic_progress)
+        self.review_progress = QProgressBar(self.review_status)
+        self.review_progress.setObjectName("progressLine")
+        self.review_progress.setTextVisible(False)
+        self.review_progress.hide()
+        status_layout.addWidget(self.review_progress)
+        details.addWidget(self.review_status)
         tracks = QHBoxLayout()
         tracks.setSpacing(4)
         for button in (self.terms_track_button, self.semantic_track_button, self.segments_track_button):
@@ -667,17 +682,22 @@ class ManuscriptView(QWidget):
         self.finding_title.setObjectName("findingTitle")
         self.finding_title.setWordWrap(True)
         pair.addWidget(self.finding_title)
+        # What to do next while there is nothing to show yet.
+        self.inspector_hint = QLabel(inspector_body)
+        self.inspector_hint.setObjectName("secondaryText")
+        self.inspector_hint.setWordWrap(True)
+        pair.addWidget(self.inspector_hint)
         self.finding_pair = QLabel(inspector_body)
         self.finding_pair.setObjectName("findingPair")
         self.finding_pair.setTextFormat(Qt.TextFormat.PlainText)
         self.finding_pair.setWordWrap(True)
-        pair.addWidget(self.finding_pair)
         summary.addLayout(pair, 1)
         self.finding_verdict = QLabel(inspector_body)
         self.finding_verdict.setObjectName("findingVerdict")
         self.finding_verdict.setWordWrap(True)
         summary.addWidget(self.finding_verdict, 0, Qt.AlignmentFlag.AlignTop)
         term_details.addLayout(summary)
+        term_details.addWidget(self.finding_pair)
         self.finding_rule = QLabel(inspector_body)
         self.finding_rule.setObjectName("secondaryText")
         self.finding_rule.setWordWrap(True)
@@ -691,14 +711,18 @@ class ManuscriptView(QWidget):
         self.lookup_button.setIcon(icon("external-link"))
         self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.lookup_button.clicked.connect(self._request_lookup)
-        term_details.addWidget(self.lookup_button)
-        self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
-        self.manual_edit_label.setWordWrap(True)
-        term_details.addWidget(self.manual_edit_label)
         self.replace_toggle = QPushButton(strings.MANUSCRIPT_REPLACE, inspector_body)
         self.replace_toggle.setCheckable(True)
         self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        term_details.addWidget(self.replace_toggle)
+        term_actions = QHBoxLayout()
+        term_actions.setSpacing(6)
+        term_actions.addWidget(self.replace_toggle)
+        term_actions.addWidget(self.lookup_button)
+        term_actions.addStretch(1)
+        term_details.addLayout(term_actions)
+        self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
+        self.manual_edit_label.setWordWrap(True)
+        term_details.addWidget(self.manual_edit_label)
         self.replacement_area = QWidget(inspector_body)
         self.replacement_area.setObjectName("inspectorBody")
         replacement = QVBoxLayout(self.replacement_area)
@@ -722,7 +746,11 @@ class ManuscriptView(QWidget):
         self.details_button = QPushButton(strings.MANUSCRIPT_DETAILS, inspector_body)
         self.details_button.setObjectName("commandButton")
         self.details_button.setCheckable(True)
-        details.addWidget(self.details_button)
+        self.details_button.setIcon(icon("chevron-right"))
+        self.details_button.setIconSize(QSize(16, 16))
+        self.details_button.toggled.connect(
+            lambda shown: self.details_button.setIcon(icon("chevron-down" if shown else "chevron-right")))
+        details.addWidget(self.details_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.more_details = QWidget(inspector_body)
         self.more_details.setObjectName("inspectorBody")
         more = QVBoxLayout(self.more_details)
@@ -764,9 +792,11 @@ class ManuscriptView(QWidget):
         self.limit_label = QLabel(strings.MANUSCRIPT_REVIEW_LIMIT, footer)
         self.limit_label.setObjectName("secondaryText")
         self.limit_label.setWordWrap(True)
-        footer_layout.addWidget(self.report_label, 1)
-        footer_layout.addWidget(self.limit_label, 1)
-        footer_layout.addWidget(self.status_label, 1)
+        footer_layout.setSpacing(16)
+        footer_layout.addWidget(self.status_label, 3)
+        footer_layout.addWidget(self.limit_label, 3)
+        self.report_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        footer_layout.addWidget(self.report_label, 2)
         outer.addWidget(footer)
         self._render_finding(-1)
         self._build_shortcuts()
@@ -800,11 +830,14 @@ class ManuscriptView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
+        self.semantic_note.setObjectName("secondaryText")
+        self.semantic_note.setWordWrap(True)
+        layout.addWidget(self.semantic_note)
+        # Shown in the status card above the tracks, so a pause or a limit is
+        # visible from every track, not only from the semantic one.
         self.semantic_progress = QLabel(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, page)
-        for label in (self.semantic_note, self.semantic_progress):
-            label.setObjectName("secondaryText")
-            label.setWordWrap(True)
-            layout.addWidget(label)
+        self.semantic_progress.setObjectName("statusText")
+        self.semantic_progress.setWordWrap(True)
         heading = QHBoxLayout()
         self.issue_title = QLabel(strings.MANUSCRIPT_SEMANTIC_PROMPT, page)
         self.issue_title.setObjectName("findingTitle")
@@ -823,9 +856,11 @@ class ManuscriptView(QWidget):
         self.issue_excerpts.setObjectName("findingPair")
         self.issue_rationale = QLabel(page)
         self.issue_suggestion = QLabel(page)
+        self.issue_suggestion.setObjectName("suggestionText")
         self.issue_term_effect = QLabel(page)
         self.issue_term_effect.setObjectName("secondaryText")
         self.issue_notice = QLabel(page)
+        self.issue_notice.setObjectName("noticeText")
         for label in (self.issue_confidence, self.issue_excerpts, self.issue_rationale,
                       self.issue_suggestion, self.issue_term_effect, self.issue_notice):
             # Model text is untrusted: never rendered as rich text.
@@ -833,7 +868,7 @@ class ManuscriptView(QWidget):
             label.setWordWrap(True)
             layout.addWidget(label)
         self.issue_alternative_button = QPushButton(page)
-        self.issue_alternative_button.setObjectName("commandButton")
+        self.issue_alternative_button.setObjectName("linkButton")
         self.issue_alternative_button.setCheckable(True)
         self.issue_alternative_button.toggled.connect(self._alternative_toggled)
         self.issue_alternative_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
@@ -881,7 +916,7 @@ class ManuscriptView(QWidget):
         self.semantic_list.currentRowChanged.connect(self._select_issue)
         layout.addWidget(self.semantic_list)
         self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
-        self.shortcuts_label.setObjectName("secondaryText")
+        self.shortcuts_label.setObjectName("captionText")
         self.shortcuts_label.setWordWrap(True)
         layout.addWidget(self.shortcuts_label)
         layout.addStretch(1)
@@ -1068,33 +1103,62 @@ class ManuscriptView(QWidget):
 
     def _render_semantic_progress(self) -> None:
         if self._semantic_state == "error" and not self._semantic_running():
-            self.semantic_progress.setText(self._semantic_detail)
+            self._show_status(self._semantic_detail, "danger")
             return
         if self._capabilities is not None and not self._semantic_available() and not self._session.results:
-            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE)
+            self._show_status(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE, "neutral")
             return
         if self._semantic_state == "none" and not self._session.results and not self._semantic_running():
-            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_NOT_RUN)
+            self._show_status(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, "neutral")
             return
         progress = self._progress()
         if progress is None:
             return  # refreshed shortly by the derived-state timer
         done, total = progress
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        tone, bar = "neutral", None
         if self._semantic_running():
             text = strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=done + 1, done=done, total=total)
+            tone, bar = "busy", (done, total)
         elif self._semantic_state == "paused":
             text = strings.MANUSCRIPT_SEMANTIC_PAUSED.format(done=done, total=total)
+            tone, bar = "paused", (done, total)
         elif self._semantic_state == "quota":
             text = strings.MANUSCRIPT_SEMANTIC_QUOTA.format(done=done, total=total)
+            tone, bar = "warn", (done, total)
         else:
             text = strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending)
             failed = sum(1 for pair in self._cached_pairs() or () if self._segment_status(pair) in ("failed", "not_reviewed"))
             if failed:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS.format(count=failed)
+                tone = "warn"
             if not self._session.issues() and done:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_NONE
+        self._show_status(text, tone, bar)
+
+    def _show_status(self, text: str, tone: str, bar: tuple[int, int] | None = None) -> None:
+        """One status card for the run: text, a colour for its kind, and the
+        segment count as a bar while the run is going or waiting to go on.
+        Neutral and done look alike on purpose: no issues is not a pass."""
         self.semantic_progress.setText(text)
+        if self.review_status.property("tone") != tone:
+            self.review_status.setProperty("tone", tone)
+            self.review_status.style().unpolish(self.review_status)
+            self.review_status.style().polish(self.review_status)
+        show_bar = bar is not None and bar[1] > 0
+        if show_bar:
+            self.review_progress.setMaximum(bar[1])
+            self.review_progress.setValue(bar[0])
+        if self.review_progress.isVisibleTo(self.review_status) != show_bar:
+            self.review_progress.setVisible(show_bar)
+
+    def _render_inspector_hint(self) -> None:
+        if self._report is not None or self._review_state == "reviewing":
+            self.inspector_hint.hide()
+            return
+        configured = self._api_client.is_configured
+        self.inspector_hint.setText(strings.MANUSCRIPT_HINT_START if configured else strings.MANUSCRIPT_HINT_UNCONFIGURED)
+        self.inspector_hint.show()
 
     def _current_issue(self) -> sessions.LiveIssue | None:
         row = self.semantic_list.currentRow()
@@ -1519,6 +1583,7 @@ class ManuscriptView(QWidget):
         self.finding_count.setText(strings.MANUSCRIPT_FINDING_COUNT.format(
             current=index + 1 if finding is not None else 0, total=total))
         self.findings.setVisible(total > 0)
+        self._render_inspector_hint()
         if finding is None:
             self.finding_title.setText(
                 strings.MANUSCRIPT_FINDING_PROMPT if total else
@@ -1527,6 +1592,7 @@ class ManuscriptView(QWidget):
             for label in (self.finding_verdict, self.finding_pair, self.finding_rule, self.finding_positions, self.candidates_label):
                 label.clear()
             self.finding_verdict.hide()
+            self.finding_pair.hide()
             self.lookup_button.hide()
             self.manual_edit_label.hide()
             self.replace_toggle.hide()
@@ -1547,6 +1613,7 @@ class ManuscriptView(QWidget):
         self.finding_verdict.style().unpolish(self.finding_verdict)
         self.finding_verdict.style().polish(self.finding_verdict)
         self.finding_pair.setText(target["text"] if isinstance(target, dict) and isinstance(target.get("text"), str) else "")
+        self.finding_pair.setVisible(bool(self.finding_pair.text()))
         rule = strings.MANUSCRIPT_RULE_TERM_PAIR if finding["rule_id"] == "review.term_pair" else finding["rule_id"]
         self.finding_rule.setText(strings.MANUSCRIPT_RULE.format(rule=rule))
         positions = []
@@ -1719,6 +1786,7 @@ class ManuscriptView(QWidget):
         self._after_draft_change(before, value, edits, exempt)
 
     def _apply_endpoint_state(self) -> None:
+        self._render_inspector_hint()
         self._update_controls()
 
     def _on_composition_changed(self) -> None:

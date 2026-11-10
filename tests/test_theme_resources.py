@@ -74,6 +74,11 @@ OBJECT_NAMES = (
     "findingTitle",
     "findingPair",
     "findingVerdict",
+    "captionText",
+    "suggestionText",
+    "noticeText",
+    "reviewStatus",
+    "statusText",
 )
 
 # The dynamic properties, and the values the views set on them.
@@ -84,6 +89,7 @@ PROPERTY_VALUES = (
     ("invalid", ("true", "false")),
     ("done", ("true", "false")),
     ("verdict", ("verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated")),
+    ("tone", ("neutral", "busy", "paused", "warn", "danger")),
 )
 
 # Widget classes that appear in this application and would otherwise render in

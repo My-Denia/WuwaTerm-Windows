@@ -47,6 +47,7 @@ from ..credentials import (
     store_token,
 )
 from .components import (
+    ChevronComboBox,
     Banner,
     FieldError,
     apply_credential_backend,
@@ -324,7 +325,7 @@ class SettingsDialog(QDialog):
         sidebar_layout.setContentsMargins(0, 0, 8, 0)
         sidebar_layout.setSpacing(4)
         self.category_buttons = []
-        self.category_combo = QComboBox(self)
+        self.category_combo = ChevronComboBox(self)
         self.category_combo.setAccessibleName(strings.SETTINGS_CATEGORY_LABEL)
         for index, (label, icon_name) in enumerate(categories):
             button = QPushButton(label, self.category_sidebar)

@@ -47,6 +47,7 @@ from .. import strings
 from ..api import ApiClient, TranslationResult
 from ..errors import ERROR_CANCELLED, ClientError
 from .components import (
+    ChevronComboBox,
     Banner,
     FieldError,
     KindBadge,
@@ -175,7 +176,7 @@ class TranslateView(QWidget):
 
         self.field_error = FieldError(self)
 
-        self.direction_combo = QComboBox(self)
+        self.direction_combo = ChevronComboBox(self)
         for value, label in _DIRECTION_ITEMS:
             self.direction_combo.addItem(label, value)
 
