@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from wuwaterm_client import strings
 from wuwaterm_client.api import ApiClient
-from wuwaterm_client.config import ClientConfig
+from wuwaterm_client.config import ClientConfig, config_path
 from wuwaterm_client.manuscript import empty_workfile, save_workfile
 from wuwaterm_client.ui.main_window import MainWindow
 from wuwaterm_client.ui.manuscript_view import MAX_IMPORT_BYTES, ManuscriptView
@@ -357,3 +357,15 @@ def test_a_saved_workfile_never_contains_its_own_path(qapp, tmp_path) -> None:
     raw = path.read_text(encoding="utf-8")
     assert "private-folder-name" not in raw and str(tmp_path) not in raw
     assert str(path) in (Path(__import__("os").environ["APPDATA"]) / "WuwaTerm" / "config.json").read_text(encoding="utf-8")
+
+
+def test_a_damaged_settings_file_is_not_overwritten_by_the_recent_list(qapp, tmp_path) -> None:
+    """The damaged file still holds the server address the owner can repair;
+    opening a manuscript must not replace it with defaults."""
+    damaged = b'{"base_url": "https://example.invalid", '
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_bytes(damaged)
+    window = _window(tmp_path)
+    window.manuscript_view.open_path(_save_doc(tmp_path, "a.json", "x", "y"))
+    window.close()
+    assert config_path().read_bytes() == damaged

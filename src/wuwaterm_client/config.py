@@ -312,6 +312,23 @@ def _stored_base_url(value: object) -> str | None:
     return value.strip()
 
 
+def stored_file_is_replaceable(base_dir: Path | None = None) -> bool:
+    """Whether a background write may replace the file on disk.
+
+    A file that exists but cannot be read as settings still holds the only
+    record of the owner's server address, which they can repair by hand. The
+    recent-files list must not overwrite it with defaults; an explicit
+    settings change still may. A missing file is fine to create.
+    """
+    try:
+        raw = json.loads(config_path(base_dir).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict)
+
+
 @dataclasses.dataclass(frozen=True)
 class ClientConfig:
     """Non-secret client settings.

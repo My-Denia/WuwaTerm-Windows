@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from .. import recent, strings
 from ..api import ApiClient
-from ..config import ClientConfig, RecentEntry, sanitize_recent_entry, usable_base_url
+from ..config import ClientConfig, RecentEntry, sanitize_recent_entry, stored_file_is_replaceable, usable_base_url
 from ..credentials import CredentialStoreUnavailable, has_token, store_token
 from ..errors import (
     ERROR_INSECURE_ENDPOINT,
@@ -372,6 +372,8 @@ class MainWindow(QMainWindow):
 
     def _set_recent(self, entries: tuple[RecentEntry, ...]) -> None:
         self.config = dataclasses.replace(self.config, recent=entries)
+        if not stored_file_is_replaceable():
+            return
         try:
             self.config.save()
         except OSError:
