@@ -1278,3 +1278,27 @@ def test_status_queries_stay_fast_with_many_issues_and_decisions(qapp) -> None:
     keystroke = time.perf_counter() - started
     assert view._issue_state(view._issue_rows[0]) == "stale"
     assert rebuild < 0.2 and keystroke < 0.2, (rebuild, keystroke)
+
+
+def test_reopening_restores_the_selected_occurrence_of_a_repeated_issue(qapp) -> None:
+    """Identical paragraphs give identical fingerprints; the stored position
+    must bring back the copy the owner was on, not the first one."""
+    async def scenario():
+        source = "\n\n".join([SOURCE + "甲" * 1500] * 2)
+        target = "\n\n".join([TARGET + "A" * 1500] * 2)
+        view = make_view(Server(issues=two_issues), source, target)
+        view._start_review()
+        await settle(view)
+        assert len(view._issue_rows) == 4
+        view.semantic_list.setCurrentRow(3)
+        selected = view._current_issue()
+        assert selected.segment_index == 1
+        position = view.work_position()
+        reopened = make_view(Server(issues=two_issues), source, target)
+        reopened.restore_work_position(position)
+        reopened._start_review()
+        await settle(reopened)
+        restored = reopened._current_issue()
+        assert restored is not None and restored.segment_index == 1
+        assert restored.target_span == selected.target_span
+    asyncio.run(scenario())

@@ -11,7 +11,7 @@ import bisect
 import copy
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -2802,23 +2802,22 @@ class ManuscriptView(QWidget):
         event.acceptProposedAction()
         self._files_dropped(files, "source")
 
-    def import_files(self, paths: list[str], side: str = "source") -> None:
+    def import_files(self, paths: list[str], side: str = "source") -> bool:
         """What dropped files mean: .json opens, .txt/.md replace one side."""
         if not self._input_ready():
-            return
+            return False
         if len(paths) != 1:
             self.status_label.setText(strings.IMPORT_ONE_FILE_ONLY)
-            return
+            return False
         path = Path(paths[0])
         suffix = path.suffix.lower()
         if suffix == ".json":
-            self.open_path(path)
-        elif suffix in _TEXT_SUFFIXES:
+            return bool(self.open_path(path))
+        if suffix in _TEXT_SUFFIXES:
             text = self._read_import_text(path)
-            if text is not None:
-                self._replace_side(side, text)
-        else:
-            self.status_label.setText(strings.IMPORT_UNSUPPORTED_TYPE)
+            return text is not None and self._replace_side(side, text)
+        self.status_label.setText(strings.IMPORT_UNSUPPORTED_TYPE)
+        return False
 
     def _read_import_text(self, path: Path) -> str | None:
         try:
@@ -2853,9 +2852,30 @@ class ManuscriptView(QWidget):
         self.status_label.setText(strings.IMPORT_REPLACED[side])
         return True
 
+    @staticmethod
+    def _clipboard_files() -> list[str]:
+        """Local files on the clipboard, also when only spelled as file URLs.
+
+        Copying a file in Explorer puts its URL on the clipboard, and the
+        plain-text form of that is the full path. A path is never manuscript
+        text: it would be saved, exported and sent with the next review.
+        """
+        mime = QApplication.clipboard().mimeData()
+        files = LosslessEditor.local_files(mime)
+        if files or mime is None or not mime.hasText():
+            return files
+        lines = [line.strip() for line in mime.text().splitlines() if line.strip()]
+        if lines and all(line.lower().startswith("file:") for line in lines):
+            return [QUrl(line).toLocalFile() or line for line in lines]
+        return []
+
     def paste_as(self, side: str) -> bool:
         if not self._input_ready():
             return False
+        files = self._clipboard_files()
+        if files:
+            # The same rules as dropping that file onto this side.
+            return self.import_files(files, side)
         text = QApplication.clipboard().text()
         if not text:
             self.status_label.setText(strings.CLIPBOARD_EMPTY)
@@ -2874,7 +2894,16 @@ class ManuscriptView(QWidget):
     def new_from_clipboard(self) -> bool:
         if not self._input_ready():
             return False
-        text = QApplication.clipboard().text()
+        files = self._clipboard_files()
+        if files:
+            if len(files) != 1 or Path(files[0]).suffix.lower() not in _TEXT_SUFFIXES:
+                # A workfile opens as itself; anything else is refused there.
+                return self.import_files(files, "source")
+            text = self._read_import_text(Path(files[0]))
+            if text is None:
+                return False
+        else:
+            text = QApplication.clipboard().text()
         if not text:
             self.status_label.setText(strings.CLIPBOARD_EMPTY)
             return False
@@ -2903,7 +2932,7 @@ class ManuscriptView(QWidget):
             "cursor": {"side": editor.side, "offset": editor.raw_cursor_offset()},
             "scroll": {"source": self.source_edit.verticalScrollBar().value(),
                        "target": self.target_edit.verticalScrollBar().value()},
-            "selected_issue_id": issue.issue["fingerprint"] if issue is not None else self._pending_issue_id,
+            "selected_issue_id": self._issue_anchor(issue) if issue is not None else self._pending_issue_id,
             "panel_width": width,
         }
 
@@ -2936,11 +2965,35 @@ class ManuscriptView(QWidget):
             if isinstance(value, int) and not isinstance(value, bool):
                 editor.verticalScrollBar().setValue(value)
 
+    def _texts_tag(self) -> str:
+        return sessions.revision(self._payload["source"] + "\0" + self._payload["target"])[:16]
+
+    @staticmethod
+    def _occurrence(issue: sessions.LiveIssue) -> str:
+        def bounds(span: dict | None) -> str:
+            return "-" if span is None else f'{span["start"]}-{span["end"]}'
+
+        return "|".join((issue.issue["fingerprint"], bounds(issue.source_span), bounds(issue.target_span)))
+
+    def _issue_anchor(self, issue: sessions.LiveIssue) -> str:
+        """One occurrence of an issue: the texts it was measured in, its
+        fingerprint and both spans in whole-text coordinates.
+
+        The fingerprint alone repeats for identical paragraphs, so restoring
+        by it selected the first copy rather than the one the owner was on.
+        """
+        return f"{self._texts_tag()}|{self._occurrence(issue)}"
+
     def _select_pending_issue(self) -> None:
-        if self._pending_issue_id is None or self._current_issue() is not None:
+        if self._pending_issue_id is None or self._current_issue() is not None or not self._issue_rows:
             return
-        for row, issue in enumerate(self._issue_rows):
-            if issue.issue["fingerprint"] == self._pending_issue_id:
-                self._pending_issue_id = None
-                self.semantic_list.setCurrentRow(row)
-                return
+        tag, _, occurrence = self._pending_issue_id.partition("|")
+        if tag != self._texts_tag():
+            # Other texts (or an older bare fingerprint): never guess.
+            self._pending_issue_id = None
+            return
+        matches = [row for row, issue in enumerate(self._issue_rows) if self._occurrence(issue) == occurrence]
+        # Only an exact, unique occurrence; otherwise nothing is selected.
+        if len(matches) == 1:
+            self._pending_issue_id = None
+            self.semantic_list.setCurrentRow(matches[0])

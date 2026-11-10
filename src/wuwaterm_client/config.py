@@ -49,7 +49,8 @@ DEFAULT_APPEARANCE = APPEARANCE_SYSTEM
 # manuscript, an export, a log line or a request.
 MAX_RECENT = 10
 MAX_RECENT_PATH_CHARS = 4096
-MAX_FINGERPRINT_CHARS = 64
+# A fingerprint, a short text revision and two spans (see ManuscriptView).
+MAX_FINGERPRINT_CHARS = 160
 MIN_PANEL_WIDTH = 120
 MAX_PANEL_WIDTH = 2000
 # A scrollbar value or text offset beyond this is a corrupt file, not a position.
@@ -76,7 +77,7 @@ class RecentEntry:
     opened_at: str
     cursor: RecentCursor | None = None
     scroll: RecentScroll = RecentScroll()
-    # The semantic issue fingerprint, which survives a re-review.
+    # One occurrence of a semantic issue: fingerprint, text revision and spans.
     selected_issue_id: str | None = None
     panel_width: int | None = None
 

@@ -1,6 +1,7 @@
 """Drop, clipboard, recent files and work-position restore on real widgets."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from wuwaterm_client import strings
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.config import ClientConfig, config_path
-from wuwaterm_client.manuscript import empty_workfile, save_workfile
+from wuwaterm_client.manuscript import empty_workfile, save_workfile, serialize_workfile
 from wuwaterm_client.ui.main_window import MainWindow
 from wuwaterm_client.ui.manuscript_view import MAX_IMPORT_BYTES, ManuscriptView
 
@@ -330,21 +331,88 @@ def test_saving_as_a_new_path_lists_it(qapp, tmp_path, monkeypatch) -> None:
 
 def test_pending_issue_is_selected_only_if_the_owner_has_not_chosen(qapp) -> None:
     class Issue:
-        def __init__(self, fingerprint):
+        def __init__(self, fingerprint, start):
             self.issue = {"fingerprint": fingerprint}
+            self.source_span = None
+            self.target_span = {"start": start, "end": start + 1}
 
     view = _view()
-    first, second = Issue("a" * 32), Issue("b" * 32)
+    first, second = Issue("a" * 32, 0), Issue("b" * 32, 1)
     view._issue_rows = [first, second]
     view.semantic_list.addItems(["one", "two"])
-    view.restore_work_position({"selected_issue_id": "b" * 32})
+    anchor = view._issue_anchor(second)
+    view.restore_work_position({"selected_issue_id": anchor})
     view._select_pending_issue()
-    assert view.work_position()["selected_issue_id"] == "b" * 32
+    assert view.work_position()["selected_issue_id"] == anchor
     assert view.semantic_list.currentRow() == 1
     view.semantic_list.setCurrentRow(0)
-    view._pending_issue_id = "b" * 32
+    view._pending_issue_id = anchor
     view._select_pending_issue()
     assert view.semantic_list.currentRow() == 0
+
+
+def test_a_stored_issue_is_not_restored_into_other_texts_or_by_fingerprint_alone(qapp) -> None:
+    class Issue:
+        def __init__(self, start):
+            self.issue = {"fingerprint": "b" * 32}
+            self.source_span = None
+            self.target_span = {"start": start, "end": start + 1}
+
+    view = _view()
+    view._issue_rows = [Issue(0), Issue(1)]
+    view.semantic_list.addItems(["one", "two"])
+    for stored in ("b" * 32, "0" * 16 + "|" + view._occurrence(view._issue_rows[1])):
+        view._pending_issue_id = stored
+        view._select_pending_issue()
+        assert view.semantic_list.currentRow() == -1 and view._pending_issue_id is None
+
+
+@pytest.mark.parametrize("spelling", ["urls", "text"])
+@pytest.mark.parametrize("action", ["source", "target", "new"])
+def test_a_copied_file_never_becomes_manuscript_text(qapp, tmp_path, action, spelling) -> None:
+    """Copying a file in Explorer puts its URL on the clipboard; pasting must
+    import the file as a drop would, never type its path into the draft."""
+    path = tmp_path / "private-directory" / "draft.txt"
+    path.parent.mkdir()
+    path.write_text("body", encoding="utf-8")
+    mime = QMimeData()
+    if spelling == "urls":
+        mime.setUrls([QUrl.fromLocalFile(str(path))])
+    else:
+        mime.setText(QUrl.fromLocalFile(str(path)).toString())
+    QApplication.clipboard().setMimeData(mime)
+    view = _view()
+    try:
+        assert view.new_from_clipboard() if action == "new" else view.paste_as(action)
+    finally:
+        QApplication.clipboard().clear()
+    side = "source" if action == "new" else action
+    assert view._payload[side] == "body"
+    serialized = serialize_workfile(view._payload)
+    assert "private-directory" not in serialized
+    assert json.dumps(str(path))[1:-1] not in serialized
+
+
+def test_a_copied_file_path_never_reaches_a_review_request(qapp, tmp_path) -> None:
+    from test_manuscript_semantic import SOURCE, TARGET, Server, make_view, settle
+
+    async def scenario():
+        path = tmp_path / "private-directory" / "draft.txt"
+        path.parent.mkdir()
+        path.write_text("body", encoding="utf-8")
+        server = Server(capabilities=None)
+        view = make_view(server, SOURCE, TARGET)
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path))])
+        QApplication.clipboard().setMimeData(mime)
+        try:
+            view.paste_as("source")
+        finally:
+            QApplication.clipboard().clear()
+        view._start_review()
+        await settle(view)
+        assert server.sent("/v1/reviews")[0]["source"] == "body"
+    asyncio.run(scenario())
 
 
 def test_a_saved_workfile_never_contains_its_own_path(qapp, tmp_path) -> None:
