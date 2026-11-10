@@ -114,6 +114,7 @@ WIDGET_SELECTORS = (
     "QDoubleSpinBox",
     "QProgressBar",
     "QRadioButton",
+    "QCheckBox",
     "QMenuBar",
     "QMenu",
     "QMessageBox",

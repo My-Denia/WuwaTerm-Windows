@@ -14,7 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
@@ -47,6 +47,11 @@ _FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGU
                           ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE, ERROR_LLM_UNAVAILABLE})
 # The same failure on consecutive segments is the service, not the segment.
 _REPEATED_FAILURES = 2
+# Precedents (the owner's earlier choices in this manuscript) go with both
+# translation and semantic review by default, as on the Web, because the
+# Core evaluation's M' gates (same-sense reuse, led astray) were met with
+# them (C2 receipt, round 1). Re-read the receipt when the Core pin moves.
+PRECEDENTS_DEFAULT_ON = True
 TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
 # A dropped text file is read whole into the editor, so it gets the same
 # ceiling as a workfile.
@@ -842,6 +847,10 @@ class ManuscriptView(QWidget):
         self.request_id_label.setObjectName("secondaryText")
         self.request_id_label.setWordWrap(True)
         more.addWidget(self.request_id_label)
+        self.precedents_check = QCheckBox(strings.MANUSCRIPT_USE_PRECEDENTS, self.more_details)
+        self.precedents_check.setChecked(PRECEDENTS_DEFAULT_ON)
+        self.precedents_check.hide()
+        more.addWidget(self.precedents_check)
         self.more_details.hide()
         self.details_button.toggled.connect(self.more_details.setVisible)
         details.addWidget(self.more_details)
@@ -1611,10 +1620,14 @@ class ManuscriptView(QWidget):
         # Semantic review is an experimental server option, off by default.
         # Without it the track would only ever be empty; it appears once the
         # server offers it, or when the manuscript already carries its data.
-        semantic = self._semantic_available() or bool(self._issue_rows) or bool(self._decisions())
-        if self.semantic_track_button.isVisibleTo(self) != semantic:
-            self.semantic_track_button.setVisible(semantic)
-        if not semantic and self.track_stack.currentIndex() == TRACK_SEMANTIC:
+        offered = self._capabilities is not None and bool(
+            {semantic.CAPABILITY_SEMANTIC_REVIEW, semantic.CAPABILITY_TRANSLATION_CONTEXT} & self._capabilities)
+        if self.precedents_check.isVisibleTo(self.more_details) != offered:
+            self.precedents_check.setVisible(offered)
+        show_semantic = self._semantic_available() or bool(self._issue_rows) or bool(self._decisions())
+        if self.semantic_track_button.isVisibleTo(self) != show_semantic:
+            self.semantic_track_button.setVisible(show_semantic)
+        if not show_semantic and self.track_stack.currentIndex() == TRACK_SEMANTIC:
             self._show_track(TRACK_TERMS)
             return
         track = self.track_stack.currentIndex()
@@ -2284,7 +2297,8 @@ class ManuscriptView(QWidget):
                 hard_cut=pair.hard_cut, report=None)
             before = self._context_for(pair)
             precedents = semantic.select_precedents(
-                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start)
+                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start
+            ) if self.precedents_check.isChecked() else []
             term_alignments = self._segment_alignments(pair)
             self._render_semantic_progress()
             term_report = report = None
@@ -2448,9 +2462,11 @@ class ManuscriptView(QWidget):
             self._capabilities = await self._api_client.get_capabilities()
             context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
             if pair is None:
-                text = source
+                text, base = source, 0
             else:
-                text = source[pair.source.core_start:pair.source.core_end]
+                text, base = source[pair.source.core_start:pair.source.core_end], pair.source.core_start
+            candidates = (sessions.precedent_candidates(self._payload, self._current_pairs())
+                          if context_on and self.precedents_check.isChecked() else [])
             pieces = segment_text(text, SEGMENT_LIMIT)
             count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
             out: list[str] = []
@@ -2464,10 +2480,11 @@ class ManuscriptView(QWidget):
                 done += 1
                 self.status_label.setText(strings.MANUSCRIPT_TRANSLATING.format(index=done, total=count))
                 context = None
-                if context_on and previous is not None:
-                    # Precedents stay off until the ADR 0019 M′ gates pass.
-                    before = semantic.context_before(*previous)
-                    context = {"before": before} if before is not None else None
+                if context_on:
+                    before = semantic.context_before(*previous) if previous is not None else None
+                    precedents = semantic.select_precedents(candidates, core, base + piece.core_start)
+                    context = {**({"before": before} if before is not None else {}),
+                               **({"precedents": precedents} if precedents else {})} or None
                 result = await self._api_client.translate(core, to=direction, context=context)
                 if generation != self._translate_generation:
                     return

@@ -504,6 +504,7 @@ MANUSCRIPT_HINT_START = "填好原文和译文后按「审校」（Ctrl+Shift+R�
 MANUSCRIPT_HINT_UNCONFIGURED = "可以先编辑和保存稿件。审校需要先在设置里配置服务地址和设备令牌。"
 MANUSCRIPT_SEMANTIC_NOTE = "以下是模型提出的疑点，可能有误，请自行判断。没有列出的地方也不代表一定没有问题。"
 MANUSCRIPT_SEMANTIC_EXPERIMENTAL = "实验性"
+MANUSCRIPT_USE_PRECEDENTS = "翻译与审校时附带本稿此前的人工判断作为先例（每条只说明那一处）"
 MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE = "语义审校是服务端的实验性功能，默认不开启。疑点由模型提出，可能有误，请自行判断。"
 MANUSCRIPT_SEMANTIC_UNAVAILABLE = "当前服务器没有提供语义审校，本次只做术语审校。"
 MANUSCRIPT_SEMANTIC_NOT_RUN = "尚未进行语义审校。"

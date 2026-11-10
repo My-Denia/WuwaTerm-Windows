@@ -18,6 +18,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from wuwaterm_client import semantic, strings
+from wuwaterm_client import semantic_session as sessions
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.manuscript import WORKFILE_FORMAT_V2, empty_workfile, load_workfile
 from wuwaterm_client.segmentation import SEGMENT_LIMIT
@@ -608,8 +609,34 @@ def test_translation_sends_context_only_when_the_server_lists_it(qapp) -> None:
             assert len(sent) == 2 and "context" not in sent[0]
             assert ("context" in sent[1]) is expect_context
             if expect_context:
-                assert set(sent[1]["context"]) == {"before"}, "no precedents until the M′ gates pass"
+                assert set(sent[1]["context"]) == {"before"}, "no human choices yet, so no precedents"
                 assert len(sent[1]["context"]["before"]["source"]) <= 400
+    asyncio.run(scenario())
+
+
+def test_precedents_go_with_translation_and_review_by_default_and_can_be_turned_off(qapp, monkeypatch) -> None:
+    """As on the Web: precedents are on by default for both (C2 M′ gates met)
+    and one option turns them off for both."""
+    source = ("第一句。" * 300) + "\n\n" + ("第二句。" * 300)
+    precedent = {"surface": "第一句", "choice": "not_a_term", "rendering": None, "snippet": "第一句。",
+                 "anchor": {"segment_index": 0, "source_start": 0, "source_end": 3}, "scope": "occurrence"}
+    monkeypatch.setattr(sessions, "precedent_candidates", lambda payload, pairs: [(3, dict(precedent))])
+
+    async def scenario():
+        for checked in (True, False):
+            server = Server(capabilities=("semantic-review-v1", "translation-context-v1"))
+            view = make_view(server, source, "", direction="en")
+            assert view.precedents_check.isChecked()
+            view.precedents_check.setChecked(checked)
+            view._translate()
+            await settle(view)
+            assert not view.precedents_check.isHidden()
+            second = server.sent("/v1/translations")[1]["context"]
+            assert ("precedents" in second) is checked
+            view._start_review()
+            await settle(view)
+            reviewed = server.sent("/v1/semantic-reviews")
+            assert reviewed and any(body["precedents"] for body in reviewed) is checked
     asyncio.run(scenario())
 
 

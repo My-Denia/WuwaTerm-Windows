@@ -724,6 +724,35 @@ QRadioButton::indicator:disabled {
     border: 1px solid @border-subtle@;
 }
 
+QCheckBox {
+    background-color: transparent;
+    color: @text-primary@;
+    spacing: 8px;
+    min-height: 24px;
+    padding: 2px 0px;
+}
+
+QCheckBox:disabled {
+    color: @text-muted@;
+}
+
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid @border-strong@;
+    border-radius: 4px;
+    background-color: @bg-surface@;
+}
+
+QCheckBox::indicator:hover {
+    border: 1px solid @accent@;
+}
+
+QCheckBox::indicator:checked {
+    background-color: @accent@;
+    border: 1px solid @accent@;
+}
+
 /* -------------------------------------------------------------- 表格 */
 
 QTableView,
