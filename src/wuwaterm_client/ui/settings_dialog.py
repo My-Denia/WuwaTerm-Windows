@@ -6,6 +6,7 @@ are applied only on acceptance; credential changes take effect immediately.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -414,10 +415,12 @@ class SettingsDialog(QDialog):
         empty is valid; clearing a configured address is refused.
         """
         base_url = self.base_url_edit.text().strip() or None
-        return ClientConfig(
+        # `replace`, not a fresh ClientConfig: fields this dialog does not
+        # edit (the recent-files list) must survive an accepted dialog.
+        return dataclasses.replace(
+            self._config,
             base_url=base_url,
             request_timeout_seconds=self.timeout_spin.value(),
-            translate_timeout_seconds=self._config.translate_timeout_seconds,
             appearance=self.selected_appearance(),
         )
 

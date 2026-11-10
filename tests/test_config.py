@@ -40,6 +40,7 @@ def test_config_file_never_contains_the_credential(tmp_path: Path) -> None:
         "request_timeout_seconds",
         "translate_timeout_seconds",
         "appearance",
+        "recent",
     }
 
 

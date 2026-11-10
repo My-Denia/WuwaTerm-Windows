@@ -7,7 +7,9 @@ not a claim that a service connection has been tested.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
+import os
 from collections.abc import Callable
 
 from PySide6.QtCore import QSize
@@ -25,9 +27,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import strings
+from .. import recent, strings
 from ..api import ApiClient
-from ..config import ClientConfig, usable_base_url
+from ..config import ClientConfig, RecentEntry, sanitize_recent_entry, usable_base_url
 from ..credentials import CredentialStoreUnavailable, has_token, store_token
 from ..errors import (
     ERROR_INSECURE_ENDPOINT,
@@ -224,6 +226,9 @@ class MainWindow(QMainWindow):
         if lookup_signal is not None:
             lookup_signal.connect(self._on_lookup_requested)
         self.manuscript_view.documentChanged.connect(self._update_window_title)
+        self.manuscript_view.documentLeaving.connect(self._remember_position)
+        self.manuscript_view.documentSaved.connect(self._remember_position)
+        self.manuscript_view.documentOpened.connect(self._on_document_opened)
         self._update_window_title()
 
         self.show_page(PAGE_MANUSCRIPT)
@@ -276,18 +281,33 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu(strings.MENU_FILE)
-        for text, shortcut, handler in (
-            (strings.MANUSCRIPT_NEW, "Ctrl+N", self.manuscript_view.new_document),
-            (strings.MANUSCRIPT_OPEN, "Ctrl+O", self.manuscript_view.open_document),
-            (strings.MANUSCRIPT_SAVE, "Ctrl+S", self.manuscript_view.save_document),
-            (strings.MANUSCRIPT_SAVE_AS, "Ctrl+Shift+S", lambda: self.manuscript_view.save_document(save_as=True)),
-        ):
+        view = self.manuscript_view
+
+        def add(menu, text, shortcut, handler):
             action = QAction(text, self)
-            action.setShortcut(QKeySequence(shortcut))
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
             action.triggered.connect(
                 lambda _checked=False, callback=handler: self._run_manuscript_action(callback)
             )
-            file_menu.addAction(action)
+            menu.addAction(action)
+            return action
+
+        add(file_menu, strings.MANUSCRIPT_NEW, "Ctrl+N", view.new_document)
+        add(file_menu, strings.MANUSCRIPT_OPEN, "Ctrl+O", view.open_document)
+        add(file_menu, strings.MANUSCRIPT_SAVE, "Ctrl+S", view.save_document)
+        add(file_menu, strings.MANUSCRIPT_SAVE_AS, "Ctrl+Shift+S", lambda: view.save_document(save_as=True))
+        file_menu.addSeparator()
+        add(file_menu, strings.MANUSCRIPT_NEW_FROM_CLIPBOARD, None, view.new_from_clipboard)
+        self.recent_menu = file_menu.addMenu(strings.RECENT_MENU)
+        self.recent_menu.setToolTipsVisible(True)
+        self.recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+
+        edit_menu = self.menuBar().addMenu(strings.MENU_EDIT)
+        add(edit_menu, strings.EDIT_PASTE_SOURCE, None, lambda: view.paste_as("source"))
+        add(edit_menu, strings.EDIT_PASTE_TARGET, None, lambda: view.paste_as("target"))
+        # Ctrl+Shift+C is free (the manuscript uses Ctrl+Shift+E/I/R/T/S).
+        add(edit_menu, strings.EDIT_COPY_TARGET, "Ctrl+Shift+C", view.copy_target)
         file_menu.addSeparator()
         settings_action = QAction(strings.SETTINGS_MENU_LABEL, self)
         settings_action.triggered.connect(self._on_settings_clicked)
@@ -304,6 +324,94 @@ class MainWindow(QMainWindow):
         about_action = QAction(strings.MENU_ABOUT, self)
         about_action.triggered.connect(self._on_about_clicked)
         help_menu.addAction(about_action)
+
+    # -- recent files and work position ------------------------------------
+
+    def _rebuild_recent_menu(self) -> None:
+        menu = self.recent_menu
+        menu.clear()
+        entries = self.config.recent
+        if not entries:
+            menu.addAction(strings.RECENT_NONE).setEnabled(False)
+            return
+        any_missing = False
+        for entry in entries:
+            present = recent.file_exists(entry.path)
+            any_missing = any_missing or not present
+            label = recent.menu_label(entry.path)
+            action = QAction(label if present else label + strings.RECENT_MISSING_SUFFIX, menu)
+            action.setToolTip(entry.path)
+            action.setStatusTip(entry.path)
+            action.setEnabled(present)
+            action.triggered.connect(
+                lambda _checked=False, path=entry.path: self._run_manuscript_action(
+                    lambda: self._open_recent(path)
+                )
+            )
+            menu.addAction(action)
+        menu.addSeparator()
+        remove = menu.addAction(strings.RECENT_REMOVE_MISSING)
+        remove.setEnabled(any_missing)
+        remove.triggered.connect(self._remove_missing_recent)
+        menu.addAction(strings.RECENT_CLEAR).triggered.connect(self._clear_recent)
+
+    def _open_recent(self, path: str) -> None:
+        if not recent.file_exists(path):
+            # Gone since the menu was drawn. The entry stays; the menu marks it.
+            self.manuscript_view.status_label.setText(
+                strings.RECENT_FILE_MISSING.format(name=os.path.basename(path))
+            )
+            return
+        self.manuscript_view.open_path(path)
+
+    def _remove_missing_recent(self) -> None:
+        self._set_recent(recent.without_missing(self.config.recent, recent.file_exists))
+
+    def _clear_recent(self) -> None:
+        self._set_recent(())
+
+    def _set_recent(self, entries: tuple[RecentEntry, ...]) -> None:
+        self.config = dataclasses.replace(self.config, recent=entries)
+        try:
+            self.config.save()
+        except OSError:
+            # The list is a convenience; settings saves keep their own banner.
+            pass
+
+    def _remember_position(self) -> None:
+        """Record the open document's path and work position.
+
+        Called when it is saved or left and when the window closes - never
+        while typing, so no config write sits on the keystroke path.
+        """
+        path = self.manuscript_view.document_path
+        if path is None:
+            return
+        self._store_recent(os.path.abspath(path), self.manuscript_view.work_position())
+
+    def _store_recent(self, path: str, position: dict | None) -> None:
+        """Upsert `path` on top, keeping what an earlier entry knew.
+
+        A position of None (just opened) keeps the old one; a hidden
+        inspector reports no width, so the stored width stays.
+        """
+        previous = recent.find(self.config.recent, path)
+        merged = dataclasses.asdict(previous) if previous is not None else {}
+        for key, value in (position or {}).items():
+            if key != "panel_width" or value is not None:
+                merged[key] = value
+        merged.update(path=path, opened_at=recent.utc_now())
+        # The loader's own check, so nothing is stored that would not load.
+        entry = sanitize_recent_entry(merged)
+        if entry is not None:
+            self._set_recent(recent.upsert(self.config.recent, entry))
+
+    def _on_document_opened(self, name: str) -> None:
+        path = os.path.abspath(name)
+        previous = recent.find(self.config.recent, path)
+        if previous is not None:
+            self.manuscript_view.restore_work_position(dataclasses.asdict(previous))
+        self._store_recent(path, None)
 
     def _run_manuscript_action(self, handler: Callable[[], object]) -> None:
         # Do not change focus while an IME composition is pending. The
@@ -590,6 +698,7 @@ class MainWindow(QMainWindow):
         if not self.manuscript_view.confirm_discard():
             event.ignore()
             return
+        self._remember_position()
         self.manuscript_view.cancel_background_work()
         super().closeEvent(event)
 

@@ -89,6 +89,7 @@ def test_a_saved_configuration_is_really_on_disk(tmp_path: Path) -> None:
         "request_timeout_seconds": 11.0,
         "translate_timeout_seconds": 45.0,
         "appearance": "dark",
+        "recent": [],
     }
     # Nothing else: an atomic write leaves no temporary file behind.
     assert sorted(item.name for item in tmp_path.iterdir()) == [CONFIG_FILE_NAME]
