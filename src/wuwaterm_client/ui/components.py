@@ -847,6 +847,11 @@ class ChevronComboBox(QComboBox):
 
     ARROW_SIZE = 14
 
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Loaded once: the icon engine picks the theme's colour at paint time.
+        self._arrow = icon("chevron-down", "text-secondary")
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         option = QStyleOptionComboBox()
@@ -858,6 +863,6 @@ class ChevronComboBox(QComboBox):
         target = QRect(area.center().x() - side // 2, area.center().y() - side // 2 + 1, side, side)
         mode = QIcon.Mode.Normal if self.isEnabled() else QIcon.Mode.Disabled
         painter = QPainter(self)
-        icon("chevron-down", "text-secondary").paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
+        self._arrow.paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
         painter.end()
 
