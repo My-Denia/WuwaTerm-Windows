@@ -761,3 +761,46 @@ def test_saving_again_after_history_was_trimmed_away_keeps_memory_and_file_in_st
         assert view.save_document()
         assert load_workfile(view._path)["source"] == source
     asyncio.run(scenario())
+
+
+def test_a_failed_semantic_segment_keeps_its_term_results_and_retries_only_the_model(qapp) -> None:
+    async def scenario():
+        server = Server()
+        server.semantic_errors = [httpx.Response(500, json={"error": {"code": "internal", "message": "x"},
+                                                            "request_id": "e"})]
+        view = make_view(server, LONG_SOURCE, LONG_TARGET)
+        view._start_review()
+        await settle(view)
+        ready = [p for p in view._current_pairs() if p.status == "ready"]
+        terms = len(server.sent("/v1/reviews"))
+        assert terms == len(ready), "every segment's term review was kept"
+        assert view._review_state == "current"
+        assert view._progress() == (len(ready) - 1, len(ready))
+        semantic_before = len(server.sent("/v1/semantic-reviews"))
+        view._start_review()
+        await settle(view)
+        assert len(server.sent("/v1/reviews")) == terms, "the term track is not requested again"
+        assert len(server.sent("/v1/semantic-reviews")) == semantic_before + 1
+        assert view._progress() == (len(ready), len(ready))
+    asyncio.run(scenario())
+
+
+def test_re_reviewing_an_edited_segment_replaces_its_old_issues(qapp) -> None:
+    def issues(s, t):
+        return [issue(s, t, source_quote=s[:2], target_quote=t[:3], seed=t[:4])]
+
+    async def scenario():
+        view = make_view(Server(issues=issues), LONG_SOURCE, LONG_TARGET)
+        view._start_review()
+        await settle(view)
+        count = len(view._session.issues())
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(LONG_SOURCE.index("第二段") + 1)
+        view.source_edit.setTextCursor(cursor)
+        view.source_edit.insertPlainText("加长" * 5)
+        assert sum(view._issue_state(i) == "stale" for i in view._session.issues()) == 1
+        view._start_review()
+        await settle(view)
+        assert len(view._session.issues()) == count
+        assert all(view._issue_state(i) == "pending" for i in view._session.issues())
+    asyncio.run(scenario())

@@ -130,6 +130,8 @@ class SegmentResult:
     hard_cut: bool
     report: dict[str, Any] | None
     index: int = 0
+    # The term review succeeded but the semantic review did not; retried.
+    semantic_missing: bool = False
     issues: list[LiveIssue] = field(default_factory=list)
     term_findings: list[dict] = field(default_factory=list)  # full coordinates
     term_report: dict[str, Any] | None = None
@@ -219,8 +221,13 @@ class Session:
 
     # -- results ---------------------------------------------------------
     def replace_result(self, result: SegmentResult) -> None:
-        """Keep at most one result per sent source core position."""
-        self.results = [r for r in self.results if r.source_core != result.source_core]
+        """Keep at most one result per segment: a new result replaces the one
+        at the same place and any invalidated result its cores overlap."""
+        def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+            return a[0] < b[1] and b[0] < a[1]
+        self.results = [r for r in self.results if r.source_core != result.source_core
+                        and not (r.invalid and (overlaps(r.source_core, result.source_core)
+                                                or overlaps(r.target_core, result.target_core)))]
         self.results.append(result)
         self.results.sort(key=lambda r: r.source_core)
 

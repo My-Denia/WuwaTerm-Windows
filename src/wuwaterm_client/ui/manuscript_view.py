@@ -965,7 +965,8 @@ class ManuscriptView(QWidget):
     def _segment_status(self, pair) -> str:
         if pair.status != STATUS_READY:
             return pair.status
-        if self._session.result_for(pair, self._payload["source"], self._payload["target"]) is not None:
+        result = self._session.result_for(pair, self._payload["source"], self._payload["target"])
+        if result is not None and not (result.semantic_missing and self._semantic_available()):
             return "reviewed"
         return self._segment_failures.get(self._segment_key(pair), "pending")
 
@@ -1845,7 +1846,7 @@ class ManuscriptView(QWidget):
             return
         self._show_term_report({
             "request_id": reports[-1]["request_id"],
-            "findings": self._session.term_findings(source, target)[:256],
+            "findings": self._session.term_findings(source, target),
             "coverage": {"evaluated": sum(r["coverage"]["evaluated"] for r in reports),
                          "not_evaluated": sum(r["coverage"]["not_evaluated"] for r in reports),
                          "rules": reports[-1]["coverage"]["rules"]},
@@ -1921,8 +1922,10 @@ class ManuscriptView(QWidget):
     def _next_pair(self, attempted: set) -> object | None:
         source, target = self._payload["source"], self._payload["target"]
         for pair in self._current_pairs():
-            if (pair.status == STATUS_READY and self._session.result_for(pair, source, target) is None
-                    and self._segment_key(pair) not in attempted):
+            if pair.status != STATUS_READY or self._segment_key(pair) in attempted:
+                continue
+            result = self._session.result_for(pair, source, target)
+            if result is None or (result.semantic_missing and self._semantic_available()):
                 return pair
         return None
 
@@ -1964,9 +1967,12 @@ class ManuscriptView(QWidget):
             precedents = semantic.select_precedents(
                 sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start)
             self._render_semantic_progress()
-            term_report = report = None
+            report = None
+            # A segment whose term review already succeeded only needs the model.
+            existing = self._session.result_for(pair, source, target)
+            term_report = existing.term_report if existing is not None else None
             try:
-                if segments:
+                if segments and term_report is None:
                     term_report = await self._api_client.review_pair(key[4], key[5], direction)
                 if semantic_on and generation == self._semantic_generation:
                     report = await self._api_client.semantic_review(
@@ -1978,6 +1984,9 @@ class ManuscriptView(QWidget):
                     key = _core_key(moved.source_core, moved.target_core,
                                     self._payload["source"], self._payload["target"])
                     self._session.pending = None
+                    if term_report is not None and moved.current(self._payload["source"], self._payload["target"]):
+                        # The deterministic track does not depend on the model.
+                        self._store_segment(pair.index, moved, None, term_report, direction, semantic_missing=True)
                 if generation != self._semantic_generation or exc.code == ERROR_CANCELLED:
                     return
                 if exc.code in _QUOTA_CODES:
@@ -1999,6 +2008,8 @@ class ManuscriptView(QWidget):
             if pending is None or not pending.current(source, target):
                 continue
             if report is not None and report["status"] != "complete":
+                if term_report is not None:
+                    self._store_segment(pair.index, pending, None, term_report, direction, semantic_missing=True)
                 self._segment_failures[_core_key(pending.source_core, pending.target_core, source, target)] = "not_reviewed"
                 continue
             failure_streak = (None, 0)
@@ -2009,12 +2020,13 @@ class ManuscriptView(QWidget):
                 self._show_segment_term_report()
 
     def _store_segment(self, index: int, pending: sessions.SegmentResult, report: dict | None,
-                       term_report: dict | None, direction: str) -> None:
+                       term_report: dict | None, direction: str, *, semantic_missing: bool = False) -> None:
         source, target = self._payload["source"], self._payload["target"]
         result = sessions.SegmentResult(
             sent_source=pending.sent_source, sent_target=pending.sent_target,
             source_core=pending.source_core, target_core=pending.target_core,
-            hard_cut=pending.hard_cut, report=report, index=index)
+            hard_cut=pending.hard_cut, report=report, index=index,
+            semantic_missing=semantic_missing and self._semantic_available())
         key = _core_key(pending.source_core, pending.target_core, source, target)
         notes = []
         if report is not None:
@@ -2032,7 +2044,8 @@ class ManuscriptView(QWidget):
             result.term_report = term_report
             result.term_findings = sessions.term_findings_from_report(
                 term_report, source_offset=pending.source_core[0], target_offset=pending.target_core[0])
-        self._segment_failures.pop(key, None)
+        if not result.semantic_missing:
+            self._segment_failures.pop(key, None)
         self._segment_notes[key] = notes
         self._session.replace_result(result)
         if report is not None:
