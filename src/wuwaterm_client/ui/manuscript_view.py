@@ -417,6 +417,9 @@ class ManuscriptView(QWidget):
         self._pairs_key: tuple | None = None
         self._pairs: list = []
         self._issue_rows: list[sessions.LiveIssue] = []
+        self._row_texts: list[str] = []
+        self._rows_dirty = False
+        self._index: sessions.DecisionIndex | None = None
         self._segment_rows: list = []
         self._refreshing_lists = False
         self._translate_task: asyncio.Task | None = None
@@ -919,14 +922,24 @@ class ManuscriptView(QWidget):
         self.track_stack.setCurrentIndex(index)
         if index == TRACK_SEGMENTS:
             self._refresh_segments()
+        if index == TRACK_SEMANTIC and self._rows_dirty:
+            self._refresh_semantic()
         self._update_tracks()
 
     # -- semantic review: derived state --------------------------------------
     def _decisions(self) -> list[dict]:
         return self._payload.get("semantic_decisions", [])
 
+    def _decision_index(self) -> sessions.DecisionIndex:
+        """Decisions by occurrence, rebuilt only when the decisions list is
+        replaced (every change assigns a new list: edits, undo/redo, loading)."""
+        decisions = self._decisions()
+        if self._index is None or self._index.decisions is not decisions:
+            self._index = sessions.DecisionIndex(decisions)
+        return self._index
+
     def _issue_state(self, issue: sessions.LiveIssue) -> str:
-        return sessions.state_of(issue, self._decisions(), self._payload["source"], self._payload["target"])
+        return sessions.state_of(issue, self._decision_index(), self._payload["source"], self._payload["target"])
 
     def _pairs_key_now(self) -> tuple:
         return (self._payload["source"], self._payload["target"], repr(self._payload["alignments"] or None))
@@ -992,26 +1005,44 @@ class ManuscriptView(QWidget):
         return self._review_state == "reviewing" or self._semantic_running() or self._translating()
 
     # -- semantic review: rendering ------------------------------------------
+    def _issue_row_text(self, issue: sessions.LiveIssue) -> str:
+        record = issue.issue
+        return strings.MANUSCRIPT_ISSUE_ITEM.format(
+            state=strings.MANUSCRIPT_ISSUE_STATE[self._issue_state(issue)],
+            category=strings.MANUSCRIPT_CATEGORY.get(record["category"], record["category"]),
+            source=record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE,
+            target=record["target_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE)
+
     def _refresh_semantic(self) -> None:
+        """Keep the issue rows in step. The list widget is rebuilt only when the
+        rows themselves change; otherwise only changed row texts are updated,
+        and not at all while the semantic track is hidden."""
         if self._refreshing_lists:
             return
         current = self._current_issue()
         rows = sorted(self._session.issues(), key=lambda issue: (
             issue.segment_index,
             (issue.source_span or issue.target_span or {"start": 0})["start"]))
+        same = len(rows) == len(self._issue_rows) and all(a is b for a, b in zip(rows, self._issue_rows))
+        visible = self.track_stack.currentIndex() == TRACK_SEMANTIC
         self._refreshing_lists = True
         try:
-            self._issue_rows = rows
-            self.semantic_list.clear()
-            for issue in rows:
-                record = issue.issue
-                self.semantic_list.addItem(strings.MANUSCRIPT_ISSUE_ITEM.format(
-                    state=strings.MANUSCRIPT_ISSUE_STATE[self._issue_state(issue)],
-                    category=strings.MANUSCRIPT_CATEGORY.get(record["category"], record["category"]),
-                    source=record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE,
-                    target=record["target_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE))
-            row = rows.index(current) if current in rows else -1
-            self.semantic_list.setCurrentRow(row)
+            if not same:
+                self._issue_rows = rows
+                self._row_texts = [self._issue_row_text(issue) for issue in rows]
+                self.semantic_list.clear()
+                self.semantic_list.addItems(self._row_texts)
+                self.semantic_list.setCurrentRow(rows.index(current) if current in rows else -1)
+                self._rows_dirty = False
+            elif not visible:
+                self._rows_dirty = True
+            else:
+                for row, issue in enumerate(rows):
+                    text = self._issue_row_text(issue)
+                    if text != self._row_texts[row]:
+                        self._row_texts[row] = text
+                        self.semantic_list.item(row).setText(text)
+                self._rows_dirty = False
         finally:
             self._refreshing_lists = False
         self.semantic_list.setVisible(bool(rows))
@@ -1161,7 +1192,7 @@ class ManuscriptView(QWidget):
         self.adjust_button.setEnabled(free and self._can_adjust(issue))
         # A decision already made here stays as history; it is not decided again.
         self.ignore_button.setEnabled(free and issue is not None and self._issue_state(issue) in sessions.UNHANDLED
-                                      and sessions.decision_for(issue, self._decisions()) is None)
+                                      and sessions.decision_for(issue, self._decision_index()) is None)
         self.adjust_apply_button.setEnabled(free and self._can_adjust(issue))
         self.semantic_list.setEnabled(not composing)
 

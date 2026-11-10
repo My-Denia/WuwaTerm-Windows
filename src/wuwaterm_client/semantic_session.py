@@ -22,6 +22,7 @@ Pure Python: no Qt, no HTTP.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -106,13 +107,13 @@ class LiveIssue:
     def id(self) -> str:
         return self.issue["id"]
 
-    @property
-    def occurrence(self) -> str:
-        """Whole-document occurrence plus text version (Web ``occurrenceKey``)."""
-        from .manuscript import occurrence_key
-        return occurrence_key({"category": self.issue["category"], "source_revision": self.source_revision,
-                               "target_revision": self.target_revision, "source_span": self.issue["source_span"],
-                               "target_span": self.issue["target_span"]})
+    @functools.cached_property
+    def occurrence(self) -> tuple:
+        """Whole-document occurrence plus text version (Web ``occurrenceKey``),
+        as an immutable value computed once: it never changes."""
+        return occurrence_tuple({"category": self.issue["category"], "source_revision": self.source_revision,
+                                 "target_revision": self.target_revision, "source_span": self.issue["source_span"],
+                                 "target_span": self.issue["target_span"]})
 
     def live(self, source: str, target: str) -> bool:
         return (span_live(self.source_span, source) and span_live(self.target_span, target)
@@ -442,14 +443,14 @@ def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], texts: dict[
     ``issues`` is the whole current report (all segments), so "exactly one
     candidate" means one in the manuscript, as on the Web.
     """
+    index = DecisionIndex(decisions)
     for issue in issues:
         if issue.preexisting is None:
-            issue.preexisting = frozenset(_key(d) for d in decisions if _matches_decision(issue, d))
+            issue.preexisting = frozenset(key for _, key in index.at(issue))
     # A decision made on an issue of this session is that issue's own state,
     # not history to merge.
-    own = {_key(d) for d in decisions for issue in issues
-           if _matches_decision(issue, d) and _key(d) not in issue.preexisting}
-    prior = [d for d in decisions if _key(d) not in own]
+    own = {key for issue in issues for _, key in index.at(issue) if key not in issue.preexisting}
+    prior = [d for d, key in ((d, _key(d)) for d in decisions) if key not in own]
     # Compare at current positions (see COORDINATE RULE); identity stays with
     # the original report coordinates and versions held in ``issue.issue``.
     outcomes = reconcile(prior, texts, source, target, [_current_view(issue) for issue in issues])
@@ -483,26 +484,50 @@ def _key(decision: dict) -> str:
     return json.dumps(decision, sort_keys=True, ensure_ascii=False)
 
 
+def occurrence_tuple(decision: dict) -> tuple:
+    """The occurrence identity as a tuple (same fields as Web ``occurrenceKey``)."""
+    def bounds(span):
+        return None if span is None else (span["start"], span["end"])
+    return (decision["category"], decision["source_revision"], decision["target_revision"],
+            bounds(decision["source_span"]), bounds(decision["target_span"]))
+
+
 def _matches_decision(issue: LiveIssue, decision: dict) -> bool:
     """Same whole-document occurrence and text version; never the request-local id."""
-    from .manuscript import occurrence_key
-    return occurrence_key(decision) == issue.occurrence
+    return occurrence_tuple(decision) == issue.occurrence
 
 
-def decision_for(issue: LiveIssue, decisions: list[dict]) -> dict | None:
+class DecisionIndex:
+    """Decisions by occurrence identity, built once per decisions list.
+
+    Status queries run per issue on every refresh and keystroke; a linear
+    scan with serialization there made large manuscripts unusable.
+    """
+
+    def __init__(self, decisions: list[dict]) -> None:
+        self.decisions = decisions
+        self._by_occurrence: dict[tuple, list[tuple[dict, str]]] = {}
+        for decision in decisions:
+            self._by_occurrence.setdefault(occurrence_tuple(decision), []).append((decision, _key(decision)))
+
+    def at(self, issue: LiveIssue) -> list[tuple[dict, str]]:
+        return self._by_occurrence.get(issue.occurrence, [])
+
+
+def decision_for(issue: LiveIssue, index: DecisionIndex) -> dict | None:
     """The decision made on this report's issue, if any."""
-    for decision in reversed(decisions):
-        if _matches_decision(issue, decision) and _key(decision) not in (issue.preexisting or ()):
+    for decision, key in reversed(index.at(issue)):
+        if key not in (issue.preexisting or ()):
             return decision
     return None
 
 
-def state_of(issue: LiveIssue, decisions: list[dict], source: str, target: str) -> str:
+def state_of(issue: LiveIssue, index: DecisionIndex, source: str, target: str) -> str:
     """Validity first: an occurrence an edit touched needs reconfirmation,
     whatever was decided there before (the decision stays as history)."""
     if issue.invalid or issue.basis_lost:
         return STATE_STALE
-    decision = decision_for(issue, decisions)
+    decision = decision_for(issue, index)
     if decision is not None and decision["decision"] != "ignored":
         # Accept and adjust replaced this occurrence themselves.
         return decision["decision"]
@@ -535,12 +560,10 @@ def with_decision(decisions: list[dict], issue: LiveIssue, record: dict) -> list
     Accepted and adjusted records already changed the text; they stay as
     history even when the same place is reported again.
     """
-    from .manuscript import occurrence_key
-
     superseded = issue.previous if issue.previous and issue.previous.get("decision") == "ignored" else None
-    occurrence = occurrence_key(record)
+    occurrence = occurrence_tuple(record)
     kept = [d for d in decisions if not _matches_decision(issue, d) and d != superseded
-            and occurrence_key(d) != occurrence]
+            and occurrence_tuple(d) != occurrence]
     return kept + [record]
 
 

@@ -1188,3 +1188,59 @@ def test_accepting_one_issue_leaves_the_other_issues_of_its_segment_executable(q
         assert view._payload["target"] == both
         assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "accepted"]
     asyncio.run(scenario())
+
+
+def _many_issues_view(n_segments: int = 64, per_segment: int = 16, n_decisions: int = 128) -> ManuscriptView:
+    """1,024 live issues and 128 decisions, built directly in the session."""
+    from wuwaterm_client import semantic_session as sessions
+    para_s, para_t = "甲" * 1000, "A" * 1000
+    source, target = "\n\n".join([para_s] * n_segments), "\n\n".join([para_t] * n_segments)
+    view = make_view(Server(), source, target)
+    view._capabilities = frozenset({"semantic-review-v1"})
+    revisions = sessions.revision(source), sessions.revision(target)
+    basis = {"dictionary_revision": "a" * 64, "matcher_revision": "a" * 64}
+    for seg in range(n_segments):
+        start = seg * 1002
+        result = sessions.SegmentResult(
+            sent_source=para_s, sent_target=para_t, source_core=(start, start + 1000),
+            target_core=(start, start + 1000), hard_cut=False, index=seg,
+            report={"status": "complete", "review_version": "semantic-review-v1"})
+        for k in range(per_segment):
+            at = start + k * 50
+            ss, ts = _span(source, at, at + 3), _span(target, at, at + 3)
+            record = {"id": f"{seg:016x}{k:016x}", "fingerprint": f"{k:032x}", "category": "omission",
+                      "confidence": "low", "source_span": ss, "target_span": ts, "source_excerpt": ss["text"],
+                      "target_excerpt": ts["text"], "rationale": "r", "suggestion": None,
+                      "suggestion_withheld": None, "alternatives": [], "segment_index": seg}
+            result.issues.append(sessions.LiveIssue(
+                issue=record, segment_index=seg, source_revision=revisions[0], target_revision=revisions[1],
+                term_basis=basis, source_span=dict(ss), target_span=dict(ts), suggestion_span=None,
+                preexisting=frozenset()))
+        view._session.add(result)
+    issues = view._session.issues()
+    view._payload.update(semantic_decisions=[sessions.make_decision(i, "ignored", None) for i in issues[:n_decisions]],
+                         semantic_texts=[], semantic_history=[])
+    return view
+
+
+def test_status_queries_stay_fast_with_many_issues_and_decisions(qapp) -> None:
+    """1,024 issues x 128 decisions: one full rebuild of the issue list and one
+    keystroke each stay well inside an interactive budget (it was seconds)."""
+    import time
+    view = _many_issues_view()
+    view._show_track(TRACK_SEMANTIC)
+    started = time.perf_counter()
+    view._issue_rows = []  # force a full rebuild
+    view._refresh_semantic()
+    view._update_controls()
+    rebuild = time.perf_counter() - started
+    states = [view._issue_state(i) for i in view._issue_rows]
+    assert states.count("ignored") == 128 and states.count("pending") == 896
+    cursor = view.target_edit.textCursor()
+    cursor.setPosition(1)  # inside the first issue's target span
+    view.target_edit.setTextCursor(cursor)
+    started = time.perf_counter()
+    view.target_edit.insertPlainText("x")
+    keystroke = time.perf_counter() - started
+    assert view._issue_state(view._issue_rows[0]) == "stale"
+    assert rebuild < 0.2 and keystroke < 0.2, (rebuild, keystroke)
