@@ -966,7 +966,7 @@ class ManuscriptView(QWidget):
         if pair.status != STATUS_READY:
             return pair.status
         result = self._session.result_for(pair, self._payload["source"], self._payload["target"])
-        if not self._needs_work(result):
+        if not any(self._basis().needs(result)):
             return "reviewed"
         return self._segment_failures.get(self._segment_key(pair), "pending")
 
@@ -1841,7 +1841,9 @@ class ManuscriptView(QWidget):
     def _show_segment_term_report(self) -> None:
         """Long manuscripts: one display report from every segment still current."""
         source, target = self._payload["source"], self._payload["target"]
-        usable = [r for r in self._session.results if r.current(source, target) and self._term_current(r)]
+        basis = self._basis()
+        usable = [r for r in self._session.results
+                  if self._ready_pair_for(r) is not None and sessions.term_part_valid(r, basis)]
         reports = [r.term_report for r in usable]
         if not reports:
             return
@@ -1924,25 +1926,34 @@ class ManuscriptView(QWidget):
 
     def _next_pair(self, attempted: set) -> object | None:
         source, target = self._payload["source"], self._payload["target"]
+        basis = self._basis()
         for pair in self._current_pairs():
             if pair.status != STATUS_READY or self._segment_key(pair) in attempted:
                 continue
-            if self._needs_work(self._session.result_for(pair, source, target)):
+            if any(basis.needs(self._session.result_for(pair, source, target))):
                 return pair
         return None
 
-    def _term_current(self, result: sessions.SegmentResult) -> bool:
-        """A segment's term report counts only if it was computed with the
-        correspondence the owner has selected now."""
-        return (result.term_report is not None
-                and result.term_alignments == self._alignments_for(result.source_core, result.target_core))
+    def _basis(self) -> sessions.Basis:
+        """The current basis of the segment reuse rule (``sessions.Basis``)."""
+        return sessions.Basis(term_required=self._term_mode == "segments",
+                              semantic_required=self._semantic_available(),
+                              alignments=self._alignments_for)
 
-    def _needs_work(self, result: sessions.SegmentResult | None) -> bool:
-        if result is None:
-            return True
-        if result.semantic_missing and self._semantic_available():
-            return True
-        return self._term_mode == "segments" and not self._term_current(result)
+    def _ready_pair_for(self, result: sessions.SegmentResult):
+        source, target = self._payload["source"], self._payload["target"]
+        return next((p for p in self._current_pairs()
+                     if p.status == STATUS_READY and result.matches(p, source, target)), None)
+
+    def _rebuild_plan(self) -> None:
+        """Apply the reuse rule: keep only results, failures and notes that a
+        current ready pair can use under the current basis."""
+        source, target = self._payload["source"], self._payload["target"]
+        pairs = self._current_pairs()
+        self._session.rebuild(pairs, source, target, self._basis())
+        keys = {self._segment_key(p) for p in pairs if p.status == STATUS_READY}
+        self._segment_failures = {k: v for k, v in self._segment_failures.items() if k in keys}
+        self._segment_notes = {k: v for k, v in self._segment_notes.items() if k in keys}
 
     def _segment_alignments(self, pair) -> list | None:
         """The owner's correspondence for one segment's term request.
@@ -1978,18 +1989,18 @@ class ManuscriptView(QWidget):
                                        target[previous.target.core_start:previous.target.core_end])
 
     async def _run_segments(self, generation: int) -> None:
-        """Serial, one request in flight. A segment edited while its request
-        is in flight is discarded and picked again with its new text."""
-        attempted: set[tuple[str, str]] = set()
+        """Serial, one request in flight. The plan follows the segment reuse
+        rule (``sessions.Basis``): rebuilt at the start, and a pair is sent
+        only for the parts it is missing under the current basis."""
+        attempted: set[tuple] = set()
         failure_streak: tuple[str | None, int] = (None, 0)
+        self._rebuild_plan()
         if self._term_mode == "segments":
             # Segments that need no request still show their term results.
             self._show_segment_term_report()
         while generation == self._semantic_generation:
-            segments = self._term_mode == "segments"
-            semantic_on = self._semantic_available()
             pair = self._next_pair(attempted)
-            if pair is None or not (segments or semantic_on):
+            if pair is None:
                 break
             source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
             key = self._segment_key(pair)
@@ -1998,6 +2009,8 @@ class ManuscriptView(QWidget):
                 # The final pre-send assertion: never send an oversized pair.
                 self._segment_failures[key] = "needs_manual_split"
                 continue
+            existing = self._session.result_for(pair, source, target)
+            need_term, need_semantic = self._basis().needs(existing)
             self._session.pending = sessions.SegmentResult(
                 sent_source=key[4], sent_target=key[5],
                 source_core=(pair.source.core_start, pair.source.core_end),
@@ -2006,111 +2019,92 @@ class ManuscriptView(QWidget):
             before = self._context_for(pair)
             precedents = semantic.select_precedents(
                 sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start)
-            self._render_semantic_progress()
-            report = None
-            # A segment whose term review already succeeded only needs the model.
-            existing = self._session.result_for(pair, source, target)
-            term_report = existing.term_report if existing is not None and self._term_current(existing) else None
             term_alignments = self._segment_alignments(pair)
-            # A segment whose model review is complete only needs its term part.
-            need_semantic = semantic_on and (existing is None or existing.semantic_missing)
+            self._render_semantic_progress()
+            term_report = report = None
+            error: ClientError | None = None
             try:
-                if segments and term_report is None:
+                if need_term:
                     term_report = await self._api_client.review_pair(
                         key[4], key[5], direction, alignments=term_alignments)
                 if need_semantic and generation == self._semantic_generation:
                     report = await self._api_client.semantic_review(
                         key[4], key[5], direction, before=before, precedents=precedents)
             except ClientError as exc:
-                if generation == self._semantic_generation and self._session.pending is not None:
-                    # Positions may have moved while the request was in flight.
-                    moved = self._session.pending
-                    key = _core_key(moved.source_core, moved.target_core,
-                                    self._payload["source"], self._payload["target"])
-                    self._session.pending = None
-                    if term_report is not None and moved.current(self._payload["source"], self._payload["target"]):
-                        # The deterministic track does not depend on the model.
-                        self._store_segment(pair.index, moved, None, term_report, direction,
-                                            semantic_missing=True, term_alignments=term_alignments)
-                if generation != self._semantic_generation or exc.code == ERROR_CANCELLED:
-                    return
-                if exc.code in _QUOTA_CODES:
-                    self._semantic_state = "quota"
-                    return
-                failure_streak = (exc.code, failure_streak[1] + 1 if failure_streak[0] == exc.code else 1)
-                if exc.code in _FATAL_CODES or failure_streak[1] >= _REPEATED_FAILURES:
-                    self._segment_failures[key] = "failed"
-                    self._semantic_state = "error"
-                    self._semantic_detail = exc.message
-                    return
-                self._segment_failures[key] = "failed"
-                self._refresh_semantic()
-                continue
+                error = exc
             if generation != self._semantic_generation:
                 return
             pending, self._session.pending = self._session.pending, None
-            source, target = self._payload["source"], self._payload["target"]
-            if pending is None or not pending.current(source, target):
-                continue
-            if not need_semantic and existing is not None and term_report is not None:
-                # Keep the model result and its issues (decisions bind to them);
-                # only the term part was redone.
-                existing.term_report, existing.term_alignments = term_report, term_alignments
-                existing.term_findings = sessions.term_findings_from_report(
-                    term_report, source_offset=existing.source_core[0], target_offset=existing.target_core[0])
-                failure_streak = (None, 0)
-                self._show_segment_term_report()
+            # Only an answer for a pair that still exists, exactly, is stored.
+            target_pair = self._ready_pair_for(pending) if pending is not None else None
+            if target_pair is not None:
+                key = self._segment_key(target_pair)
+                self._store_parts(target_pair, pending, term_report, term_alignments, report, direction)
+            if error is not None:
+                if error.code == ERROR_CANCELLED:
+                    return
+                if error.code in _QUOTA_CODES:
+                    self._semantic_state = "quota"
+                    return
+                failure_streak = (error.code, failure_streak[1] + 1 if failure_streak[0] == error.code else 1)
+                if target_pair is not None:
+                    self._segment_failures[key] = "failed"
+                if error.code in _FATAL_CODES or failure_streak[1] >= _REPEATED_FAILURES:
+                    self._semantic_state = "error"
+                    self._semantic_detail = error.message
+                    return
                 self._refresh_semantic()
-                self._update_controls()
                 continue
             if report is not None and report["status"] != "complete":
-                if term_report is not None:
-                    self._store_segment(pair.index, pending, None, term_report, direction,
-                                        semantic_missing=True, term_alignments=term_alignments)
-                self._segment_failures[_core_key(pending.source_core, pending.target_core, source, target)] = "not_reviewed"
+                if target_pair is not None:
+                    self._segment_failures[key] = "not_reviewed"
                 continue
             failure_streak = (None, 0)
-            self._store_segment(pair.index, pending, report, term_report, direction, term_alignments=term_alignments)
         if generation == self._semantic_generation:
             self._semantic_state = "done"
+            self._rebuild_plan()
             if self._term_mode == "segments":
                 self._show_segment_term_report()
 
-    def _store_segment(self, index: int, pending: sessions.SegmentResult, report: dict | None,
-                       term_report: dict | None, direction: str, *, semantic_missing: bool = False,
-                       term_alignments: list | None = None) -> None:
+    def _store_parts(self, pair, pending: sessions.SegmentResult, term_report: dict | None,
+                     term_alignments: list | None, report: dict | None, direction: str) -> None:
+        """Store what this request produced for ``pair``; keep valid parts it did not redo."""
         source, target = self._payload["source"], self._payload["target"]
-        result = sessions.SegmentResult(
-            sent_source=pending.sent_source, sent_target=pending.sent_target,
-            source_core=pending.source_core, target_core=pending.target_core,
-            hard_cut=pending.hard_cut, report=report, index=index,
-            semantic_missing=semantic_missing and self._semantic_available())
-        key = _core_key(pending.source_core, pending.target_core, source, target)
-        notes = []
-        if report is not None:
+        complete = report is not None and report["status"] == "complete"
+        if term_report is None and not complete:
+            return
+        result = self._session.result_for(pair, source, target)
+        if result is None:
+            result = sessions.SegmentResult(
+                sent_source=pending.sent_source, sent_target=pending.sent_target,
+                source_core=pending.source_core, target_core=pending.target_core,
+                hard_cut=pending.hard_cut, report=None, index=pair.index)
+            self._session.add(result)
+        key = self._segment_key(pair)
+        if term_report is not None:
+            result.term_report, result.term_alignments = term_report, term_alignments
+            result.term_findings = sessions.term_findings_from_report(
+                term_report, source_offset=result.source_core[0], target_offset=result.target_core[0])
+        if complete:
+            result.report, result.index = report, pair.index
             result.issues = sessions.live_issues_from_report(
-                report, segment_index=index, source_offset=pending.source_core[0],
-                target_offset=pending.target_core[0], source_revision=sessions.revision(source),
+                report, segment_index=pair.index, source_offset=result.source_core[0],
+                target_offset=result.target_core[0], source_revision=sessions.revision(source),
                 target_revision=sessions.revision(target))
             self._known_texts.setdefault(sessions.revision(source), source)
             self._known_texts.setdefault(sessions.revision(target), target)
+            notes = []
             if report["omitted_issues"]:
                 notes.append(strings.MANUSCRIPT_SEGMENT_HINT["truncated"].format(count=report["omitted_issues"]))
             if report["dropped_unanchored"]:
                 notes.append(strings.MANUSCRIPT_SEGMENT_HINT["dropped"].format(count=report["dropped_unanchored"]))
-        if term_report is not None:
-            result.term_report, result.term_alignments = term_report, term_alignments
-            result.term_findings = sessions.term_findings_from_report(
-                term_report, source_offset=pending.source_core[0], target_offset=pending.target_core[0])
-        if not result.semantic_missing:
-            self._segment_failures.pop(key, None)
-        self._segment_notes[key] = notes
-        self._session.replace_result(result)
-        if report is not None:
+            self._segment_notes[key] = notes
             # "Exactly one candidate" is judged over the whole current report.
             sessions.apply_reconcile(self._session.issues(), self._decisions(), self._texts_for_reconcile(),
                                      source, target)
             self._remember_semantic_report(direction)
+        if not any(self._basis().needs(result)):
+            self._segment_failures.pop(key, None)
         if term_report is not None:
             self._show_segment_term_report()
         self._refresh_semantic()
@@ -2133,7 +2127,8 @@ class ManuscriptView(QWidget):
         source, target = self._payload["source"], self._payload["target"]
         segments = [{"segment_index": r.index, "source_start": r.source_core[0], "source_end": r.source_core[1],
                      "target_start": r.target_core[0], "target_end": r.target_core[1], "report": r.report}
-                    for r in self._session.results if r.report is not None and r.current(source, target)]
+                    for r in self._session.results
+                    if sessions.semantic_part_valid(r) and self._ready_pair_for(r) is not None]
         snapshot = {"source": source, "target": target, "direction": direction,
                     "segments": copy.deepcopy(segments[:MAX_HISTORY_SEGMENTS])}
         candidate = copy.deepcopy(self._payload)
@@ -2183,8 +2178,8 @@ class ManuscriptView(QWidget):
 
     async def _run_translation(self, generation: int, pair, source: str, target: str, direction: str) -> None:
         try:
-            if self._capabilities is None:
-                self._capabilities = await self._api_client.get_capabilities()
+            # Capabilities are part of the basis: probe again, never reuse.
+            self._capabilities = await self._api_client.get_capabilities()
             context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
             if pair is None:
                 text = source

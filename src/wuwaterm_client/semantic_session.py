@@ -130,8 +130,6 @@ class SegmentResult:
     hard_cut: bool
     report: dict[str, Any] | None
     index: int = 0
-    # The term review succeeded but the semantic review did not; retried.
-    semantic_missing: bool = False
     issues: list[LiveIssue] = field(default_factory=list)
     term_findings: list[dict] = field(default_factory=list)  # full coordinates
     term_report: dict[str, Any] | None = None
@@ -223,22 +221,27 @@ class Session:
                     _, issue.source_span, issue.target_span, issue.suggestion_span, issue.invalid = kept
 
     # -- results ---------------------------------------------------------
-    def replace_result(self, result: SegmentResult) -> None:
-        """Keep at most one result per segment: a new result replaces the one
-        at the same place and any invalidated result its cores overlap."""
-        def overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
-            return a[0] < b[1] and b[0] < a[1]
-        self.results = [r for r in self.results if r.source_core != result.source_core
-                        and not (r.invalid and (overlaps(r.source_core, result.source_core)
-                                                or overlaps(r.target_core, result.target_core)))]
+    def add(self, result: SegmentResult) -> None:
         self.results.append(result)
         self.results.sort(key=lambda r: r.source_core)
 
-    def prune(self, pairs, source: str, target: str) -> None:
-        """Drop results no current ready pair can use any more."""
-        self.results = [r for r in self.results if any(r.matches(p, source, target) for p in pairs)]
+    def rebuild(self, pairs, source: str, target: str, basis: "Basis") -> None:
+        """Apply the segment reuse rule (see ``Basis``) to every cached result."""
+        kept = []
+        for result in self.results:
+            if not any(p.status == "ready" and result.matches(p, source, target) for p in pairs):
+                continue
+            if result.term_report is not None and not term_part_valid(result, basis):
+                result.term_report, result.term_alignments, result.term_findings = None, None, []
+            if result.report is not None and not (basis.semantic_required and semantic_part_valid(result)):
+                result.report, result.issues = None, []
+            if result.term_report is not None or result.report is not None:
+                kept.append(result)
+        self.results = kept
 
     def result_for(self, pair, source: str, target: str) -> SegmentResult | None:
+        if pair.status != "ready":
+            return None
         for result in self.results:
             if result.matches(pair, source, target):
                 return result
@@ -247,15 +250,52 @@ class Session:
     def issues(self) -> list[LiveIssue]:
         return [issue for result in self.results for issue in result.issues]
 
-    def term_findings(self, source: str, target: str) -> list[dict]:
-        out = []
-        for result in self.results:
-            if not result.current(source, target):
-                continue
-            for finding in result.term_findings:
-                if span_live(finding.get("source_span"), source) and span_live(finding.get("target_span"), target):
-                    out.append(finding)
-        return out
+
+@dataclass(frozen=True)
+class Basis:
+    """What a segment result must have been produced under to be reused.
+
+    SEGMENT REUSE RULE (the one place it is defined; README and PR quote it):
+    a cached segment result (term report, semantic report, failure or note,
+    or the answer to a request in flight) is used only when
+
+    1. its core ranges equal those of a current *ready* pair exactly, and
+       both sides' texts at those ranges are the ones that were sent (text
+       version) and no edit has overlapped them since; and
+    2. its basis equals the current basis: the alignments the segment's term
+       request carried (``None`` for automatic), the Core capabilities (when
+       the server lists semantic-review-v1 a segment is complete only with a
+       complete semantic report; when it does not, no semantic report is
+       reused), and the contract versions (review-v2, semantic-review-v1).
+
+    At the start of every run the plan is rebuilt from the current pairing
+    and everything else is dropped. Decisions are not segment results: they
+    stay in the manuscript and follow the occurrence rules.
+    """
+
+    term_required: bool            # long manuscripts: one term report per segment
+    semantic_required: bool        # the server lists semantic-review-v1
+    alignments: Any                # (source_core, target_core) -> list | None
+
+    def needs(self, result: "SegmentResult | None") -> tuple[bool, bool]:
+        """(needs a term request, needs a semantic request) for one ready pair."""
+        if result is None:
+            return self.term_required, self.semantic_required
+        return (self.term_required and not term_part_valid(result, self),
+                self.semantic_required and not semantic_part_valid(result))
+
+
+TERM_CONTRACT = "review-v2"
+
+
+def term_part_valid(result: SegmentResult, basis: Basis) -> bool:
+    return (result.term_report is not None and result.term_report["rule_version"] == TERM_CONTRACT
+            and result.term_alignments == basis.alignments(result.source_core, result.target_core))
+
+
+def semantic_part_valid(result: SegmentResult) -> bool:
+    return (result.report is not None and result.report["status"] == "complete"
+            and result.report["review_version"] == semantic.REVIEW_VERSION)
 
 
 def live_issues_from_report(report: dict, *, segment_index: int, source_offset: int, target_offset: int,

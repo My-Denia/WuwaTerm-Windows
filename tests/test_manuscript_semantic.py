@@ -865,3 +865,52 @@ def test_choosing_automatic_alignment_redoes_cached_segment_term_reviews(qapp) -
         assert len(again) == terms and all("alignments" not in body for body in again)
         assert len(server.sent("/v1/semantic-reviews")) == models, "the model results are kept"
     asyncio.run(scenario())
+
+
+# -- the segment reuse rule (sessions.Basis) --------------------------------
+
+
+def test_an_edit_that_merges_two_segments_leaves_no_duplicate_issues(qapp) -> None:
+    first, second = "甲" * 1200, "乙" * 700
+    source = f"{first}\n\n{second}"
+    target = "\n\n".join(["One. " * 120, "Two. " * 120])
+
+    def issues(s, t):
+        return [issue(s, t, source_quote=s[:2], target_quote=t[:3], seed=s[:1] + t[:4])]
+
+    async def scenario():
+        server = Server(issues=issues)
+        view = make_view(server, source, target)
+        view._start_review()
+        await settle(view)
+        assert len(view._current_pairs()) == 2 and len(view._session.issues()) == 2
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(300, QTextCursor.MoveMode.KeepAnchor)
+        view.source_edit.setTextCursor(cursor)
+        cursor.removeSelectedText()
+        assert [p.status for p in view._current_pairs()] == ["ready"], "the edit merged the pairs"
+        view._start_review()
+        await settle(view)
+        assert len(view._session.results) == 1
+        assert len(view._session.issues()) == 1
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending"]
+    asyncio.run(scenario())
+
+
+def test_term_only_segments_get_a_semantic_request_once_the_server_offers_it(qapp) -> None:
+    async def scenario():
+        server = Server(capabilities=None)
+        view = make_view(server, LONG_SOURCE, LONG_TARGET)
+        view._start_review()
+        await settle(view)
+        terms = len(server.sent("/v1/reviews"))
+        ready = [p for p in view._current_pairs() if p.status == "ready"]
+        assert server.sent("/v1/semantic-reviews") == [] and view._progress() == (len(ready), len(ready))
+        server.capabilities = ("semantic-review-v1",)
+        view._start_review()
+        await settle(view)
+        assert len(server.sent("/v1/semantic-reviews")) == len(ready)
+        assert len(server.sent("/v1/reviews")) == terms, "valid term reports are reused"
+        assert view._progress() == (len(ready), len(ready))
+    asyncio.run(scenario())
