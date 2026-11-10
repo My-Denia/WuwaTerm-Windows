@@ -98,7 +98,7 @@ def sanitize_recent_entry(raw: object) -> RecentEntry | None:
         return None
     path = raw.get("path")
     if (not isinstance(path, str) or not path or len(path) > MAX_RECENT_PATH_CHARS
-            or "\0" in path):
+            or "\0" in path or not os.path.isabs(path)):
         return None
     opened_at = raw.get("opened_at")
     if not isinstance(opened_at, str) or len(opened_at) > 64:

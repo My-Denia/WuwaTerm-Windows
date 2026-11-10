@@ -134,6 +134,15 @@ def test_plain_text_drag_is_left_to_qt(qapp) -> None:
     assert view.status_label.text() != strings.IMPORT_UNSUPPORTED_TYPE
 
 
+def test_a_file_dropped_on_an_inspector_field_is_not_typed_into_it(qapp, tmp_path) -> None:
+    view = _view()
+    view.show()
+    path = tmp_path / "in.txt"
+    path.write_text("body")
+    _drop(view.replacement_edit, path, text=str(path))
+    assert view.replacement_edit.text() == "" and view.source_edit.raw_text() == "body"
+
+
 def test_a_dropped_file_is_refused_during_composition(qapp, tmp_path) -> None:
     view = _view()
     view.source_edit._ime_active = True

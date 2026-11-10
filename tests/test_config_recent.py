@@ -56,7 +56,7 @@ def test_recent_round_trips_and_the_config_stays_hashable(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize("hostile", [
     "text", 5, {"path": "/a"}, None, [None, 3, "x", []],
-    [_entry("")], [_entry("a\0b")], [_entry("x" * 5000)], [{"path": "/a"}], [{"path": "/a", "opened_at": "yesterday"}],
+    [_entry("")], [_entry("a\0b")], [_entry("relative/a.json")], [_entry("x" * 5000)], [{"path": "/a"}], [{"path": "/a", "opened_at": "yesterday"}],
     [{"path": 7, "opened_at": "2026-11-10T08:00:00+00:00"}],
 ])
 def test_a_hostile_recent_never_costs_the_other_settings(tmp_path: Path, hostile) -> None:

@@ -835,6 +835,7 @@ class ManuscriptView(QWidget):
         self._render_issue(None)
         self._update_inspector_button()
         self._update_controls()
+        self._guard_text_inputs()
 
     # -- semantic review: widgets -------------------------------------------
     def _build_semantic_widgets(self) -> None:
@@ -2646,6 +2647,25 @@ class ManuscriptView(QWidget):
         return True
 
     # -- file continuity: import, clipboard, work position -------------------
+    def _guard_text_inputs(self) -> None:
+        """Inspector text fields take a dropped file as a file, not as typed text.
+
+        QLineEdit and the adjust box accept drops by default and would type
+        the file's path into a field that can later be written into the draft.
+        """
+        for widget in (*self.findChildren(QLineEdit), self.adjust_edit):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
+            files = LosslessEditor.local_files(event.mimeData())
+            if files:
+                event.acceptProposedAction()
+                if event.type() == QEvent.Type.Drop:
+                    self._files_dropped(files, "source")
+                return True
+        return super().eventFilter(watched, event)
+
     def _files_dropped(self, paths: list[str], side: str) -> None:
         QTimer.singleShot(0, lambda: self.import_files(paths, side))
 

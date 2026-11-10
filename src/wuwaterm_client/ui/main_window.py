@@ -27,9 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import strings
+from .. import recent, strings
 from ..api import ApiClient
-from .. import recent
 from ..config import ClientConfig, RecentEntry, sanitize_recent_entry, usable_base_url
 from ..credentials import CredentialStoreUnavailable, has_token, store_token
 from ..errors import (
