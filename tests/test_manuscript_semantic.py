@@ -12,7 +12,8 @@ import json
 
 import httpx
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QMimeData, Qt
+from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 
@@ -609,4 +610,154 @@ def test_the_same_service_failure_on_consecutive_segments_stops_the_run(qapp) ->
         assert len(server.sent("/v1/semantic-reviews")) == 2
         assert view._semantic_state == "error"
         assert view.semantic_progress.text() == view._semantic_detail
+    asyncio.run(scenario())
+
+
+# -- occurrence identity and edit invalidation (review of a33f8b4) ---------
+# Identical paragraphs produce identical request-local ids and texts, so
+# identity must be the whole-document position plus the text version, and an
+# edit's range must come from the edit itself rather than a text difference.
+
+REPEATED_SOURCE = "\n\n".join(["不会出发。" * 220] * 3)
+REPEATED_TARGET = "\n\n".join(["will leave. " * 110] * 3)
+
+
+def repeated_issues(s, t):
+    return [issue(s, t, source_quote="不会", target_quote="will leave", replace="will leave",
+                  replacement="will not leave")]
+
+
+def test_identical_paragraphs_are_each_reviewed_once(qapp) -> None:
+    async def scenario():
+        for capabilities in (("semantic-review-v1",), None):
+            server = Server(capabilities=capabilities, issues=repeated_issues)
+            view = make_view(server, REPEATED_SOURCE, REPEATED_TARGET)
+            assert len([p for p in view._current_pairs() if p.status == "ready"]) == 3
+            view._start_review()
+            await settle(view)
+            assert view._progress() == (3, 3)
+            path = "/v1/semantic-reviews" if capabilities else "/v1/reviews"
+            assert len(server.sent(path)) == 3
+    asyncio.run(scenario())
+
+
+def test_deciding_one_identical_occurrence_leaves_the_others_pending(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=repeated_issues), REPEATED_SOURCE, REPEATED_TARGET)
+        view._start_review()
+        await settle(view)
+        assert len({i.id for i in view._session.issues()}) == 1, "same request-local id in every paragraph"
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        view.ignore_button.click()
+        assert [view._issue_state(i) for i in view._issue_rows] == ["ignored", "pending", "pending"]
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        assert len(view._decisions()) == 2, "two occurrences, two decisions"
+    asyncio.run(scenario())
+
+
+def test_an_ignore_on_one_identical_paragraph_never_carries_to_another(qapp, tmp_path, monkeypatch) -> None:
+    path = tmp_path / "repeated.json"
+
+    async def scenario():
+        view = make_view(Server(issues=repeated_issues), REPEATED_SOURCE, REPEATED_TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        view._path = path
+        assert view.save_document()
+        reopened = make_view(Server(issues=repeated_issues), "", "")
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+        reopened.open_document()
+        reopened._start_review()
+        await settle(reopened)
+        # Three candidates for one decision: nothing carries over (Web rule).
+        assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["needs_reconfirm"] * 3
+    asyncio.run(scenario())
+
+
+def test_deleting_a_reviewed_line_does_not_retarget_its_twin(qapp) -> None:
+    async def scenario():
+        target = "will leave\nwill leave"
+        view = make_view(Server(issues=lambda s, t: [issue(
+            s, t, source_quote="不会", target_quote="will leave", replace="will leave", replacement="will not leave")]),
+            "甲不会出发。乙会出发。", target)
+        view._start_review()
+        await settle(view)
+        cursor = view.target_edit.textCursor()
+        cursor.setPosition(0)
+        cursor.setPosition(len("will leave\n"), QTextCursor.MoveMode.KeepAnchor)
+        view.target_edit.setTextCursor(cursor)
+        cursor.removeSelectedText()
+        assert view._payload["target"] == "will leave"
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        assert view._issue_state(view._issue_rows[0]) == "stale"
+        assert not view.accept_button.isEnabled()
+        view._accept_current()
+        assert view._payload["target"] == "will leave"
+    asyncio.run(scenario())
+
+
+def test_rewriting_an_issue_with_identical_text_still_needs_reconfirmation(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        view._start_review()
+        await settle(view)
+        start = TARGET.index("will leave")
+        cursor = view.target_edit.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(start + len("will leave"), QTextCursor.MoveMode.KeepAnchor)
+        view.target_edit.setTextCursor(cursor)
+        mime = QMimeData()
+        mime.setText("will leave")
+        view.target_edit.insertFromMimeData(mime)
+        assert view._payload["target"] == TARGET
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "stale"]
+    asyncio.run(scenario())
+
+
+def test_editing_inside_an_ignored_issue_needs_reconfirmation_and_undo_restores_it(qapp) -> None:
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        cursor = view.target_edit.textCursor()
+        cursor.setPosition(TARGET.index("will") + 1)
+        view.target_edit.setTextCursor(cursor)
+        view.target_edit.insertPlainText("!")
+        second = view._issue_rows[1]
+        assert view._issue_state(second) == "stale"
+        assert [d["decision"] for d in view._decisions()] == ["ignored"], "the decision stays as history"
+        view.semantic_list.setCurrentRow(1)
+        assert not view.ignore_button.isEnabled() and not view.accept_button.isEnabled()
+        view._undo_replace()
+        assert view._payload["target"] == TARGET
+        assert view._issue_state(second) == "ignored"
+    asyncio.run(scenario())
+
+
+def test_saving_again_after_history_was_trimmed_away_keeps_memory_and_file_in_step(qapp, tmp_path) -> None:
+    async def scenario():
+        source = "\n\n".join(["甲。" * 550] * 125)
+        target = "\n\n".join(["One. " * 220] * 125)
+        view = make_view(Server(), source, target)
+        view._start_review()
+        await settle(view)
+        assert view._payload["semantic_history"][0]["segments"]
+        view._path = tmp_path / "trimmed.json"
+        assert view.save_document()
+        written = load_workfile(view._path)
+        # Web's writer drops history to fit 1 MiB and still writes v2.
+        assert written["format"] == "wuwaterm-manuscript-v2" and written["semantic_history"] == []
+        assert view._payload["semantic_history"] == [], "memory holds what was written"
+        assert not view.document_dirty
+        assert view.save_document()
+        assert load_workfile(view._path)["source"] == source
     asyncio.run(scenario())

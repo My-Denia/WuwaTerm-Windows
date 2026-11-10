@@ -1,12 +1,17 @@
 """Runtime state of a segmented semantic review, kept apart from widgets.
 
 A semantic report belongs to the exact segment texts that were sent. The
-workbench keeps those results while the owner edits the manuscript: every edit
-is reduced to one replaced range, positions after it shift, and a position that
-overlapped it stays where it was. Nothing is trusted from a position alone; an
-issue or a segment is usable only while its recorded text still equals the
-current slice. This keeps model results across an accepted suggestion (and its
-undo) without ever executing a range that no longer matches.
+workbench keeps those results while the owner edits the manuscript. Every edit
+arrives as the range the editor (or the workbench itself) actually replaced; it
+is never guessed from a text difference, because repeated text makes such a
+guess ambiguous. Positions after the edit shift; anything the edit overlaps is
+invalidated for good and needs reconfirmation. Undo restores a snapshot of
+these positions together with the text.
+
+Identity is a whole-document occurrence plus a text version: an issue's
+reported spans and the revisions of the whole texts it was reported against.
+A request-local issue id or the text content is never an identity, because
+identical paragraphs produce identical ids and texts.
 
 Offsets are Unicode scalar indices into the whole manuscript side. Report
 offsets are relative to the segment core that was sent and are converted once,
@@ -37,46 +42,25 @@ def revision(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def changed_range(old: str, new: str) -> tuple[int, int, int]:
-    """One replaced range ``old[p:old_end] -> new[p:new_end]``.
+def _shift(start: int, end: int, p: int, old_end: int, new_end: int) -> tuple[int, int, bool]:
+    """Move ``[start, end)`` across the edit ``[p, old_end) -> [p, new_end)``.
 
-    Bisects on slice equality so a keystroke in a long manuscript compares
-    in C rather than scalar by scalar in Python.
+    Returns the new range and whether the edit overlapped it. An insertion at
+    either boundary does not overlap; one strictly inside does.
     """
-    limit = min(len(old), len(new))
-    low, high = 0, limit
-    while low < high:
-        mid = (low + high + 1) // 2
-        if old[:mid] == new[:mid]:
-            low = mid
-        else:
-            high = mid - 1
-    p = low
-    low, high = 0, limit - p
-    while low < high:
-        mid = (low + high + 1) // 2
-        if old[len(old) - mid:] == new[len(new) - mid:]:
-            low = mid
-        else:
-            high = mid - 1
-    return p, len(old) - low, len(new) - low
-
-
-def _shift(start: int, end: int, p: int, old_end: int, new_end: int) -> tuple[int, int]:
     if end <= p and not (start == end == p):
-        return start, end
+        return start, end, False
     if start >= old_end:
         delta = new_end - old_end
-        return start + delta, end + delta
-    # Overlapping: keep the position; liveness is decided by the slice check.
-    return start, end
+        return start + delta, end + delta, False
+    return start, end, True
 
 
-def shift_span(span: dict | None, p: int, old_end: int, new_end: int) -> dict | None:
+def shift_span(span: dict | None, p: int, old_end: int, new_end: int) -> tuple[dict | None, bool]:
     if span is None:
-        return None
-    start, end = _shift(span["start"], span["end"], p, old_end, new_end)
-    return {"start": start, "end": end, "text": span["text"]}
+        return None, False
+    start, end, hit = _shift(span["start"], span["end"], p, old_end, new_end)
+    return {"start": start, "end": end, "text": span["text"]}, hit
 
 
 def span_live(span: dict | None, text: str) -> bool:
@@ -92,7 +76,7 @@ def _offset(span: dict | None, by: int) -> dict | None:
     return {"start": span["start"] + by, "end": span["end"] + by, "text": span["text"]}
 
 
-@dataclass
+@dataclass(eq=False)
 class LiveIssue:
     """One model issue in whole-manuscript coordinates."""
 
@@ -109,12 +93,22 @@ class LiveIssue:
     previously_applied: bool = False
     # Decisions already on file when the report arrived. They inform the base
     # state through the merge rules; they never count as a decision on this
-    # report by themselves (an identical issue id is not a new decision).
+    # report by themselves.
     preexisting: frozenset | None = None
+    # An edit overlapped this occurrence: it needs reconfirmation for good.
+    invalid: bool = False
 
     @property
     def id(self) -> str:
         return self.issue["id"]
+
+    @property
+    def occurrence(self) -> str:
+        """Whole-document occurrence plus text version (Web ``occurrenceKey``)."""
+        from .manuscript import occurrence_key
+        return occurrence_key({"category": self.issue["category"], "source_revision": self.source_revision,
+                               "target_revision": self.target_revision, "source_span": self.issue["source_span"],
+                               "target_span": self.issue["target_span"]})
 
     def live(self, source: str, target: str) -> bool:
         return (span_live(self.source_span, source) and span_live(self.target_span, target)
@@ -125,7 +119,7 @@ class LiveIssue:
         return self.suggestion_span or self.target_span
 
 
-@dataclass
+@dataclass(eq=False)
 class SegmentResult:
     """A semantic (and, for long manuscripts, term) result for one sent pair."""
 
@@ -139,10 +133,11 @@ class SegmentResult:
     issues: list[LiveIssue] = field(default_factory=list)
     term_findings: list[dict] = field(default_factory=list)  # full coordinates
     term_report: dict[str, Any] | None = None
+    invalid: bool = False
 
     def current(self, source: str, target: str) -> bool:
         (a, b), (c, d) = self.source_core, self.target_core
-        return source[a:b] == self.sent_source and target[c:d] == self.sent_target
+        return (not self.invalid and source[a:b] == self.sent_source and target[c:d] == self.sent_target)
 
     def matches(self, pair, source: str, target: str) -> bool:
         return (self.source_core == (pair.source.core_start, pair.source.core_end)
@@ -150,16 +145,12 @@ class SegmentResult:
                 and self.current(source, target))
 
 
-def _shift_core(core: tuple[int, int], p: int, old_end: int, new_end: int) -> tuple[int, int]:
-    return _shift(core[0], core[1], p, old_end, new_end)
-
-
 class Session:
     """Semantic results for the open manuscript."""
 
     def __init__(self) -> None:
         self.results: list[SegmentResult] = []
-        # The pair whose request is in flight; edits shift it like a result.
+        # The pair whose request is in flight; edits move it like a result.
         self.pending: SegmentResult | None = None
 
     def clear(self) -> None:
@@ -167,28 +158,64 @@ class Session:
         self.pending = None
 
     # -- edits -----------------------------------------------------------
-    def text_changed(self, side: str, old: str, new: str) -> None:
-        if old == new or not (self.results or self.pending is not None):
-            return
-        p, old_end, new_end = changed_range(old, new)
+    def apply_edit(self, side: str, start: int, old_end: int, new_len: int,
+                   exempt: LiveIssue | None = None) -> None:
+        """One replacement the editor or the workbench actually performed.
+
+        ``exempt`` is the issue whose own accept or adjust made this edit.
+        """
+        p, new_end = start, start + new_len
+        source_side = side == "source"
         for result in self.results + ([self.pending] if self.pending is not None else []):
-            if side == "source":
-                result.source_core = _shift_core(result.source_core, p, old_end, new_end)
+            core = result.source_core if source_side else result.target_core
+            a, b, hit = _shift(core[0], core[1], p, old_end, new_end)
+            if source_side:
+                result.source_core = (a, b)
             else:
-                result.target_core = _shift_core(result.target_core, p, old_end, new_end)
+                result.target_core = (a, b)
+            result.invalid = result.invalid or hit
             for issue in result.issues:
-                if side == "source":
-                    issue.source_span = shift_span(issue.source_span, p, old_end, new_end)
-                else:
-                    issue.target_span = shift_span(issue.target_span, p, old_end, new_end)
-                    issue.suggestion_span = shift_span(issue.suggestion_span, p, old_end, new_end)
-            shifted = []
+                keys = ("source_span",) if source_side else ("target_span", "suggestion_span")
+                for key in keys:
+                    span, hit = shift_span(getattr(issue, key), p, old_end, new_end)
+                    setattr(issue, key, span)
+                    if hit and issue is not exempt:
+                        issue.invalid = True
+            kept = []
+            key = "source_span" if source_side else "target_span"
             for finding in result.term_findings:
-                finding = dict(finding)
-                key = "source_span" if side == "source" else "target_span"
-                finding[key] = shift_span(finding.get(key), p, old_end, new_end)
-                shifted.append(finding)
-            result.term_findings = shifted
+                span, hit = shift_span(finding.get(key), p, old_end, new_end)
+                if not hit:
+                    kept.append({**finding, key: span})
+            result.term_findings = kept
+
+    def snapshot(self) -> dict:
+        """Positions and validity, so undo can restore them with the text."""
+        state: dict[int, Any] = {}
+        for result in self.results + ([self.pending] if self.pending is not None else []):
+            state[id(result)] = (result, result.source_core, result.target_core, result.invalid,
+                                 list(result.term_findings))
+            for issue in result.issues:
+                state[id(issue)] = (issue, issue.source_span, issue.target_span, issue.suggestion_span, issue.invalid)
+        return state
+
+    def restore(self, state: dict) -> None:
+        """Objects created after the snapshot cannot be mapped back: invalid."""
+        for result in self.results + ([self.pending] if self.pending is not None else []):
+            saved = state.get(id(result))
+            if saved is None or saved[0] is not result:
+                result.invalid = True
+                for issue in result.issues:
+                    issue.invalid = True
+                continue
+            _, result.source_core, result.target_core, result.invalid, findings = saved
+            result.term_findings = list(findings)
+            for issue in result.issues:
+                kept = state.get(id(issue))
+                if kept is None or kept[0] is not issue:
+                    issue.invalid = True
+                else:
+                    _, issue.source_span, issue.target_span, issue.suggestion_span, issue.invalid = kept
 
     # -- results ---------------------------------------------------------
     def replace_result(self, result: SegmentResult) -> None:
@@ -283,13 +310,14 @@ def reconcile(decisions: list[dict], texts: dict[str, str], source: str, target:
 
     results = []
     for decision in decisions:
-        candidates = [i for i in issues if i["fingerprint"] == decision["fingerprint"]
+        # Issues are referred to by their index in ``issues``: identical
+        # paragraphs produce identical request-local ids.
+        candidates = [index for index, i in enumerate(issues) if i["fingerprint"] == decision["fingerprint"]
                       and i["category"] == decision["category"]]
 
-        def outcome(status: str, code: str, issue: dict | None = None) -> dict:
+        def outcome(status: str, code: str, index: int | None = None) -> dict:
             return {"decision": decision, "status": status, "code": code,
-                    "issue_id": None if issue is None else issue["id"],
-                    "candidates": [c["id"] for c in candidates]}
+                    "issue": index, "candidates": list(candidates)}
         if not candidates:
             results.append(outcome("not_reported", "not_reported"))
             continue
@@ -297,8 +325,9 @@ def reconcile(decisions: list[dict], texts: dict[str, str], source: str, target:
         if decision["decision"] != "ignored":
             here = (recover_span(old_source, decision["source_span"], source)
                     if old_source is not None and decision["source_span"] is not None else None)
-            match = next((c for c in candidates if here and c["source_span"] and _same_range(c["source_span"], here)), None)
-            results.append(outcome("previously_applied", "previously_applied", match) if match
+            match = next((c for c in candidates if here and issues[c]["source_span"]
+                          and _same_range(issues[c]["source_span"], here)), None)
+            results.append(outcome("previously_applied", "previously_applied", match) if match is not None
                            else outcome("needs_reconfirmation", "applied_not_carried"))
             continue
         old_target = text_for(decision["target_revision"], target, target_revision)
@@ -318,17 +347,18 @@ def reconcile(decisions: list[dict], texts: dict[str, str], source: str, target:
             results.append(outcome("needs_reconfirmation", failed))
         elif len(candidates) != 1:
             results.append(outcome("needs_reconfirmation", "multiple_candidates"))
-        elif not (_same_range(spans[0], candidates[0]["source_span"]) and _same_range(spans[1], candidates[0]["target_span"])):
+        elif not (_same_range(spans[0], issues[candidates[0]]["source_span"])
+                  and _same_range(spans[1], issues[candidates[0]]["target_span"])):
             results.append(outcome("needs_reconfirmation", "candidate_elsewhere"))
         else:
             results.append(outcome("carried", "carried", candidates[0]))
-    counts: dict[str, int] = {}
+    counts: dict[int, int] = {}
     for r in results:
         if r["status"] == "carried":
-            counts[r["issue_id"]] = counts.get(r["issue_id"], 0) + 1
+            counts[r["issue"]] = counts.get(r["issue"], 0) + 1
     for r in results:
-        if r["status"] == "carried" and counts[r["issue_id"]] > 1:
-            r.update(status="needs_reconfirmation", code="converged_on_one_issue", issue_id=None)
+        if r["status"] == "carried" and counts[r["issue"]] > 1:
+            r.update(status="needs_reconfirmation", code="converged_on_one_issue", issue=None)
     return results
 
 
@@ -349,21 +379,21 @@ def apply_reconcile(issues: list[LiveIssue], decisions: list[dict], texts: dict[
     prior = [d for d in decisions if _key(d) not in own]
     outcomes = reconcile(prior, texts, source, target, [issue.issue for issue in issues])
     rank = {STATE_IGNORED_CARRIED: 3, "previously_applied": 2, STATE_NEEDS_RECONFIRM: 1, STATE_PENDING: 0}
-    best: dict[str, tuple[str, dict]] = {}
+    best: dict[int, tuple[str, dict]] = {}
 
-    def offer(issue_id: str, state: str, decision: dict) -> None:
-        if issue_id not in best or rank[state] > rank[best[issue_id][0]]:
-            best[issue_id] = (state, decision)
+    def offer(index: int, state: str, decision: dict) -> None:
+        if index not in best or rank[state] > rank[best[index][0]]:
+            best[index] = (state, decision)
     for r in outcomes:
         if r["status"] == "carried":
-            offer(r["issue_id"], STATE_IGNORED_CARRIED, r["decision"])
+            offer(r["issue"], STATE_IGNORED_CARRIED, r["decision"])
         elif r["status"] == "previously_applied":
-            offer(r["issue_id"], "previously_applied", r["decision"])
+            offer(r["issue"], "previously_applied", r["decision"])
         elif r["status"] == "needs_reconfirmation":
-            for issue_id in r["candidates"]:
-                offer(issue_id, STATE_NEEDS_RECONFIRM, r["decision"])
-    for issue in issues:
-        state, decision = best.get(issue.id, (STATE_PENDING, None))
+            for index in r["candidates"]:
+                offer(index, STATE_NEEDS_RECONFIRM, r["decision"])
+    for index, issue in enumerate(issues):
+        state, decision = best.get(index, (STATE_PENDING, None))
         issue.previously_applied = state == "previously_applied"
         issue.base_state = STATE_PENDING if issue.previously_applied else state
         issue.previous = decision
@@ -374,8 +404,9 @@ def _key(decision: dict) -> str:
 
 
 def _matches_decision(issue: LiveIssue, decision: dict) -> bool:
-    return (decision.get("issue_id") == issue.id and decision.get("source_revision") == issue.source_revision
-            and decision.get("target_revision") == issue.target_revision)
+    """Same whole-document occurrence and text version; never the request-local id."""
+    from .manuscript import occurrence_key
+    return occurrence_key(decision) == issue.occurrence
 
 
 def decision_for(issue: LiveIssue, decisions: list[dict]) -> dict | None:
@@ -387,15 +418,20 @@ def decision_for(issue: LiveIssue, decisions: list[dict]) -> dict | None:
 
 
 def state_of(issue: LiveIssue, decisions: list[dict], source: str, target: str) -> str:
+    """Validity first: an occurrence an edit touched needs reconfirmation,
+    whatever was decided there before (the decision stays as history)."""
+    if issue.invalid:
+        return STATE_STALE
     decision = decision_for(issue, decisions)
-    if decision is not None:
+    if decision is not None and decision["decision"] != "ignored":
+        # Accept and adjust replaced this occurrence themselves.
         return decision["decision"]
-    if issue.base_state == STATE_IGNORED_CARRIED:
-        return STATE_IGNORED_CARRIED
     if not issue.live(source, target):
         return STATE_STALE
-    if issue.base_state == STATE_NEEDS_RECONFIRM:
-        return STATE_NEEDS_RECONFIRM
+    if decision is not None:
+        return decision["decision"]
+    if issue.base_state in (STATE_IGNORED_CARRIED, STATE_NEEDS_RECONFIRM):
+        return issue.base_state
     return STATE_PENDING
 
 

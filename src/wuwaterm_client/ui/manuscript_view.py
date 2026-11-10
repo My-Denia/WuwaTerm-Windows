@@ -66,6 +66,11 @@ def _normalize_semantic(payload: dict) -> dict:
     return payload
 
 
+def _core_key(source_core: tuple[int, int], target_core: tuple[int, int], source: str, target: str) -> tuple:
+    (a, b), (c, d) = source_core, target_core
+    return (a, b, c, d, source[a:b], target[c:d])
+
+
 def _blank(text: str) -> bool:
     return all(char in WHITESPACE for char in text)
 
@@ -124,6 +129,10 @@ class LosslessEditor(QPlainTextEdit):
         self._ime_active = False
         self._ime_origin: tuple[int, int] | None = None
         self._ignore_ime_changes = False
+        # The raw range the last accepted edit replaced: (start, old_end,
+        # new_length) in scalar offsets. It comes from the edit itself, never
+        # from comparing texts, so repeated text cannot make it ambiguous.
+        self.last_edit: tuple[int, int, int] | None = None
         # Qt's undo buffer contains normalised text, so using it could turn an
         # original CRLF or non-breaking space into a different character.
         self.setUndoRedoEnabled(False)
@@ -266,6 +275,7 @@ class LosslessEditor(QPlainTextEdit):
             if left is not None and right is not None and old[:left] + inserted_shown + old[right:] == new:
                 raw = self._raw[:self._bounds[left]] + self._pending + self._raw[self._bounds[right]:]
                 shown, bounds = _display_map(raw)
+                self.last_edit = (self._bounds[left], self._bounds[right], len(self._pending))
                 self._raw, self._shown, self._bounds = raw, shown, bounds
                 self.rawChanged.emit()
                 return
@@ -292,6 +302,9 @@ class LosslessEditor(QPlainTextEdit):
             raw = self._raw[:self._bounds[left]] + inserted + self._raw[self._bounds[right]:]
             shown, bounds = _display_map(raw)
             if shown == new:
+                # The whole range Qt reported, not the trimmed difference.
+                old_start, old_end = self._bounds[start], self._bounds[end]
+                self.last_edit = (old_start, old_end, len(raw) - len(self._raw) + old_end - old_start)
                 self._raw, self._shown, self._bounds = raw, shown, bounds
                 self.rawChanged.emit()
                 return
@@ -373,6 +386,9 @@ class ManuscriptView(QWidget):
         # an edit undo must never erase a report added later or undo a save.
         self._undo_history: list[dict] = []
         self._redo_history: list[dict] = []
+        # Semantic positions at each history step, restored with the text.
+        self._undo_sessions: list[dict] = []
+        self._redo_sessions: list[dict] = []
         self._review_state = "none"
         self._review_detail = ""
         self._request_id: str | None = None
@@ -418,7 +434,8 @@ class ManuscriptView(QWidget):
         for editor in (self.source_edit, self.target_edit):
             editor.setMinimumHeight(36)
             editor.setMinimumWidth(80)
-            editor.rawChanged.connect(self._on_edit)
+            editor.rawChanged.connect(lambda side="source" if editor is self.source_edit else "target",
+                                      e=editor: self._on_edit(edit=(side, *e.last_edit)))
             editor.undoRequested.connect(self._undo_replace)
             editor.redoRequested.connect(self._redo_edit)
             editor.compositionChanged.connect(self._on_composition_changed)
@@ -938,10 +955,12 @@ class ManuscriptView(QWidget):
             self._pairs_key, self._pairs = key, pairs
         return self._pairs
 
-    def _segment_key(self, pair) -> tuple[str, str]:
+    def _segment_key(self, pair) -> tuple:
+        """A pair's identity: where its cores are and what they say. Identical
+        paragraphs at different places are different segments."""
         source, target = self._payload["source"], self._payload["target"]
-        return (source[pair.source.core_start:pair.source.core_end],
-                target[pair.target.core_start:pair.target.core_end])
+        return _core_key((pair.source.core_start, pair.source.core_end),
+                         (pair.target.core_start, pair.target.core_end), source, target)
 
     def _segment_status(self, pair) -> str:
         if pair.status != STATUS_READY:
@@ -1125,7 +1144,9 @@ class ManuscriptView(QWidget):
         free = not composing and not self._translating()
         self.accept_button.setEnabled(free and self._can_accept(issue))
         self.adjust_button.setEnabled(free and self._can_adjust(issue))
-        self.ignore_button.setEnabled(free and issue is not None and self._issue_state(issue) in sessions.UNHANDLED)
+        # A decision already made here stays as history; it is not decided again.
+        self.ignore_button.setEnabled(free and issue is not None and self._issue_state(issue) in sessions.UNHANDLED
+                                      and sessions.decision_for(issue, self._decisions()) is None)
         self.adjust_apply_button.setEnabled(free and self._can_adjust(issue))
         self.semantic_list.setEnabled(not composing)
 
@@ -1179,7 +1200,8 @@ class ManuscriptView(QWidget):
 
     # -- semantic review: decisions ------------------------------------------
     def _record_decision(self, issue: sessions.LiveIssue, decision: str, *,
-                         applied_text: str | None = None, target: str | None = None) -> bool:
+                         applied_text: str | None = None, target: str | None = None,
+                         replaced: dict | None = None) -> bool:
         """Apply one decision as one undoable edit, after a save preflight."""
         record = sessions.make_decision(issue, decision, applied_text)
         decisions = sessions.with_decision(self._decisions(), issue, record)
@@ -1197,7 +1219,10 @@ class ManuscriptView(QWidget):
         if len(decisions) > MAX_SEMANTIC_DECISIONS or not semantic_payload_fits(candidate):
             self.status_label.setText(strings.MANUSCRIPT_DECISIONS_FULL)
             return False
-        self._apply_edit(value)
+        edits = None
+        if replaced is not None:
+            edits = [("target", replaced["start"], replaced["end"], len(applied_text or ""))]
+        self._apply_edit(value, edits=edits, exempt=issue)
         return True
 
     def _accept_current(self) -> None:
@@ -1220,7 +1245,8 @@ class ManuscriptView(QWidget):
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
-        if self._record_decision(issue, "accepted", applied_text=replacement, target=changed):
+        if self._record_decision(issue, "accepted", applied_text=replacement, target=changed,
+                                 replaced=issue.suggestion_span):
             self.status_label.setText(strings.MANUSCRIPT_ACCEPTED)
             self._advance_after_decision(issue)
 
@@ -1254,7 +1280,8 @@ class ManuscriptView(QWidget):
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
-        if self._record_decision(issue, "adjusted", applied_text=text, target=changed):
+        if self._record_decision(issue, "adjusted", applied_text=text, target=changed,
+                                 replaced=issue.edit_span()):
             self.adjust_area.hide()
             self.status_label.setText(strings.MANUSCRIPT_ADJUSTED)
             self._advance_after_decision(issue)
@@ -1575,15 +1602,24 @@ class ManuscriptView(QWidget):
         self._payload.setdefault("semantic_texts", [])
         _normalize_semantic(self._payload)
 
-    def _after_draft_change(self, before: dict, after: dict) -> None:
-        """Keep model results across edits, and expire only what an edit touched."""
+    def _after_draft_change(self, before: dict, after: dict, edits: list | None = None,
+                            exempt: sessions.LiveIssue | None = None) -> None:
+        """Keep model results across edits; invalidate exactly what an edit touched.
+
+        ``edits`` are the replacements actually performed, as
+        ``(side, start, old_end, new_length)``. A text change that arrives
+        without them is treated as replacing that whole side.
+        """
         if before["direction"] != after["direction"]:
             if self._session.results or self._semantic_running():
                 self._clear_semantic()
                 self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED)
-        else:
-            self._session.text_changed("source", before["source"], after["source"])
-            self._session.text_changed("target", before["target"], after["target"])
+        elif edits is not None or before["source"] != after["source"] or before["target"] != after["target"]:
+            if edits is None:
+                edits = [(side, 0, len(before[side]), len(after[side]))
+                         for side in ("source", "target") if before[side] != after[side]]
+            for side, start, old_end, new_length in edits:
+                self._session.apply_edit(side, start, old_end, new_length, exempt=exempt)
         if any(before[key] != after[key] for key in _REVIEW_KEYS):
             self._invalidate_report()
         if self._conflict_mode:
@@ -1593,20 +1629,25 @@ class ManuscriptView(QWidget):
             self._derived_timer.start()
         self._update_controls()
 
-    def _apply_edit(self, value: dict, *, editors_already_updated: bool = False) -> None:
+    def _push_history(self, stack: list, sessions_stack: list, value: dict) -> tuple[list, list]:
+        return (stack + [value])[-20:], (sessions_stack + [self._session.snapshot()])[-20:]
+
+    def _apply_edit(self, value: dict, *, editors_already_updated: bool = False, edits: list | None = None,
+                    exempt: sessions.LiveIssue | None = None) -> None:
         before = self._draft_snapshot()
         value = {**before, **copy.deepcopy(value)}
         if value == before:
             return
-        self._undo_history = (self._undo_history + [before])[-20:]
+        self._undo_history, self._undo_sessions = self._push_history(self._undo_history, self._undo_sessions, before)
         self._redo_history.clear()
+        self._redo_sessions.clear()
         self._restore_draft(value)
         self._document_revision += 1
         if self.status_label.text() == strings.MANUSCRIPT_SAVE_DONE:
             self.status_label.setText(strings.MANUSCRIPT_UNSAVED)
         if not editors_already_updated:
             self._set_payload(self._payload)
-        self._after_draft_change(before, value)
+        self._after_draft_change(before, value, edits, exempt)
 
     def _apply_endpoint_state(self) -> None:
         self._update_controls()
@@ -1668,7 +1709,7 @@ class ManuscriptView(QWidget):
         self.status_label.setText(strings.MANUSCRIPT_ENDPOINT_CHANGED)
         self._update_controls()
 
-    def _on_edit(self, *_args) -> None:
+    def _on_edit(self, *_args, edit: tuple | None = None) -> None:
         if self._updating:
             return
         value = self._draft_snapshot()
@@ -1676,11 +1717,16 @@ class ManuscriptView(QWidget):
         value["target"] = self.target_edit.raw_text()
         value["direction"] = self.direction_combo.currentData()
         if value == self._draft_snapshot():
+            if edit is not None:
+                # Text rewritten with identical text: still an edit of that range.
+                self._session.apply_edit(*edit)
+                self._refresh_semantic()
+                self._update_controls()
             return
         if value["alignments"] is not None:
             value["alignments"] = []
             self.status_label.setText(strings.MANUSCRIPT_ALIGNMENTS_CLEARED)
-        self._apply_edit(value, editors_already_updated=True)
+        self._apply_edit(value, editors_already_updated=True, edits=[edit] if edit is not None else None)
 
     def _start_review(self) -> None:
         if not self.review_button.isEnabled() or not self._input_ready():
@@ -1910,23 +1956,27 @@ class ManuscriptView(QWidget):
                 self._segment_failures[key] = "needs_manual_split"
                 continue
             self._session.pending = sessions.SegmentResult(
-                sent_source=key[0], sent_target=key[1],
+                sent_source=key[4], sent_target=key[5],
                 source_core=(pair.source.core_start, pair.source.core_end),
                 target_core=(pair.target.core_start, pair.target.core_end),
                 hard_cut=pair.hard_cut, report=None)
             before = self._context_for(pair)
             precedents = semantic.select_precedents(
-                sessions.precedent_candidates(self._payload, self._current_pairs()), key[0], pair.source.core_start)
+                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start)
             self._render_semantic_progress()
             term_report = report = None
             try:
                 if segments:
-                    term_report = await self._api_client.review_pair(key[0], key[1], direction)
+                    term_report = await self._api_client.review_pair(key[4], key[5], direction)
                 if semantic_on and generation == self._semantic_generation:
                     report = await self._api_client.semantic_review(
-                        key[0], key[1], direction, before=before, precedents=precedents)
+                        key[4], key[5], direction, before=before, precedents=precedents)
             except ClientError as exc:
-                if generation == self._semantic_generation:
+                if generation == self._semantic_generation and self._session.pending is not None:
+                    # Positions may have moved while the request was in flight.
+                    moved = self._session.pending
+                    key = _core_key(moved.source_core, moved.target_core,
+                                    self._payload["source"], self._payload["target"])
                     self._session.pending = None
                 if generation != self._semantic_generation or exc.code == ERROR_CANCELLED:
                     return
@@ -1949,7 +1999,7 @@ class ManuscriptView(QWidget):
             if pending is None or not pending.current(source, target):
                 continue
             if report is not None and report["status"] != "complete":
-                self._segment_failures[key] = "not_reviewed"
+                self._segment_failures[_core_key(pending.source_core, pending.target_core, source, target)] = "not_reviewed"
                 continue
             failure_streak = (None, 0)
             self._store_segment(pair.index, pending, report, term_report, direction)
@@ -1965,7 +2015,7 @@ class ManuscriptView(QWidget):
             sent_source=pending.sent_source, sent_target=pending.sent_target,
             source_core=pending.source_core, target_core=pending.target_core,
             hard_cut=pending.hard_cut, report=report, index=index)
-        key = (pending.sent_source, pending.sent_target)
+        key = _core_key(pending.source_core, pending.target_core, source, target)
         notes = []
         if report is not None:
             result.issues = sessions.live_issues_from_report(
@@ -2105,11 +2155,14 @@ class ManuscriptView(QWidget):
         translated = "".join(out)
         if pair is None:
             changed = translated
+            edit = ("target", 0, len(target), len(changed))
         else:
             position = pair.target.core_start
             left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
             right = "\n\n" if position < len(target) and target[position] not in WHITESPACE else ""
-            changed = target[:position] + left + translated + right + target[position:]
+            inserted = left + translated + right
+            changed = target[:position] + inserted + target[position:]
+            edit = ("target", position, position, len(inserted))
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
@@ -2117,7 +2170,7 @@ class ManuscriptView(QWidget):
         value["target"] = changed
         if value["alignments"] is not None:
             value["alignments"] = []
-        self._apply_edit(value)
+        self._apply_edit(value, edits=[edit])
         self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
         self._update_controls()
 
@@ -2159,32 +2212,34 @@ class ManuscriptView(QWidget):
         value["target"] = changed
         if value["alignments"] is not None:
             value["alignments"] = []
-        self._apply_edit(value)
+        self._apply_edit(value, edits=[("target", span["start"], span["end"], len(replacement))])
         self.status_label.setText(strings.MANUSCRIPT_REPLACED)
         self._update_controls()
 
     def _undo_replace(self) -> None:
-        if not self._undo_history or not self._input_ready():
-            return
-        value = self._undo_history.pop()
-        before = self._draft_snapshot()
-        self._redo_history = (self._redo_history + [before])[-20:]
-        self._restore_draft(value)
-        self._set_payload(self._payload)
-        self._after_draft_change(before, value)
-        self.status_label.setText(strings.MANUSCRIPT_UNDONE)
-        self._update_controls()
+        self._step_history(undo=True)
 
     def _redo_edit(self) -> None:
-        if not self._redo_history or not self._input_ready():
+        self._step_history(undo=False)
+
+    def _step_history(self, *, undo: bool) -> None:
+        """Undo and redo restore text, decisions and the semantic positions together."""
+        source = self._undo_history if undo else self._redo_history
+        if not source or not self._input_ready():
             return
-        value = self._redo_history.pop()
+        value = source.pop()
+        saved = (self._undo_sessions if undo else self._redo_sessions).pop()
         before = self._draft_snapshot()
-        self._undo_history = (self._undo_history + [before])[-20:]
+        if undo:
+            self._redo_history, self._redo_sessions = self._push_history(self._redo_history, self._redo_sessions, before)
+        else:
+            self._undo_history, self._undo_sessions = self._push_history(self._undo_history, self._undo_sessions, before)
         self._restore_draft(value)
         self._set_payload(self._payload)
-        self._after_draft_change(before, value)
-        self.status_label.setText(strings.MANUSCRIPT_REDONE)
+        self._session.restore(saved)
+        # Positions came back with the snapshot; only the review state follows.
+        self._after_draft_change(before, value, edits=[])
+        self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
         self._update_controls()
 
     def _set_payload(self, value: dict) -> None:
@@ -2276,9 +2331,14 @@ class ManuscriptView(QWidget):
         except OSError as exc:
             self.status_label.setText(strings.MANUSCRIPT_SAVE_FAILED.format(reason=str(exc)))
             return False
-        if "semantic_history" in self._payload:
-            # The writer may have dropped the oldest history to fit 1 MiB.
-            self._payload["semantic_history"] = parse_workfile(serialize_workfile(self._payload))["semantic_history"]
+        # Hold exactly what was written: the writer may have dropped history to
+        # fit 1 MiB (possibly falling back to v1) and unneeded old texts.
+        written = parse_workfile(serialize_workfile(self._payload))
+        for key in ("semantic_decisions", "semantic_texts", "semantic_history"):
+            if key in written:
+                self._payload[key] = written[key]
+            else:
+                self._payload.pop(key, None)
         self._path = path
         self._saved_payload = copy.deepcopy(self._payload)
         self.status_label.setText(strings.MANUSCRIPT_SAVE_DONE)
@@ -2315,6 +2375,8 @@ class ManuscriptView(QWidget):
         self._clear_semantic()
         self._undo_history.clear()
         self._redo_history.clear()
+        self._undo_sessions.clear()
+        self._redo_sessions.clear()
         self._conflict_mode = False
         self._refresh_conflicts()
         self._set_payload(value)
@@ -2333,6 +2395,8 @@ class ManuscriptView(QWidget):
         self._clear_semantic()
         self._undo_history.clear()
         self._redo_history.clear()
+        self._undo_sessions.clear()
+        self._redo_sessions.clear()
         self._conflict_mode = False
         self._refresh_conflicts()
         value = empty_workfile()
