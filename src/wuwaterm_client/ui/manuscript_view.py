@@ -1959,9 +1959,12 @@ class ManuscriptView(QWidget):
         """The owner's correspondence for one segment's term request.
 
         ``None`` (automatic) stays automatic. An explicit list, including the
-        empty list an edit leaves behind, never becomes automatic: the
-        alignments inside this segment's cores move to segment coordinates and
-        the rest are left out.
+        empty list an edit leaves behind, never becomes automatic. Each span
+        is intersected with the segment's core (segmentation-v1 strips the
+        whitespace around a region, an alignment span may include it or cross
+        into a neighbour) and moved to segment coordinates; the text is the
+        core slice, as review-v2 requires. An alignment whose source, or
+        non-null target, does not intersect the core is left out.
         """
         return self._alignments_for((pair.source.core_start, pair.source.core_end),
                                     (pair.target.core_start, pair.target.core_end))
@@ -1970,14 +1973,21 @@ class ManuscriptView(QWidget):
         alignments = self._payload["alignments"]
         if alignments is None:
             return None
-        (a, b), (c, d) = source_core, target_core
+        source_text, target_text = self._payload["source"], self._payload["target"]
+
+        def clip(span: dict, core: tuple[int, int], text: str) -> dict | None:
+            start, end = max(span["start"], core[0]), min(span["end"], core[1])
+            if start >= end:
+                return None
+            return {"start": start - core[0], "end": end - core[0], "text": text[start:end]}
+
         out = []
         for item in alignments:
-            source, target = item["source"], item["target"]
-            if a <= source["start"] and source["end"] <= b and (target is None or c <= target["start"] and target["end"] <= d):
-                out.append({"source": {**source, "start": source["start"] - a, "end": source["end"] - a},
-                            "target": None if target is None else
-                            {**target, "start": target["start"] - c, "end": target["end"] - c}})
+            source = clip(item["source"], source_core, source_text)
+            target = None if item["target"] is None else clip(item["target"], target_core, target_text)
+            if source is None or (item["target"] is not None and target is None):
+                continue
+            out.append({"source": source, "target": target})
         return out
 
     def _context_for(self, pair) -> dict | None:

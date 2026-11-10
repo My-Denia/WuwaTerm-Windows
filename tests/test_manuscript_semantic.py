@@ -1029,3 +1029,52 @@ def test_an_ignore_never_carries_to_another_occurrence_through_original_coordina
         assert reopened._issue_state(live) == "needs_reconfirm"
         assert reopened.semantic_track_button.text() == strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=1)
     asyncio.run(scenario())
+
+
+# -- explicit alignments in segment term requests ---------------------------
+
+ALIGNED_SOURCE = "  " + "甲" * 1200 + "\n\n" + "乙" * 1200 + "\n"
+ALIGNED_TARGET = " " + "A" * 1200 + "\n\n" + "B" * 1200 + "\n"
+
+
+def _span(text: str, start: int, end: int) -> dict:
+    return {"start": start, "end": end, "text": text[start:end]}
+
+
+def test_alignments_with_surrounding_whitespace_reach_the_segment_term_requests(qapp) -> None:
+    alignments = [{"source": _span(ALIGNED_SOURCE, 0, 1204), "target": _span(ALIGNED_TARGET, 0, 1203)},
+                  {"source": _span(ALIGNED_SOURCE, 1204, len(ALIGNED_SOURCE)),
+                   "target": _span(ALIGNED_TARGET, 1203, len(ALIGNED_TARGET))}]
+
+    async def scenario():
+        server = Server(capabilities=None)
+        view = make_view(server, ALIGNED_SOURCE, ALIGNED_TARGET)
+        view._payload["alignments"] = alignments
+        view._start_review()
+        await settle(view)
+        sent = server.sent("/v1/reviews")
+        assert [p.status for p in view._current_pairs()] == ["ready", "ready"] and len(sent) == 2
+        for body in sent:
+            [item] = body["alignments"]
+            assert item["source"] == _span(body["source"], 0, 1200)
+            assert item["target"] == _span(body["target"], 0, 1200)
+    asyncio.run(scenario())
+
+
+def test_alignment_spans_are_clipped_to_the_core_or_left_out(qapp) -> None:
+    view = make_view(Server(), ALIGNED_SOURCE, ALIGNED_TARGET)
+    first, second = ((2, 1202), (1, 1201)), ((1204, 2404), (1203, 2403))
+    # Crossing the core boundary: the part inside each core is kept.
+    view._payload["alignments"] = [{"source": _span(ALIGNED_SOURCE, 1000, 1500),
+                                    "target": _span(ALIGNED_TARGET, 1100, 1300)}]
+    assert view._alignments_for(*first) == [{"source": _span(ALIGNED_SOURCE[2:1202], 998, 1200),
+                                             "target": _span(ALIGNED_TARGET[1:1201], 1099, 1200)}]
+    assert view._alignments_for(*second) == [{"source": _span(ALIGNED_SOURCE[1204:2404], 0, 296),
+                                              "target": _span(ALIGNED_TARGET[1203:2403], 0, 97)}]
+    # Entirely outside one side's core: the whole alignment is left out there.
+    view._payload["alignments"] = [{"source": _span(ALIGNED_SOURCE, 1300, 1400),
+                                    "target": _span(ALIGNED_TARGET, 100, 200)},
+                                   {"source": _span(ALIGNED_SOURCE, 1500, 1600), "target": None}]
+    assert view._alignments_for(*first) == []
+    assert view._alignments_for(*second) == [{"source": _span(ALIGNED_SOURCE[1204:2404], 296, 396),
+                                              "target": None}]
