@@ -914,3 +914,29 @@ def test_term_only_segments_get_a_semantic_request_once_the_server_offers_it(qap
         assert len(server.sent("/v1/reviews")) == terms, "valid term reports are reused"
         assert view._progress() == (len(ready), len(ready))
     asyncio.run(scenario())
+
+
+def test_an_ignore_survives_reopening_and_an_unrelated_edit_before_the_next_review(qapp, tmp_path, monkeypatch) -> None:
+    path = tmp_path / "draft.json"
+
+    async def scenario():
+        view = make_view(Server(issues=two_issues), SOURCE, TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(1)
+        view.ignore_button.click()
+        view._path = path
+        assert view.save_document()
+        assert load_workfile(path)["semantic_texts"] == [], "nothing old is needed at save time"
+        reopened = make_view(Server(issues=two_issues), "", "")
+        monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+        reopened.open_document()
+        cursor = reopened.target_edit.textCursor()
+        cursor.setPosition(0)
+        reopened.target_edit.setTextCursor(cursor)
+        reopened.target_edit.insertPlainText("Intro.\n")
+        reopened._start_review()
+        await settle(reopened)
+        assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending", "ignored_carried"]
+    asyncio.run(scenario())

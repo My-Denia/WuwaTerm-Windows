@@ -2447,6 +2447,10 @@ class ManuscriptView(QWidget):
         self._refresh_conflicts()
         self._set_payload(value)
         self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
+        # The loaded texts are the versions on-file decisions usually refer to;
+        # keep them so an edit before the next review does not lose them.
+        for text in (value["source"], value["target"]):
+            self._known_texts.setdefault(sessions.revision(text), text)
         self._path = Path(name)
         self._saved_payload = copy.deepcopy(self._payload)
         self._set_review_state("history" if value["history"] else "none")
