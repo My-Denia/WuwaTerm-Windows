@@ -10,7 +10,7 @@ import asyncio
 import copy
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -22,7 +22,7 @@ from .. import semantic, strings
 from .. import semantic_session as sessions
 from ..errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_LLM_BUDGET_EXHAUSTED,
-    ERROR_NOT_CONFIGURED, ERROR_OFFLINE, ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
+    ERROR_LLM_UNAVAILABLE, ERROR_NOT_CONFIGURED, ERROR_OFFLINE, ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
 )
 from ..manuscript import (
     MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, WorkfileError, choice_conflict_groups,
@@ -41,7 +41,9 @@ _DOCUMENT_REVIEW_LIMIT = 2000
 _QUOTA_CODES = frozenset({ERROR_RATE_LIMITED, ERROR_LLM_BUDGET_EXHAUSTED})
 # Nothing else can succeed until the owner fixes these, so the run stops.
 _FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGURED,
-                          ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE})
+                          ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE, ERROR_LLM_UNAVAILABLE})
+# The same failure on consecutive segments is the service, not the segment.
+_REPEATED_FAILURES = 2
 TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
 _DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 _REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
@@ -397,6 +399,11 @@ class ManuscriptView(QWidget):
         self._refreshing_lists = False
         self._translate_task: asyncio.Task | None = None
         self._translate_generation = 0
+        # Pairing a long manuscript is not free; typing never waits for it.
+        self._derived_timer = QTimer(self)
+        self._derived_timer.setSingleShot(True)
+        self._derived_timer.setInterval(300)
+        self._derived_timer.timeout.connect(self._refresh_derived)
 
         self.source_edit = LosslessEditor(self)
         self.target_edit = LosslessEditor(self)
@@ -898,10 +905,24 @@ class ManuscriptView(QWidget):
     def _issue_state(self, issue: sessions.LiveIssue) -> str:
         return sessions.state_of(issue, self._decisions(), self._payload["source"], self._payload["target"])
 
+    def _pairs_key_now(self) -> tuple:
+        return (self._payload["source"], self._payload["target"], repr(self._payload["alignments"] or None))
+
+    def _cached_pairs(self) -> list | None:
+        """The pairing of the current text if already computed; never computes."""
+        return self._pairs if self._pairs_key == self._pairs_key_now() else None
+
+    def _refresh_derived(self) -> None:
+        self._current_pairs()
+        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._refresh_segments()
+        self._update_tracks()
+        self._render_semantic_progress()
+
     def _current_pairs(self) -> list:
         source, target = self._payload["source"], self._payload["target"]
         alignments = self._payload["alignments"] or None
-        key = (source, target, repr(alignments))
+        key = self._pairs_key_now()
         if key != self._pairs_key:
             try:
                 pairs = pair_segments(source, target, SEGMENT_LIMIT, alignments)
@@ -923,8 +944,12 @@ class ManuscriptView(QWidget):
             return "reviewed"
         return self._segment_failures.get(self._segment_key(pair), "pending")
 
-    def _progress(self) -> tuple[int, int]:
-        ready = [pair for pair in self._current_pairs() if pair.status == STATUS_READY]
+    def _progress(self) -> tuple[int, int] | None:
+        pairs = self._cached_pairs()
+        if pairs is None:
+            self._derived_timer.start()
+            return None
+        ready = [pair for pair in pairs if pair.status == STATUS_READY]
         done = sum(1 for pair in ready if self._segment_status(pair) == "reviewed")
         return done, len(ready)
 
@@ -968,7 +993,19 @@ class ManuscriptView(QWidget):
         self._render_semantic_progress()
 
     def _render_semantic_progress(self) -> None:
-        done, total = self._progress()
+        if self._semantic_state == "error" and not self._semantic_running():
+            self.semantic_progress.setText(self._semantic_detail)
+            return
+        if self._capabilities is not None and not self._semantic_available() and not self._session.results:
+            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE)
+            return
+        if self._semantic_state == "none" and not self._session.results and not self._semantic_running():
+            self.semantic_progress.setText(strings.MANUSCRIPT_SEMANTIC_NOT_RUN)
+            return
+        progress = self._progress()
+        if progress is None:
+            return  # refreshed shortly by the derived-state timer
+        done, total = progress
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
         if self._semantic_running():
             text = strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=done + 1, done=done, total=total)
@@ -976,15 +1013,9 @@ class ManuscriptView(QWidget):
             text = strings.MANUSCRIPT_SEMANTIC_PAUSED.format(done=done, total=total)
         elif self._semantic_state == "quota":
             text = strings.MANUSCRIPT_SEMANTIC_QUOTA.format(done=done, total=total)
-        elif self._semantic_state == "error":
-            text = self._semantic_detail
-        elif self._capabilities is not None and not self._semantic_available():
-            text = strings.MANUSCRIPT_SEMANTIC_UNAVAILABLE
-        elif self._semantic_state == "none" and not self._session.results:
-            text = strings.MANUSCRIPT_SEMANTIC_NOT_RUN
         else:
             text = strings.MANUSCRIPT_SEMANTIC_PROGRESS.format(done=done, total=total, pending=pending)
-            failed = sum(1 for pair in self._current_pairs() if self._segment_status(pair) in ("failed", "not_reviewed"))
+            failed = sum(1 for pair in self._cached_pairs() or () if self._segment_status(pair) in ("failed", "not_reviewed"))
             if failed:
                 text += "\n" + strings.MANUSCRIPT_SEMANTIC_FAILED_SEGMENTS.format(count=failed)
             if not self._session.issues() and done:
@@ -1290,13 +1321,20 @@ class ManuscriptView(QWidget):
             else:
                 editor.setExtraSelections([])
 
+    def _segments_track_text(self) -> str:
+        pairs = self._cached_pairs()
+        if pairs is None:
+            self._derived_timer.start()
+            return strings.MANUSCRIPT_TRACK_SEGMENTS.format(count="").strip()
+        return strings.MANUSCRIPT_TRACK_SEGMENTS.format(count=len(pairs))
+
     def _update_tracks(self) -> None:
         term_total = len(self._report["findings"]) if self._report is not None else 0
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
         for button, text in (
             (self.terms_track_button, strings.MANUSCRIPT_TRACK_TERMS.format(count=term_total)),
             (self.semantic_track_button, strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=pending)),
-            (self.segments_track_button, strings.MANUSCRIPT_TRACK_SEGMENTS.format(count=len(self._current_pairs()))),
+            (self.segments_track_button, self._segments_track_text()),
         ):
             button.setText(text)
             button.setAccessibleName(text)
@@ -1451,8 +1489,8 @@ class ManuscriptView(QWidget):
         valid = all(len(value) > 0 for value in (self._payload["source"], self._payload["target"]))
         self.review_button.setEnabled(bool(self._api_client.is_configured and valid and not busy and not composing))
         self.review_button.setVisible(not busy)
-        done, total = self._progress() if self._session.results or self._semantic_state != "none" else (0, 0)
-        partial = self._semantic_state in ("paused", "quota") or (self._session.results and done < total)
+        progress = self._progress() if self._session.results else None
+        partial = self._semantic_state in ("paused", "quota") or bool(progress and progress[0] < progress[1])
         self.review_button.setText(strings.MANUSCRIPT_REVIEW_CONTINUE if partial else strings.MANUSCRIPT_REVIEW)
         self.cancel_button.setEnabled(busy)
         self.cancel_button.setVisible(busy)
@@ -1544,7 +1582,7 @@ class ManuscriptView(QWidget):
             self._refresh_conflicts()
         self._refresh_semantic()
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-            self._refresh_segments()
+            self._derived_timer.start()
         self._update_controls()
 
     def _apply_edit(self, value: dict, *, editors_already_updated: bool = False) -> None:
@@ -1845,6 +1883,10 @@ class ManuscriptView(QWidget):
         """Serial, one request in flight. A segment edited while its request
         is in flight is discarded and picked again with its new text."""
         attempted: set[tuple[str, str]] = set()
+        failure_streak: tuple[str | None, int] = (None, 0)
+        if self._term_mode == "segments":
+            # Segments that need no request still show their term results.
+            self._show_segment_term_report()
         while generation == self._semantic_generation:
             segments = self._term_mode == "segments"
             semantic_on = self._semantic_available()
@@ -1882,7 +1924,9 @@ class ManuscriptView(QWidget):
                 if exc.code in _QUOTA_CODES:
                     self._semantic_state = "quota"
                     return
-                if exc.code in _FATAL_CODES:
+                failure_streak = (exc.code, failure_streak[1] + 1 if failure_streak[0] == exc.code else 1)
+                if exc.code in _FATAL_CODES or failure_streak[1] >= _REPEATED_FAILURES:
+                    self._segment_failures[key] = "failed"
                     self._semantic_state = "error"
                     self._semantic_detail = exc.message
                     return
@@ -1898,9 +1942,12 @@ class ManuscriptView(QWidget):
             if report is not None and report["status"] != "complete":
                 self._segment_failures[key] = "not_reviewed"
                 continue
+            failure_streak = (None, 0)
             self._store_segment(pair.index, pending, report, term_report, direction)
         if generation == self._semantic_generation:
             self._semantic_state = "done"
+            if self._term_mode == "segments":
+                self._show_segment_term_report()
 
     def _store_segment(self, index: int, pending: sessions.SegmentResult, report: dict | None,
                        term_report: dict | None, direction: str) -> None:

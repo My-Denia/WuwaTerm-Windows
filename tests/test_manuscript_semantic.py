@@ -563,3 +563,37 @@ def test_translation_sends_context_only_when_the_server_lists_it(qapp) -> None:
                 assert set(sent[1]["context"]) == {"before"}, "no precedents until the M′ gates pass"
                 assert len(sent[1]["context"]["before"]["source"]) <= 400
     asyncio.run(scenario())
+
+
+LONG_SOURCE = "\n\n".join(["第一段。" * 300, "第二段。" * 300, "第三段。" * 300])
+LONG_TARGET = "\n\n".join(["One. " * 300, "Two. " * 300, "Three. " * 300])
+
+
+def test_reviewing_an_unchanged_long_manuscript_again_keeps_its_term_results(qapp) -> None:
+    async def scenario():
+        server = Server(capabilities=None)
+        view = make_view(server, LONG_SOURCE, LONG_TARGET)
+        view._start_review()
+        await settle(view)
+        sent = len(server.sent("/v1/reviews"))
+        ready = [pair for pair in view._current_pairs() if pair.status == "ready"]
+        assert sent == len(ready) > 1 and view._review_state == "current"
+        view._start_review()
+        await settle(view)
+        assert len(server.sent("/v1/reviews")) == sent, "unchanged segments are not sent again"
+        assert view._review_state == "current" and view._report is not None
+    asyncio.run(scenario())
+
+
+def test_the_same_service_failure_on_consecutive_segments_stops_the_run(qapp) -> None:
+    async def scenario():
+        server = Server()
+        failure = httpx.Response(500, json={"error": {"code": "internal", "message": "x"}, "request_id": "e"})
+        server.semantic_errors = [failure, failure, failure]
+        view = make_view(server, LONG_SOURCE, LONG_TARGET)
+        view._start_review()
+        await settle(view)
+        assert len(server.sent("/v1/semantic-reviews")) == 2
+        assert view._semantic_state == "error"
+        assert view.semantic_progress.text() == view._semantic_detail
+    asyncio.run(scenario())

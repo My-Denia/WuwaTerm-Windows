@@ -38,15 +38,28 @@ def revision(text: str) -> str:
 
 
 def changed_range(old: str, new: str) -> tuple[int, int, int]:
-    """One replaced range ``old[p:old_end] -> new[p:new_end]``."""
+    """One replaced range ``old[p:old_end] -> new[p:new_end]``.
+
+    Bisects on slice equality so a keystroke in a long manuscript compares
+    in C rather than scalar by scalar in Python.
+    """
     limit = min(len(old), len(new))
-    p = 0
-    while p < limit and old[p] == new[p]:
-        p += 1
-    s = 0
-    while s < limit - p and old[len(old) - 1 - s] == new[len(new) - 1 - s]:
-        s += 1
-    return p, len(old) - s, len(new) - s
+    low, high = 0, limit
+    while low < high:
+        mid = (low + high + 1) // 2
+        if old[:mid] == new[:mid]:
+            low = mid
+        else:
+            high = mid - 1
+    p = low
+    low, high = 0, limit - p
+    while low < high:
+        mid = (low + high + 1) // 2
+        if old[len(old) - mid:] == new[len(new) - mid:]:
+            low = mid
+        else:
+            high = mid - 1
+    return p, len(old) - low, len(new) - low
 
 
 def _shift(start: int, end: int, p: int, old_end: int, new_end: int) -> tuple[int, int]:
@@ -154,7 +167,7 @@ class Session:
 
     # -- edits -----------------------------------------------------------
     def text_changed(self, side: str, old: str, new: str) -> None:
-        if old == new:
+        if old == new or not (self.results or self.pending is not None):
             return
         p, old_end, new_end = changed_range(old, new)
         for result in self.results + ([self.pending] if self.pending is not None else []):
