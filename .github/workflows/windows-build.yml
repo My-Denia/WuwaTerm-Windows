@@ -89,6 +89,13 @@ jobs:
           Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath "$env:RUNNER_TEMP/wuwaterm-extracted"
           $exe = "$env:RUNNER_TEMP/wuwaterm-extracted/WuwaTerm/WuwaTerm.exe"
           if (-not (Test-Path -LiteralPath $exe)) { throw 'ZIP lacks executable' }
+          $info = (Get-Item -LiteralPath $exe).VersionInfo
+          if ($info.ProductName -ne "WuwaTerm") { throw "Expected ProductName 'WuwaTerm', got '$($info.ProductName)'" }
+          if ($info.FileVersion -ne $version) { throw "Expected FileVersion '$version', got '$($info.FileVersion)'" }
+          if ($info.ProductVersion -ne $version) { throw "Expected ProductVersion '$version', got '$($info.ProductVersion)'" }
+          if ([string]::IsNullOrWhiteSpace($info.FileDescription)) { throw "Expected non-empty FileDescription, got '$($info.FileDescription)'" }
+          if ($info.FileDescription -ne "WuwaTerm desktop client") { throw "Unexpected FileDescription: '$($info.FileDescription)'" }
+          if (-not [string]::IsNullOrEmpty($info.CompanyName)) { throw "Expected empty CompanyName, got '$($info.CompanyName)'" }
           $env:QT_QPA_PLATFORM = 'offscreen'
           $check = Start-Process -FilePath $exe -ArgumentList '--self-check' -Wait -PassThru
           if ($check.ExitCode -ne 0) { throw "Extracted executable self-check failed: $($check.ExitCode)" }

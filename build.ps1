@@ -89,6 +89,17 @@ if (Test-Path $ZipPath) {
     Remove-Item -LiteralPath $ZipPath -Force
 }
 
+# Windows version resource: render into the gitignored build directory
+# from the single source of truth ($Version). PyInstaller's spec embeds this
+# into WuwaTerm.exe so the binary carries genuine Windows FileVersionInfo.
+$VersionScript = Join-Path $ClientRoot "scripts\pyinstaller_version_info.py"
+$VersionInfoFile = Join-Path $ClientRoot "build\version_info.txt"
+& $VenvPython $VersionScript $VersionInfoFile --version $Version
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to generate PyInstaller version resource at: $VersionInfoFile"
+    exit 1
+}
+
 # The dependency scan walks PATH to resolve the DLLs an extension module
 # needs, so the interpreter's own runtime directory goes first: otherwise any
 # other OpenSSL installed on the build machine wins and the artifact ships a
@@ -144,6 +155,36 @@ foreach ($Resource in Get-ChildItem -LiteralPath $SourceIcons -File) {
         throw "Packaged icon resource differs: $($Resource.Name)"
     }
 }
+
+# The built executable must carry the expected Windows version resource.
+# An exe with empty or mismatched FileVersionInfo fails here before
+# reaching the self-check or packaging.
+$ExeInfo = (Get-Item -LiteralPath $ExePath).VersionInfo
+if ($ExeInfo.ProductName -ne "WuwaTerm") {
+    Write-Error "Built executable ProductName mismatch: '$($ExeInfo.ProductName)' (expected 'WuwaTerm')"
+    exit 1
+}
+if ($ExeInfo.FileVersion -ne $Version) {
+    Write-Error "Built executable FileVersion mismatch: '$($ExeInfo.FileVersion)' (expected '$Version')"
+    exit 1
+}
+if ($ExeInfo.ProductVersion -ne $Version) {
+    Write-Error "Built executable ProductVersion mismatch: '$($ExeInfo.ProductVersion)' (expected '$Version')"
+    exit 1
+}
+if ([string]::IsNullOrWhiteSpace($ExeInfo.FileDescription)) {
+    Write-Error "Built executable FileDescription is empty."
+    exit 1
+}
+if ($ExeInfo.FileDescription -ne "WuwaTerm desktop client") {
+    Write-Error "Built executable FileDescription mismatch: '$($ExeInfo.FileDescription)' (expected 'WuwaTerm desktop client')"
+    exit 1
+}
+if (-not [string]::IsNullOrEmpty($ExeInfo.CompanyName)) {
+    Write-Error "Built executable CompanyName must be empty, got: '$($ExeInfo.CompanyName)'"
+    exit 1
+}
+Write-Host "Verified Windows version resource on $ExePath (ProductName: $($ExeInfo.ProductName), Version: $($ExeInfo.ProductVersion))"
 
 # A produced file is not a working program. This runs the artifact's own
 # start-up rehearsal: it imports and constructs everything a normal start

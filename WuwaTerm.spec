@@ -183,6 +183,15 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Windows executable version resource: generated into the gitignored build/
+# directory from the single package version source. PyInstaller embeds this
+# on Windows so WuwaTerm.exe carries genuine Windows FileVersionInfo.
+sys.path.insert(0, str(CLIENT_ROOT))
+from scripts.pyinstaller_version_info import generate_version_info_file
+
+VERSION_INFO_FILE = CLIENT_ROOT / "build" / "version_info.txt"
+generate_version_info_file(VERSION_INFO_FILE)
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -199,6 +208,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=str(VERSION_INFO_FILE),
 )
 
 coll = COLLECT(
