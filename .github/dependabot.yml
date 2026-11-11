@@ -1,0 +1,34 @@
+# Dependency update proposals, monthly and grouped.
+#
+# Grouped because this repository pins dependencies in pyproject.toml and
+# resolves them in uv.lock. An ungrouped run opens multiple pull requests
+# that create review clutter. Grouping into one pull request per ecosystem
+# per month keeps dependency review tractable, and CI validates the lockfile
+# against the build and contract suites.
+#
+# Nothing here merges automatically. Each proposal is an ordinary pull request
+# that runs the standard CI gates as any other change.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  # Resolved in uv.lock and installed by CI via uv sync --locked.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
