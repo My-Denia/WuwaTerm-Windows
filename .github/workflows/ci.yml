@@ -44,7 +44,7 @@ jobs:
           WUWATERM_CONTRACTS_REQUIRED: '1'
         run: |
           python -c "import importlib.util as u; assert u.find_spec('PySide6') is None and u.find_spec('keyring') is None"
-          python -m pytest tests/test_manuscript.py tests/test_segmentation.py tests/test_semantic_contract.py
+          python -m pytest tests/test_manuscript.py tests/test_segmentation.py tests/test_semantic_contract.py tests/test_pyinstaller_version_info.py
   windows:
     name: Windows build and contracts
     uses: ./.github/workflows/windows-build.yml
