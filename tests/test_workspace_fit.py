@@ -7,11 +7,12 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QMargins, QPoint, QRect  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QWidget  # noqa: E402
 
 from wuwaterm_client import strings, theme  # noqa: E402
 from wuwaterm_client.config import APPEARANCE_LIGHT, ClientConfig  # noqa: E402
 from wuwaterm_client.ui import components  # noqa: E402
+from wuwaterm_client.ui.terms_view import TermsView  # noqa: E402
 from wuwaterm_client.ui.main_window import (  # noqa: E402
     MainWindow,
     WINDOW_ABSOLUTE_MINIMUM,
@@ -177,6 +178,27 @@ def _assert_reachable(window, control):
     assert control.width() > 0 and control.height() > 0
     bounds = QRect(control.mapTo(window, QPoint(0, 0)), control.size())
     assert window.rect().contains(bounds), (bounds, window.rect())
+
+
+def test_terms_empty_state_keeps_the_search_under_the_title(qapp):
+    class Unconfigured:
+        is_configured = False
+
+    view = TermsView(Unconfigured())
+    view.resize(1000, 700)
+    view.show()
+    qapp.processEvents()
+    try:
+        title = next(
+            label
+            for label in view.findChildren(QLabel)
+            if label.text() == strings.PAGE_TITLE_TERMS
+        )
+        assert title.height() < 40
+        assert view.query_edit.geometry().top() < 100
+        assert view.status_label.geometry().height() < 40
+    finally:
+        view.close()
 
 
 def test_real_windows_keep_actions_and_editors_reachable_at_client_budget(
