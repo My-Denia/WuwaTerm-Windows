@@ -395,6 +395,63 @@ python -m pytest tests/test_manuscript.py
 
 跨产品契约测试还需 Node 及 [固定的 Core 和 Web 源码](contracts/sources.json)，通过 `WUWATERM_CORE_ROOT` 和 `WUWATERM_WEB_ROOT` 指向对应目录。源码文件哈希与记录不符会失败；设置 `WUWATERM_CONTRACTS_REQUIRED=1` 后，缺少源码或 Node 也会失败。CI 强制执行 Core API 和 Web 双向稿件测试。
 
+## 依赖漏洞门禁
+
+`.github/workflows/dependency-audit.yml` 审计 `uv.lock` 锁定的依赖集合：critical 和 high 的 advisory（漏洞公告）让 CI 失败，medium 和 low 只打印。它回答的是 `uv sync --locked` 不回答的问题——锁能解析、与 `pyproject.toml` 一致、构建装的确实是锁里的版本，这些都不说明某个固定版本有没有已披露的漏洞。
+
+### 审计的对象
+
+门禁用与 `windows-build.yml` 相同的 uv 导出已提交的锁：
+
+```powershell
+uv export --frozen --format requirements-txt --no-hashes --all-extras --no-emit-project > requirements-locked.txt
+```
+
+`--frozen` 只读 `uv.lock`，不重新解析；`--all-extras` 把 dev 和 build 两组依赖一并导出；`--no-emit-project` 排除本项目自己。导出为空或被截断是这门禁最怕的假绿，所以审计之前先检查 `pyside6`、`httpx`、`keyring`、`qasync`、`pyinstaller`、`pytest` 都在，缺一个就失败。
+
+`pip-audit` 固定 `2.10.1`，用 `--no-deps` 只读这份锁定清单。它为 `-r` 建的临时环境里已经装了 `pip`、`wheel`、`setuptools`、`packaging`，被 pip 判为“已满足”的锁定项不进报告；门禁把这四项单列为只警告、不失败（当前是 `packaging` 和 `setuptools`），每次运行都写清自己没读到什么。四项之外，导出里有而报告里没有的锁定项算覆盖不全，判为不可信。对账还要求导出的每一行都能读成“名称==版本”加可选的环境标记，读不出来同样不可信。
+
+### 什么会让它失败
+
+- critical 或 high 漏洞。
+- 读不出严重级别。`pip-audit` 不报严重级别，门禁从 OSV 记录读 GitHub 的标签（`database_specific.severity`），优先查 `GHSA-` 编号，同一漏洞的多条记录合并成一条。查不到级别的按阻断处理：没人能分类的版本不算干净证据。只有 `pip-audit` 真找到漏洞时才请求 OSV，干净的一次运行不发请求。
+- 报告不可信：文件缺失、为空、截断或不是合法 JSON；有依赖 `pip-audit` 没能收集；`pip-audit` 的退出码不是 0 或 1，或者退出码是 1 而报告里没有漏洞。这几种都以 exit 2 结束。
+
+medium 和 low 会带编号和修复版本打印出来，不失败。处理办法是抬高 `pyproject.toml` 里的下限，或给传递依赖加约束，并记录这条漏洞为什么不适用；把门禁改绿不算。
+
+### 什么时候跑
+
+推送到 `main`；改了依赖输入的 PR（`pyproject.toml`、`uv.lock`、判据脚本及其测试、这个 workflow 本身）；每周一 04:37 UTC 的定时运行；手动 dispatch。漏洞是针对不会变的版本发布的，一周没有提交也可能变红。
+
+它刻意不是 `ci.yml` 里的 job，也不要设成 required status check。`pull_request.paths` 是 workflow 级过滤，不碰依赖文件的 PR 根本不会启动它；设成 required check，这类 PR 就会永远等一个不会出现的状态。挂进 `ci.yml` 则会让不碰依赖的 PR 跳过测试矩阵和 Windows 构建，让每周的定时运行顺带构建 EXE 和发布 ZIP，而 `ci.yml`、`windows-build.yml` 的 job 名是 `release.yml` 校验过的来源，加 job 会改变发布运行时看到的东西。
+
+### 它明确不覆盖什么
+
+- 只在 Windows 上生效的锁定项。审计跑在 Linux runner 上，`sys_platform == 'win32'` 的 3 项（`colorama`、`pefile`、`pywin32-ctypes`）和 `sys_platform == 'darwin'` 的 1 项（`macholib`）按标记排除，不计入覆盖缺口；本地在 Windows 上跑时，覆盖范围按本机平台重新计算。
+- PyInstaller 打进 `WuwaTerm.exe` 的第三方代码：门禁只看 PyPI 上的发行版，不看可执行文件内部。
+- 非 PyPI 来源：`contracts/sources.json` 固定的 Core、Web 源码和 Node 契约工具链不在审计范围内。
+- 审计之后才发布的漏洞，由下一次定时运行发现。
+
+### 本地怎么跑
+
+在仓库根目录，PowerShell 7（`pwsh`，与 `build.ps1` 相同；Windows PowerShell 5.1 的重定向默认写 UTF-16，判据脚本会拒绝这个文件）：
+
+```powershell
+uv export --frozen --format requirements-txt --no-hashes --all-extras --no-emit-project > requirements-locked.txt
+foreach ($name in 'pyside6','httpx','keyring','qasync','pyinstaller','pytest') {
+  if (-not (Select-String -Path requirements-locked.txt -Pattern "^$name==" -Quiet)) { throw "requirements-locked.txt is missing $name" }
+}
+uv run --no-project --python 3.12 --with pip-audit==2.10.1 python -m pip_audit -r requirements-locked.txt --no-deps --strict --progress-spinner off --format json -o pip-audit.json
+$status = $LASTEXITCODE
+uv run --no-project --python 3.12 --with pip-audit==2.10.1 python scripts/check_dependency_advisories.py pip-audit.json --audit-exit $status --export requirements-locked.txt
+```
+
+判据脚本要在带 `pip-audit` 的环境里跑，因为对账要用 `packaging` 解析环境标记；用裸 `python` 会报错。`requirements-locked.txt` 和 `pip-audit.json` 没有进 `.gitignore`，跑完删掉。
+
+### 失败时看哪里
+
+job 名是 `locked dependencies (critical/high)`。每条阻断的漏洞会有一条注释，写明包名、漏洞编号和修复版本。成功和失败都会上传 `dependency-audit-report-<run_attempt>`，内容是 `pip-audit.json` 和 `requirements-locked.txt`；名字带 attempt 号，重跑才不会和上一次的上传撞名。
+
 ## 发布
 
 `release.yml` 手动构建指定的完整 main 祖先提交，要求该提交的 main push CI 完整成功；默认只构建，取消 dry run 才创建草稿。草稿包含 ZIP、`SHA256SUMS` 和记录版本、源码提交、ZIP 哈希及未签名状态的 manifest。检查产物及实际 Windows 启动后，再单独发布草稿。发布草稿和构建是两个步骤。
