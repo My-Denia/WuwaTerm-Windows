@@ -26,6 +26,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<10",
+  # Read by tests/test_dependency_advisories.py, which asserts the dependency
+  # audit's trigger list, its pinned scanner and its artifact upload rather
+  # than trusting a workflow nobody re-reads.
+  "PyYAML>=6.0,<7",
 ]
 build = [
   "pyinstaller>=6.10,<7",
