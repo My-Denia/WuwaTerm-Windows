@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -181,6 +182,12 @@ class TermsView(QWidget):
         self.field_error = FieldError(self)
         self.progress = ProgressLine(self)
         self.status_label = StatusStrip(self)
+        # The status line is one row. Without a fixed vertical policy the
+        # empty-state layout gives it the leftover height and pushes the
+        # search row down with it.
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
 
         self.empty_card = EmptyStateCard(self)
 
@@ -315,6 +322,10 @@ class TermsView(QWidget):
 
         title = QLabel(strings.PAGE_TITLE_TERMS, self)
         title.setObjectName("contextTitle")
+        # Keep the page title one line high. A plain QLabel can absorb the
+        # leftover vertical space in the empty state, which makes the search
+        # row look vertically centered instead of attached to the heading.
+        title.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 10)
         layout.setSpacing(8)
