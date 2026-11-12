@@ -75,7 +75,7 @@ def test_parse_version_non_string_rejected(non_string: object) -> None:
 
 def test_get_package_version_agrees_with_repo() -> None:
     version = get_package_version(REPO_ROOT)
-    assert version == "0.4.0"
+    assert version == "0.4.1"
 
 
 def test_get_package_version_mismatch_raises(tmp_path: Path) -> None:
@@ -185,9 +185,9 @@ def test_render_version_info_structure() -> None:
 
 def test_render_version_info_default_resolves_package() -> None:
     rendered = render_version_info(root=REPO_ROOT)
-    assert "'FileVersion', '0.4.0'" in rendered
-    assert "'ProductVersion', '0.4.0'" in rendered
-    assert "filevers=(0, 4, 0, 0)" in rendered
+    assert "'FileVersion', '0.4.1'" in rendered
+    assert "'ProductVersion', '0.4.1'" in rendered
+    assert "filevers=(0, 4, 1, 0)" in rendered
 
 
 # == File generation =======================================================

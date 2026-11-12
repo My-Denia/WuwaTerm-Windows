@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.4.0**(已于 2026-11-10 发布,见下文「发布」一节的发布记录;下载步骤以它为例)。它有自己的版本号,与服务端的版本号分开走。
+当前版本 **0.4.1**(2026-11-12 发布,见下文「发布」一节的发布记录;下载步骤以它为例)。这是一次界面修复:未配置状态下术语查词页的标题和状态行不再拉伸,搜索框回到标题下方。它有自己的版本号,与服务端的版本号分开走。
 
 这个客户端说的是 HTTP 接口的 **`v1`** 版本 —— 也就是 `/v1/*` 这组路径,以及
 `GET /v1/meta` 回复里的 `api_version` 字段。稿件审校还需要服务端支持 `review-v2`;语义审校和翻译
@@ -30,11 +30,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载 `WuwaTerm-0.4.0-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
+1. 下载 `WuwaTerm-0.4.1-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.4.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.4.1-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
@@ -63,7 +63,7 @@ Get-FileHash .\WuwaTerm-0.4.0-windows-x64.zip -Algorithm SHA256
 
 ## 它能做什么
 
-以下为 0.4.0 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
+以下为 0.4.1 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
 
 - 通过共享的「词典优先」流水线翻译文本(`POST /v1/translations`),方向可自动判定,
   也可强制指定。
@@ -458,6 +458,7 @@ job 名是 `locked dependencies (critical/high)`。每条阻断的漏洞会有�
 
 ### 发布记录
 
+- v0.4.1（2026-11-12）：修复未配置状态下术语查词页的标题与状态行拉伸，搜索框回到标题下方；发布资产、源码提交与 ZIP SHA-256 在发布后补登。
 - v0.4.0（2026-11-10）：[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.0)，源码提交 `3b04b28d62bc22613a05f44f8d040d1a783f237a`，发布 CI 校验的 main push 运行 42811759415。`WuwaTerm-0.4.0-windows-x64.zip` 的 SHA-256 为 `32e56eace287be0f1d965c904dcb230a254b2b84570c3b11e7337cd1f81b4c83`。未做 Windows 代码签名。未在真机验收的项：多 DPI、混合 DPI 多屏、输入法（含候选窗位置修复）和视觉收尾，仍待 owner 设备验收；0.3.0 已知的 1 像素边框偏差也未重新核实。新能力需要 Core 0.8.0，旧版 Core 自动降级。
 - v0.3.0（2026-11-06）：[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.3.0)，源码提交 `cda93f01bf7803efe66ca695701cae678b320ef1`。
 
