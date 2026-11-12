@@ -407,7 +407,12 @@ class EmptyStateCard(QFrame):
         self._steps_layout.setSpacing(8)
         self._steps_host.setVisible(False)
 
-        self._action_host = QWidget(self)
+        # A QFrame, not a bare QWidget: the stylesheet's base `QWidget` rule
+        # paints the canvas colour, so this row drew a lighter band across the
+        # sunken card behind its button. `QFrame` is the container shape the
+        # stylesheet deliberately leaves transparent.
+        self._action_host = QFrame(self)
+        self._action_host.setObjectName("emptyAction")
         self._action_layout = QHBoxLayout(self._action_host)
         self._action_layout.setContentsMargins(0, 0, 0, 0)
         self._action_layout.setSpacing(8)
@@ -416,10 +421,20 @@ class EmptyStateCard(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
+        # The card fills whatever area its page gives it, so the leftover
+        # height has to land somewhere. Without these two stretches
+        # QBoxLayout shares it out among the rows themselves: on the lookup
+        # page a one-line title became a 285px box, its subtitle sat 250px
+        # below it, and the action row stretched into a band. Spacers take
+        # all of it, so every row keeps the height its text needs and the
+        # block stays together in the middle of the card - the same
+        # leftover-space-in-a-label defect the page title had, one level in.
+        layout.addStretch(1)
         layout.addWidget(self._title)
         layout.addWidget(self._subtitle)
         layout.addWidget(self._steps_host)
         layout.addWidget(self._action_host)
+        layout.addStretch(1)
 
     @property
     def title_text(self) -> str:

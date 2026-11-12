@@ -7,9 +7,16 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QMargins, QPoint, QRect  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QDialogButtonBox,
+    QLabel,
+    QPushButton,
+    QWidget,
+)
 
 from wuwaterm_client import strings, theme  # noqa: E402
+from wuwaterm_client.api import TermsResult  # noqa: E402
 from wuwaterm_client.config import APPEARANCE_LIGHT, ClientConfig  # noqa: E402
 from wuwaterm_client.ui import components  # noqa: E402
 from wuwaterm_client.ui.terms_view import TermsView  # noqa: E402
@@ -197,6 +204,64 @@ def test_terms_empty_state_keeps_the_search_under_the_title(qapp):
         assert title.height() < 40
         assert view.query_edit.geometry().top() < 100
         assert view.status_label.geometry().height() < 40
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize("size", [(1000, 700), (640, 380), (580, 380)])
+def test_terms_empty_state_keeps_its_copy_together(qapp, size):
+    """The card fills the page; the words inside it must stay one block.
+
+    The page title and the status line used to absorb the empty state's
+    leftover height, so they were given fixed vertical policies. The card took
+    the height instead - and the same distribution happened one level down
+    inside it: a one-line title became a 285px box, its subtitle sat 250px
+    below it, and the action row stretched into a band with the button
+    floating in the middle of it.
+
+    Every row here is a label whose text is one line at these widths, so the
+    numbers are about the layout, not about where the text happened to wrap.
+    """
+
+    class Configured:
+        is_configured = True
+
+    view = TermsView(Configured())
+    view.resize(*size)
+    view.show()
+    qapp.processEvents()
+    try:
+        # The real no-match state, through the view's own render path: title,
+        # subtitle and the bridge button that carries the query onward.
+        view._render_result(
+            TermsResult(query="音之门", matches=(), request_id="req-empty")
+        )
+        qapp.processEvents()
+        card = view.empty_card
+        title = card.findChild(QLabel, "emptyTitle")
+        subtitle = card.findChild(QLabel, "emptySubtitle")
+        action = card.findChild(QWidget, "emptyAction")
+        button = card.findChild(QPushButton)
+        assert title is not None and subtitle is not None and action is not None
+        assert button is not None and button.parentWidget() is action
+
+        # Each row keeps the height its text needs. Before this, the title
+        # was 40% of the card and the button sat in a band twice its height.
+        line = title.fontMetrics().height()
+        assert title.height() <= 2 * line
+        assert subtitle.height() <= 3 * line
+        assert action.height() <= 2 * button.height()
+
+        # The three lines are one block: the subtitle sits directly under the
+        # title, and the button directly under the subtitle, at the layout's
+        # own 8px spacing rather than wherever a share of the leftover height
+        # put them.
+        assert 0 <= subtitle.geometry().top() - title.geometry().bottom() <= 12
+        assert 0 <= action.geometry().top() - subtitle.geometry().bottom() <= 12
+
+        # ...and the block is centred in the card as a group.
+        block_centre = (title.geometry().top() + action.geometry().bottom()) / 2
+        assert abs(block_centre - card.height() / 2) <= 0.05 * card.height()
     finally:
         view.close()
 
