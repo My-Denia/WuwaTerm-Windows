@@ -458,7 +458,7 @@ job 名是 `locked dependencies (critical/high)`。每条阻断的漏洞会有�
 
 ### 发布记录
 
-- v0.4.2（2026-11-12）：修复空状态卡片内部行高被拉伸、动作行多出的底色带，并让查词区 Tab 顺序按查询→分类→搜索；发布资产与 SHA-256 在发布后补登。
+- v0.4.2（2026-11-12）：修复空状态卡片内部行高被拉伸、动作行多出的底色带，并让查词区 Tab 顺序按查询→分类→搜索。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.2)，源码提交 `14f0c36ce1767333a8c7bde0085594d61676ca12`，发布 CI 校验的 main push 运行 43224935120。`WuwaTerm-0.4.2-windows-x64.zip` 的 SHA-256 为 `824b694c9b157a121e04ddd4bebb77f8cac2e7eb371fd610e94b39edf05d8d47`。未做 Windows 代码签名；多 DPI、混合 DPI 多屏、输入法和视觉收尾仍待 owner 设备验收。
 - v0.4.1（2026-11-12）：修复未配置状态下术语查词页的标题与状态行拉伸，搜索框回到标题下方。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.1)，源码提交 `cd10a05a4e321700de946c6e3c65fc63bf3ed794`，发布 CI 校验的 main push 运行 43207816423。`WuwaTerm-0.4.1-windows-x64.zip` 的 SHA-256 为 `4d248a0ead40b905d2269698fce62e82152c49c9aff02881d8724ea3cf781cc9`。未做 Windows 代码签名。能力与 0.4.0 相同，无新增服务端能力要求；多 DPI、混合 DPI 多屏、输入法和视觉收尾仍待 owner 设备验收。
 - v0.4.0（2026-11-10）：[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.0)，源码提交 `3b04b28d62bc22613a05f44f8d040d1a783f237a`，发布 CI 校验的 main push 运行 42811759415。`WuwaTerm-0.4.0-windows-x64.zip` 的 SHA-256 为 `32e56eace287be0f1d965c904dcb230a254b2b84570c3b11e7337cd1f81b4c83`。未做 Windows 代码签名。未在真机验收的项：多 DPI、混合 DPI 多屏、输入法（含候选窗位置修复）和视觉收尾，仍待 owner 设备验收；0.3.0 已知的 1 像素边框偏差也未重新核实。新能力需要 Core 0.8.0，旧版 Core 自动降级。
 - v0.3.0（2026-11-06）：[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.3.0)，源码提交 `cda93f01bf7803efe66ca695701cae678b320ef1`。
