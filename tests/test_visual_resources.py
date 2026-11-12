@@ -15,10 +15,12 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QSize  # noqa: E402
 from PySide6.QtGui import QIcon, QPalette  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QFrame, QLabel, QListWidget, QPlainTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QFrame, QLabel, QListWidget, QPlainTextEdit, QPushButton, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
-from wuwaterm_client import theme  # noqa: E402
+from wuwaterm_client import strings, theme  # noqa: E402
+from wuwaterm_client.ui.components import EmptyStateCard  # noqa: E402
 from wuwaterm_client.ui.icons import icon  # noqa: E402
 
 CLIENT_ROOT = Path(__file__).resolve().parents[1]
@@ -213,3 +215,43 @@ def test_inspector_body_and_selected_finding_use_theme(qapp, preserve_theme, sch
         _assert_color(palette.color(QPalette.ColorRole.Window), QColor(tokens[background]))
         assert _contrast(palette.color(QPalette.ColorRole.WindowText), palette.color(QPalette.ColorRole.Window)) >= 4.5
     inspector.close()
+
+
+@pytest.mark.parametrize("scheme", [theme.SCHEME_LIGHT, theme.SCHEME_DARK])
+def test_empty_state_action_row_paints_the_card_not_the_canvas(qapp, preserve_theme, scheme):
+    """The card's action row is part of the card, not a panel laid over it.
+
+    The row was a bare ``QWidget``. The stylesheet's base ``QWidget`` rule
+    paints the canvas colour and Qt honours it for exactly that class, so the
+    row drew a lighter band across the sunken card behind its button - most
+    visible in the lookup area's no-match state, which is precisely where the
+    owner is reading two lines of copy and one button.
+
+    ``QFrame`` is the container shape this stylesheet leaves transparent, so
+    the test compares a point inside the row with a point on the card itself.
+    """
+    theme.apply_theme(qapp, scheme)
+    card = EmptyStateCard()
+    card.set_content(
+        strings.EMPTY_TERMS_NO_MATCH_TITLE,
+        strings.EMPTY_TERMS_NO_MATCH_SUBTITLE,
+        (strings.STATUS_REFRESH_BUTTON, lambda: None),
+    )
+    card.resize(600, 400)
+    card.show()
+    qapp.processEvents()
+    try:
+        title = card.findChild(QLabel, "emptyTitle")
+        button = card.findChild(QPushButton)
+        row = card.findChild(QWidget, "emptyAction")
+        assert title is not None and button is not None and row is not None
+        assert button.parentWidget() is row
+        image = card.grab().toImage()
+        # Inside the action row, beside its centred button, and on the card's
+        # own padding at the title's height. Both are background: one is the
+        # row, one is the card.
+        row_pixel = image.pixelColor(row.geometry().left() + 4, row.geometry().center().y())
+        card_pixel = image.pixelColor(row.geometry().left() // 2, title.geometry().center().y())
+        _assert_color(row_pixel, card_pixel)
+    finally:
+        card.close()
