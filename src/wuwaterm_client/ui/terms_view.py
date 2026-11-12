@@ -312,6 +312,9 @@ class TermsView(QWidget):
         self.category_filter.setAccessibleName(strings.TERMS_FILTER_LABEL)
         self.category_filter.addItem(strings.TERMS_FILTER_ALL, None)
         self.category_filter.currentIndexChanged.connect(self._filter_results)
+        # Keyboard order follows the visual row: query, category, search.
+        QWidget.setTabOrder(self.query_edit, self.category_filter)
+        QWidget.setTabOrder(self.category_filter, self.search_button)
 
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
