@@ -6,7 +6,8 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QMargins, QPoint, QRect  # noqa: E402
+from PySide6.QtCore import QMargins, QPoint, QRect, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QDialogButtonBox,
@@ -185,6 +186,25 @@ def _assert_reachable(window, control):
     assert control.width() > 0 and control.height() > 0
     bounds = QRect(control.mapTo(window, QPoint(0, 0)), control.size())
     assert window.rect().contains(bounds), (bounds, window.rect())
+
+
+def test_terms_tab_order_follows_the_visual_row(qapp):
+    class Configured:
+        is_configured = True
+
+    view = TermsView(Configured())
+    view.resize(1000, 700)
+    view.show()
+    view.query_edit.setFocus()
+    qapp.processEvents()
+    try:
+        assert qapp.focusWidget() is view.query_edit
+        QTest.keyClick(view.query_edit, Qt.Key.Key_Tab)
+        assert qapp.focusWidget() is view.category_filter
+        QTest.keyClick(view.category_filter, Qt.Key.Key_Tab)
+        assert qapp.focusWidget() is view.search_button
+    finally:
+        view.close()
 
 
 def test_terms_empty_state_keeps_the_search_under_the_title(qapp):
