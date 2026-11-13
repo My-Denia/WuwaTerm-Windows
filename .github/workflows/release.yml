@@ -11,7 +11,8 @@ on:
         type: boolean
         default: true
       validation_run_id:
-        description: Optional successful main-push CI run ID for this exact commit
+        description: Optional successful main CI run ID for this exact commit
+          (a push run, or a ci.yml dispatch run on main for the same commit)
         required: false
         type: string
 permissions:

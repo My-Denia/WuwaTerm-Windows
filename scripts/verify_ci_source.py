@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Require successful main-push CI for the exact source of a release."""
+"""Require successful main CI for the exact source of a release.
+
+A push run is the normal receipt. A manual dispatch run on main qualifies when
+its head SHA is that same source and every required job succeeded: ci.yml
+accepts workflow_dispatch so a documentation commit that skipped its push run
+can still be released with full CI evidence.
+"""
 from __future__ import annotations
 
 import json
@@ -9,6 +15,7 @@ import subprocess
 import sys
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+TRUSTED_EVENTS = {"push", "workflow_dispatch"}
 REQUIRED_JOBS = {"Pure manuscript contract", "Windows build and contracts / build and test"}
 
 
@@ -20,7 +27,8 @@ def verify_record(run: dict, jobs: list[dict], repository: str, source: str, wor
     require(bool(SHA.fullmatch(source)), "source must be a full commit SHA")
     require(run.get("workflow_id") == workflow_id, "wrong workflow")
     require(run.get("path", "").split("@", 1)[0] == ".github/workflows/ci.yml", "wrong workflow path")
-    require(run.get("event") == "push" and run.get("head_branch") == "main", "not a main push")
+    require(run.get("event") in TRUSTED_EVENTS and run.get("head_branch") == "main",
+            "not a main push or dispatch run")
     require(run.get("head_sha") == source, "CI source does not match release source")
     require(run.get("status") == "completed" and run.get("conclusion") == "success", "CI did not succeed")
     for field in ("repository", "head_repository"):
@@ -46,6 +54,8 @@ def verify_source(source: str, run_id: str | None = None) -> int:
             raise ValueError("run ID must be a positive integer")
         candidates = [int(run_id)]
     else:
+        # Only push runs are looked up automatically. A dispatch run has to be
+        # supplied by ID: its head SHA is the main tip when it was dispatched.
         result = gh_json(f"repos/{repository}/actions/workflows/ci.yml/runs", "--method", "GET",
                          "-f", "branch=main", "-f", "event=push", "-f", f"head_sha={source}",
                          "-F", "per_page=100")
@@ -62,7 +72,9 @@ def verify_source(source: str, run_id: str | None = None) -> int:
             return candidate
         except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:
             errors.append(f"{candidate}: {exc}")
-    raise ValueError("No successful main-push CI for the exact source: " + ("; ".join(errors) or "no matching run"))
+    raise ValueError("No successful main push or dispatch CI for the exact source"
+                     " (pass the dispatch run ID as the second argument if that is the only run): "
+                     + ("; ".join(errors) or "no matching run"))
 
 
 def main() -> int:
