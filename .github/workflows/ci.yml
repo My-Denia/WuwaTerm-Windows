@@ -1,8 +1,29 @@
 name: CI
+# Documentation-only changes cannot reach runtime behaviour, contracts,
+# dependencies or the packaged executable, so they skip the Windows upload and
+# build: #17 changed one README line and spent 14m47s on windows-latest. A
+# release always bumps the version in pyproject.toml and
+# src/wuwaterm_client/__init__.py, which are not ignored, so a release source
+# keeps its own full run. workflow_dispatch keeps a full run available for a
+# documentation commit that skipped its push run; release.yml accepts that run
+# through scripts/verify_ci_source.py.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'README.*.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'provenance/**'
   pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'README.*.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'provenance/**'
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
