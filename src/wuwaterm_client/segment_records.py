@@ -89,7 +89,8 @@ def with_parts(payload: Mapping[str, Any], parts: Parts) -> dict:
     history entries the three keys are removed, leaving a plain v1/v2 draft."""
     value = dict(payload)
     if parts.segments or parts.history:
-        value.update(segments=list(parts.segments), segment_choice_history=list(parts.history),
+        # The lists themselves, so an unchanged part keeps its identity.
+        value.update(segments=parts.segments, segment_choice_history=parts.history,
                      progress=parts.progress if parts.segments else _empty_progress())
     else:
         for key in _PART_KEYS:
@@ -750,6 +751,32 @@ def _map_progress(progress: Mapping, old: list, match: list, records: list, core
             current = None
     value = {"current": current, "completed": completed}
     return progress if value == progress else value
+
+
+def carry_results(parts: Parts, later: Parts) -> Parts:
+    """Undo or redo: ``parts`` is the restored snapshot, ``later`` what it replaces.
+
+    A restored record without a done result takes the done result of a later
+    record with the same stored hashes and the same choices, so a check made
+    after the snapshot is not lost. Call ``normalize`` afterwards: it compares
+    the hashes with the current cores again, so a carried result is kept only
+    where the content really is the one it was computed for."""
+    done: dict[tuple[str, str], list[dict]] = {}
+    for record in later.segments:
+        if record["status"] == "done":
+            done.setdefault((record["source_hash"], record["target_hash"]), []).append(record)
+    if not done:
+        return parts
+    segments = []
+    for record in parts.segments:
+        if record["status"] != "done":
+            match = next((r for r in done.get((record["source_hash"], record["target_hash"]), ())
+                          if r["choices"] == record["choices"]), None)
+            if match is not None:
+                record = {**match, **{key: record[key] for key in (
+                    "index", "source_start", "source_end", "target_start", "target_end")}}
+        segments.append(record)
+    return parts._replace(segments=_shared(parts.segments, segments))
 
 
 # ---- history and progress (SPEC "Runtime" step 8, "Progress") ----
