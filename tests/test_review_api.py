@@ -75,6 +75,51 @@ def test_review_sends_v2_basis_and_accepts_current_spans() -> None:
     }
 
 
+CONTEXT = {"source_revision": hashlib.sha256(SOURCE.encode()).hexdigest(), "rule_version": "review-v2",
+           "dictionary_revision": "b" * 64, "matcher_revision": "a" * 64}
+RESOLUTION = {"mention_id": f'{SOURCE.rindex("今汐")}:{SOURCE.rindex("今汐") + 2}:今汐',
+              "choice": "official_pair", "candidate_id": "c" * 64}
+
+
+@pytest.mark.parametrize("resolutions", [[RESOLUTION], []])
+def test_review_sends_resolutions_and_context_only_when_there_are_resolutions(resolutions: list) -> None:
+    seen = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=report())
+
+    async def scenario() -> None:
+        client = make_client(handler)
+        try:
+            await client.review_pair(SOURCE, TARGET, "en", resolutions=resolutions, resolution_context=CONTEXT)
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+    assert seen[0].headers["x-wuwaterm-matcher-basis"] == "1"
+    expected = {"source": SOURCE, "target": TARGET, "direction": "en", "review_version": "review-v2"}
+    if resolutions:
+        # Core rejects a null v2 field, so an empty list sends neither key.
+        expected |= {"resolutions": [RESOLUTION], "resolution_context": CONTEXT}
+    assert json.loads(seen[0].content) == expected
+
+
+def test_resolutions_without_context_fail_before_any_request() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("unexpected network request")
+
+    async def scenario() -> None:
+        client = make_client(handler)
+        try:
+            with pytest.raises(ValueError):
+                await client.review_pair(SOURCE, TARGET, "en", resolutions=[RESOLUTION])
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("change", ["source_revision", "target_revision", "span", "matcher", "schema"])
 def test_review_rejects_unusable_or_wrong_draft_report(change: str) -> None:
     payload = copy.deepcopy(report())
