@@ -3605,7 +3605,11 @@ class ManuscriptView(QWidget):
         history = [] if long else payload["history"]
         latest = snapshot(history[-1] if history else None)
         previous = snapshot(history[-2] if len(history) > 1 else None)
-        current = bool(latest and latest["trusted"] and latest["source"] == source and latest["target"] == target
+        # The Web's rule: checked in this session, for exactly this text, and
+        # the workbench still holds it as the current report (an endpoint
+        # change or a failed re-review ends that, though the text is the same).
+        current = bool(latest and latest["trusted"] and self._review_state == "current"
+                       and latest["source"] == source and latest["target"] == target
                        and latest["direction"] == direction and latest["alignments"] == payload["alignments"])
         currency = "none" if latest is None else "current" if current else "stale" if latest["trusted"] else "imported"
         draft = {"source": source, "target": target, "direction": direction, "alignments": payload["alignments"]}
@@ -3680,6 +3684,10 @@ class ManuscriptView(QWidget):
         if not name:
             return False
         destination = Path(name)
+        if self._path is not None and destination.resolve() == self._path.resolve():
+            # A report is not a manuscript: never replace the open one with it.
+            self.status_label.setText(strings.MANUSCRIPT_EXPORT_OVER_MANUSCRIPT)
+            return False
         content = self.report_markdown().encode("utf-8")
         try:
             fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)

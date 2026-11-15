@@ -98,6 +98,7 @@ MANUSCRIPT_EXPORT_REPORT = "导出报告"
 MANUSCRIPT_REPORT_FILTER = "Markdown 审校报告 (*.md);;所有文件 (*)"
 MANUSCRIPT_EXPORT_DONE = "已导出 Markdown 审校报告：只读快照，未认证整句语义。它不是稿件，不能打开续作，也没有改变稿件的保存状态。"
 MANUSCRIPT_EXPORT_FAILED = "无法导出报告：{reason}"
+MANUSCRIPT_EXPORT_OVER_MANUSCRIPT = "不能把报告导出到当前打开的稿件文件：报告不是稿件，会覆盖已保存的稿件。请换一个文件名。"
 MANUSCRIPT_REPORT_NOT_MANUSCRIPT = ("这是 WuwaTerm 导出的审校报告，不是稿件，不能打开续作；当前稿件未被替换。"
                                     "请打开「保存稿件」生成的 .json 稿件文件。")
 MANUSCRIPT_REPLACEMENT = "替换为"

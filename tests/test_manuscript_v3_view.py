@@ -601,3 +601,43 @@ def test_a_long_manuscript_report_leaves_out_a_document_report_from_a_shorter_te
         text = exported(view, tmp_path / "report.md", monkeypatch)
         assert "## 结论摘要" not in text and "当前没有审校报告" in text
     asyncio.run(scenario())
+
+
+class FailingCore(Core):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = False
+
+    def review(self, body: dict) -> httpx.Response:
+        return self.refuse(500, "internal") if self.failing else super().review(body)
+
+
+def test_a_short_report_is_current_only_while_the_workbench_says_so(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        core = FailingCore()
+        view = make_view(core, "甲术在此。", "Alpha here.")
+        report = tmp_path / "report.md"
+        await review(view)
+        assert "当前报告：与当前文本" in exported(view, report, monkeypatch)
+        # Another service: the report was checked in this session, but not by it.
+        view.reset_for_endpoint_change()
+        assert view._review_state == "stale"
+        assert "需要重新核对：报告与当前文本或选择已不一致" in exported(view, report, monkeypatch)
+        core.failing = True
+        await review(view)
+        assert view._review_state == "error"
+        text = exported(view, report, monkeypatch)
+        assert "当前报告：与当前文本" not in text and "需要重新核对" in text
+    asyncio.run(scenario())
+
+
+def test_a_report_never_overwrites_the_open_manuscript(qapp, tmp_path, monkeypatch) -> None:
+    view = make_view(Core(), "甲术在此。", "Alpha here.")
+    view._path = tmp_path / "work.json"
+    assert view.save_document()
+    before = view._path.read_bytes()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        lambda *args, **kwargs: (str(tmp_path / "." / "work.json"), ""))
+    assert not view.export_report()
+    assert view._path.read_bytes() == before and not view.document_dirty
+    assert view.status_label.text() == strings.MANUSCRIPT_EXPORT_OVER_MANUSCRIPT
