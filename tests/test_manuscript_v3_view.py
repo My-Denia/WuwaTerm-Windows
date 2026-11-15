@@ -540,3 +540,45 @@ def test_a_short_manuscript_report_states_current_stale_or_imported(qapp, tmp_pa
         assert view.open_path(tmp_path / "short.json")
         assert "导入的历史报告：来自稿件文件，未经本次会话验证" in exported(view, report, monkeypatch)
     asyncio.run(scenario())
+
+
+class TruncatingCore(Core):
+    """Core's answer for the segment holding ``marker`` is truncated, and its
+    findings' candidate lists are cut too."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+
+    def review(self, body: dict) -> httpx.Response:
+        response = super().review(body)
+        if response.status_code != 200 or self.marker not in body["source"]:
+            return response
+        data = response.json()
+        data["truncated"] = True
+        for finding in data["findings"]:
+            finding["candidates_truncated"] = True
+        return httpx.Response(200, json=data)
+
+
+def test_a_truncated_segment_says_it_has_more_findings_and_still_takes_choices(qapp) -> None:
+    async def scenario():
+        view = make_view(TruncatingCore("甲术段02"))
+        await review(view)
+        view._show_track(TRACK_SEGMENTS)
+        rows = [view.segment_list.item(i).text() for i in range(view.segment_list.count())]
+        marked = [strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK in row for row in rows]
+        assert marked == [False, True, False]
+        select_segment(view, 1)
+        assert strings.MANUSCRIPT_SEGMENT_HINT["term_truncated"] in view.segment_hint.text()
+        view._show_track(TRACK_TERMS)
+        row = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 1)
+        view.findings.setCurrentRow(row)
+        notes = view.candidates_label.text()
+        assert strings.MANUSCRIPT_CANDIDATES_TRUNCATED in notes and strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED in notes
+        choose(view, 1, 0)  # the shown finding still takes a choice
+        assert [c["confirmed"] for c in view._payload["segments"][1]["choices"]] == [True]
+        other = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 0)
+        view.findings.setCurrentRow(other)
+        assert strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED not in view.candidates_label.text()
+    asyncio.run(scenario())

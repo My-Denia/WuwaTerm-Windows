@@ -1805,6 +1805,8 @@ class ManuscriptView(QWidget):
             record = records[pair.index]
             if pair.index in sr.parts_of(self._payload).progress["completed"]:
                 status += strings.MANUSCRIPT_SEGMENT_FINISHED_MARK
+            if record["result"] is not None and record["result"]["truncated"]:
+                status += strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK
             if record["choices"]:
                 unconfirmed = sum(1 for choice in record["choices"] if not choice["confirmed"])
                 status += strings.MANUSCRIPT_SEGMENT_CHOICES_MARK.format(count=len(record["choices"])) + (
@@ -1831,6 +1833,8 @@ class ManuscriptView(QWidget):
             hints.extend(self._segment_notes.get(self._segment_key(pair), []))
             if record is not None and status != "reviewed" and pair.index in sr.parts_of(self._payload).progress["completed"]:
                 hints.append(strings.MANUSCRIPT_SEGMENT_HINT["finished_recheck"])
+            if record is not None and record["result"] is not None and record["result"]["truncated"]:
+                hints.append(strings.MANUSCRIPT_SEGMENT_HINT["term_truncated"])
             self.segment_hint.setText("\n".join(hints))
             self.translate_segment_button.setVisible(pair.status == STATUS_UNTRANSLATED)
             self.translate_segment_button.setEnabled(self._translate_ready())
@@ -2140,8 +2144,14 @@ class ManuscriptView(QWidget):
                 positions.append(strings.MANUSCRIPT_POSITION.format(side=side, start=span["start"] + 1, end=span["end"]))
         self.finding_positions.setText("\n".join(positions))
         pairs = [self._candidate_text(item) for item in finding["candidates"]]
+        # Choices stay open on what is shown; the notes say what is not.
+        notes = [strings.MANUSCRIPT_CANDIDATES_TRUNCATED] if finding["candidates_truncated"] else []
+        ref = self._finding_record(index)
+        record = self._payload["segments"][ref[0]] if ref is not None else None
+        if record is not None and record["result"] is not None and record["result"]["truncated"]:
+            notes.append(strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED)
         self.candidates_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.candidates_label.setText("\n".join([strings.MANUSCRIPT_CANDIDATES, *pairs]))
+        self.candidates_label.setText("\n".join([strings.MANUSCRIPT_CANDIDATES, *pairs, *notes]))
         self.lookup_button.setVisible(bool(source.get("text")))
         reliable = self._target_span_reliable(target)
         self.manual_edit_label.setVisible(not reliable)

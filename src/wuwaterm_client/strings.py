@@ -601,6 +601,7 @@ MANUSCRIPT_SEGMENT_HINT = {
     "saved": "这一段的术语结果是保存时的结果。开始审校时会先与服务核对一次，内容和依据都没变就直接沿用，不再重复审校。",
     "stale": "这一段的术语结果已过期（审校依据、段落对应或选择有变），下次审校会重新核对。",
     "finished_recheck": "这一段已标记完成，结果待重新核对。",
+    "term_truncated": "这一段的术语报告已截断：发现多于列出的条数，列出的不是一次完整核对；仍可对列出的发现做选择。",
     "not_reviewed": "模型这次的输出无法使用，这一段没有审校；继续审校时会重试。",
     "truncated": "这一段疑点较多，另有 {count} 条没有显示。",
     "dropped": "模型提出的 {count} 条疑点无法在正文中定位，已舍弃。",
@@ -673,6 +674,10 @@ MANUSCRIPT_TERM_CHOICE_REMOVED = "已移除这一处的术语选择；可以撤�
 MANUSCRIPT_TERM_CHOICE_FAILED = "当前结果里已没有这一处或这个候选，选择没有记录。"
 MANUSCRIPT_CHOICE_OFFICIAL_SHORT = "官方术语 {candidate}"
 MANUSCRIPT_SEGMENT_FINISHED_MARK = "，已标记完成"
+MANUSCRIPT_SEGMENT_TRUNCATED_MARK = "，术语报告已截断"
+# Parallel to the Web report's 「报告已截断…」 and 「候选词对已截断…」.
+MANUSCRIPT_FINDING_SEGMENT_TRUNCATED = "所在段落的术语报告已截断：这一段的发现多于列出的条数，列出的不是一次完整核对。"
+MANUSCRIPT_CANDIDATES_TRUNCATED = "候选词对已截断：可能仍有未显示的官方候选。"
 MANUSCRIPT_SEGMENT_CHOICES_MARK = "，选择 {count} 条"
 MANUSCRIPT_SEGMENT_RECONFIRM_MARK = "（{count} 条待重新确认）"
 MANUSCRIPT_SEGMENT_FINISH = "标记完成"
