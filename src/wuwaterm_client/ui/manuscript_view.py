@@ -3629,11 +3629,15 @@ class ManuscriptView(QWidget):
                         findings.append({"verdict": finding["verdict"],
                                          "source_span": _offset(finding["source_span"], record["source_start"]),
                                          "target_span": _offset(finding["target_span"], record["target_start"]),
-                                         "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]]})
+                                         "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]],
+                                         "candidates_truncated": finding["candidates_truncated"] is True})
                 choices = [{**choice, "source_span": _offset(choice["source_span"], record["source_start"])}
                            for choice in record["choices"]]
+                # Truncation goes with the row, so an export never reads complete
+                # when findings or candidates were left out.
+                truncated = record["result"] is not None and record["result"]["truncated"] is True
                 segment_terms.append({"index": index, "state": state, "stale": state != "current",
-                                      "findings": findings, "choices": choices})
+                                      "truncated": truncated, "findings": findings, "choices": choices})
         semantic_part = None
         issues = self._session.issues()
         if issues or self._decisions():
