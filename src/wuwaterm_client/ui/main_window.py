@@ -303,6 +303,7 @@ class MainWindow(QMainWindow):
         add(file_menu, strings.MANUSCRIPT_OPEN, "Ctrl+O", view.open_document)
         add(file_menu, strings.MANUSCRIPT_SAVE, "Ctrl+S", view.save_document)
         add(file_menu, strings.MANUSCRIPT_SAVE_AS, "Ctrl+Shift+S", lambda: view.save_document(save_as=True))
+        add(file_menu, strings.MANUSCRIPT_EXPORT_REPORT, None, view.export_report)
         file_menu.addSeparator()
         add(file_menu, strings.MANUSCRIPT_NEW_FROM_CLIPBOARD, None, view.new_from_clipboard)
         self.recent_menu = file_menu.addMenu(strings.RECENT_MENU)

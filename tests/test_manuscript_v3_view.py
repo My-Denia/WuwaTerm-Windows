@@ -14,7 +14,7 @@ import json
 import httpx
 import pytest
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from test_manuscript_semantic import issue as semantic_issue, semantic_report
 from wuwaterm_client import strings
@@ -444,4 +444,213 @@ def test_an_edit_while_a_refused_request_is_out_sends_no_fallback_for_the_old_se
             await asyncio.wait(tasks)
         assert view._semantic_state != "error"
         assert len(core.sent()) == sent, "no fallback for a segment that is gone"
+    asyncio.run(scenario())
+
+
+class HeldCore(Core):
+    """Holds every review request until the test opens ``gate``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.gate.set()
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/reviews":
+            await self.gate.wait()
+        return Core.__call__(self, request)
+
+
+def test_the_running_label_names_the_segment_in_flight_not_the_count_plus_one(qapp) -> None:
+    async def scenario():
+        core = HeldCore()
+        view = make_view(core)
+        await review(view)
+        type_at(view.source_edit, 3, "改")  # inside segment 1 of 3; the other two stay current
+        view._refresh_derived()
+        assert statuses(view) == ["pending", "reviewed", "reviewed"]
+        core.gate.clear()
+        before = len(core.sent())
+        view._start_review()
+        for _ in range(500):
+            if view._session.pending is not None:
+                break
+            await asyncio.sleep(0)
+        view._render_semantic_progress()
+        # Two of three are already reviewed; the one being checked is the first.
+        assert view.semantic_progress.text().startswith(
+            strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=1, count=3, done=2, total=3))
+        core.gate.set()
+        for _ in range(200):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                break
+            await asyncio.wait(tasks)
+        assert len(core.sent()) == before + 1 and statuses(view) == ["reviewed"] * 3
+    asyncio.run(scenario())
+
+
+def exported(view: ManuscriptView, path, monkeypatch) -> str:
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(path), ""))
+    assert view.export_report()
+    return path.read_text(encoding="utf-8")
+
+
+def test_a_report_export_sends_nothing_changes_nothing_and_is_not_a_manuscript(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        assert "当前报告：与当前文本" in exported(view, tmp_path / "first.md", monkeypatch), "every segment current"
+        choose(view, 1, 0)  # 甲术 in segment 2: the official pair; the segment awaits its re-check
+        view._path = tmp_path / "work.json"
+        assert view.save_document()
+        sent, saved = len(core.requests), view._saved_payload
+        report = tmp_path / "report.md"
+        text = exported(view, report, monkeypatch)
+        assert "需要重新核对：报告与当前文本或选择已不一致" in text
+        assert len(core.requests) == sent and view._saved_payload is saved and not view.document_dirty
+        assert view.document_path == tmp_path / "work.json"
+        assert "## 逐段术语核对（3 段）" in text and "### 第 1 段\n" in text
+        assert "### 第 2 段 · 需重新核对：文字、对应方式、选择或服务依据已变化" in text
+        start = SOURCE.index("甲术段02")
+        assert f"- 术语选择 · `甲术` · 原文位置 {start + 1}–{start + 2} · `甲术` / `Alpha` · 已确认，随核对提交" in text
+        # A report never opens or imports as a manuscript; the open document stays.
+        assert not view.open_path(report)
+        assert view.status_label.text() == strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT
+        assert not view.import_files([str(report)], "source")
+        assert view.status_label.text() == strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT
+        assert view.document_path == tmp_path / "work.json" and view._payload["source"] == SOURCE
+        view.new_document()
+        assert view.open_path(tmp_path / "work.json")
+        assert "### 第 1 段 · 来自已保存的稿件，尚未与当前服务确认" in exported(view, report, monkeypatch)
+        assert core.requests[sent:] == [], "neither the exports nor the reopening sent anything"
+    asyncio.run(scenario())
+
+
+def test_a_short_manuscript_report_states_current_stale_or_imported(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core, "甲术在此。", "Alpha here.")
+        report = tmp_path / "report.md"
+        assert "当前没有审校报告" in exported(view, report, monkeypatch)
+        await review(view)
+        text = exported(view, report, monkeypatch)
+        assert "当前报告：与当前文本、方向和已提交的局部选择一致。" in text and "### 1. 与所选词对冲突 · `甲术`" in text
+        type_at(view.target_edit, 0, "x")
+        assert "需要重新核对：报告与当前文本或选择已不一致" in exported(view, report, monkeypatch)
+        view._path = tmp_path / "short.json"
+        assert view.save_document()
+        view.new_document()
+        assert view.open_path(tmp_path / "short.json")
+        assert "导入的历史报告：来自稿件文件，未经本次会话验证" in exported(view, report, monkeypatch)
+    asyncio.run(scenario())
+
+
+class TruncatingCore(Core):
+    """Core's answer for the segment holding ``marker`` is truncated, and its
+    findings' candidate lists are cut too."""
+
+    def __init__(self, marker: str) -> None:
+        super().__init__()
+        self.marker = marker
+
+    def review(self, body: dict) -> httpx.Response:
+        response = super().review(body)
+        if response.status_code != 200 or self.marker not in body["source"]:
+            return response
+        data = response.json()
+        data["truncated"] = True
+        for finding in data["findings"]:
+            finding["candidates_truncated"] = True
+        return httpx.Response(200, json=data)
+
+
+def test_a_truncated_segment_says_it_has_more_findings_and_still_takes_choices(qapp) -> None:
+    async def scenario():
+        view = make_view(TruncatingCore("甲术段02"))
+        await review(view)
+        view._show_track(TRACK_SEGMENTS)
+        rows = [view.segment_list.item(i).text() for i in range(view.segment_list.count())]
+        shown = len(view._payload["segments"][1]["result"]["findings"])
+        mark = strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK.format(count=shown)
+        assert [mark in row for row in rows] == [False, True, False]
+        note = strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(number=2, count=shown)
+        select_segment(view, 1)
+        assert note in view.segment_hint.text()
+        view._show_track(TRACK_TERMS)
+        row = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 1)
+        view.findings.setCurrentRow(row)
+        notes = view.candidates_label.text()
+        assert strings.MANUSCRIPT_CANDIDATES_TRUNCATED in notes and note in notes
+        choose(view, 1, 0)  # the shown finding still takes a choice
+        assert [c["confirmed"] for c in view._payload["segments"][1]["choices"]] == [True]
+        other = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 0)
+        view.findings.setCurrentRow(other)
+        assert note not in view.candidates_label.text()
+    asyncio.run(scenario())
+
+
+def test_a_long_manuscript_report_leaves_out_a_document_report_from_a_shorter_text(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        view = make_view(Core(), "甲术在此。", "Alpha here.")
+        await review(view)
+        assert view._payload["history"], "the short text has a document report"
+        type_at(view.source_edit, len("甲术在此。"), "\n\n" + "文" * 2100)
+        view._refresh_derived()
+        text = exported(view, tmp_path / "report.md", monkeypatch)
+        assert "## 结论摘要" not in text and "当前没有审校报告" in text
+    asyncio.run(scenario())
+
+
+class FailingCore(Core):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failing = False
+
+    def review(self, body: dict) -> httpx.Response:
+        return self.refuse(500, "internal") if self.failing else super().review(body)
+
+
+def test_a_short_report_is_current_only_while_the_workbench_says_so(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        core = FailingCore()
+        view = make_view(core, "甲术在此。", "Alpha here.")
+        report = tmp_path / "report.md"
+        await review(view)
+        assert "当前报告：与当前文本" in exported(view, report, monkeypatch)
+        # Another service: the report was checked in this session, but not by it.
+        view.reset_for_endpoint_change()
+        assert view._review_state == "stale"
+        assert "需要重新核对：报告与当前文本或选择已不一致" in exported(view, report, monkeypatch)
+        core.failing = True
+        await review(view)
+        assert view._review_state == "error"
+        text = exported(view, report, monkeypatch)
+        assert "当前报告：与当前文本" not in text and "需要重新核对" in text
+    asyncio.run(scenario())
+
+
+def test_a_report_never_overwrites_the_open_manuscript(qapp, tmp_path, monkeypatch) -> None:
+    view = make_view(Core(), "甲术在此。", "Alpha here.")
+    view._path = tmp_path / "work.json"
+    assert view.save_document()
+    before = view._path.read_bytes()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName",
+                        lambda *args, **kwargs: (str(tmp_path / "." / "work.json"), ""))
+    assert not view.export_report()
+    assert view._path.read_bytes() == before and not view.document_dirty
+    assert view.status_label.text() == strings.MANUSCRIPT_EXPORT_OVER_MANUSCRIPT
+
+
+def test_two_short_checks_in_a_session_compare_as_automatic_checks(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        view = make_view(Core(), "甲术在此。", "Alpha here.")
+        await review(view)
+        type_at(view.target_edit, len("Alpha here."), " Again.")  # only the translation changes
+        await review(view)
+        # Both checks sent no resolutions; the file and the comparison say so.
+        assert [snapshot["resolutions"] for snapshot in view._payload["history"]] == [[], []]
+        text = exported(view, tmp_path / "report.md", monkeypatch)
+        assert "### 仍待确认（1）" in text and "前后选择不同或选择记录未知" not in text
     asyncio.run(scenario())

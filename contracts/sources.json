@@ -30,13 +30,13 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "c4e9beb31356cc978a6925a011a6798274913c4d",
+    "commit": "7f9a73c34ea3e0063450dbad0985104843b198ad",
     "files": {
       "package.json": "28e114f54b75c4299c72b2c5797aac51a93a07d5915a23a12694c6617e37ded9",
-      "lib/manuscript.js": "ffb939f691efa7b61c1c2928feca1fced6f1e1f87baac35573038e8df78c16cd",
+      "lib/manuscript.js": "ede1fa15b8e1671a144b8ee66ef22989cc06d1e13fb9a251fa9b16d3cb478e5a",
       "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
       "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
-      "docs/manuscript-v2.md": "048532da011039ee7653daf6eb0d6953354d474378386dee699694c14a59ba95",
+      "docs/manuscript-v2.md": "adc03eaa25a93d6d9398d9c56ee0198e41c38d73ddb49f4bee848a78487354f4",
       "contracts/manuscript-v2/cases.json": "fb846d23f40d257b38910c0251d19c63f91469fe33b1f006733e5617b7f94886",
       "contracts/manuscript-v2/invalid-129-decisions.json": "6f597aad8f6df0bc33d6bfccce41bd572d19177c37dd1a9560a1a4831c96b80b",
       "contracts/manuscript-v2/invalid-bad-hex.json": "3bdbd3509078196fde01be06b52bae84d345e5b33b9d8998196594768153323b",
@@ -45,8 +45,8 @@
       "contracts/manuscript-v2/invalid-ignored-with-text.json": "35cdecc33f5a5ff3c33a755b2381a9f4f0693e5ae77e9865b5b119188e381763",
       "contracts/manuscript-v2/invalid-unknown-key.json": "9102960ff2e071f21d3a8f230b503f85cf36d743e640a7cf5a659c5f6b90b043",
       "contracts/manuscript-v2/valid-all-parts.json": "e7de60c3e934267a9a25aa10a1144d249734f742c759493d18aa4261d3f32363",
-      "contracts/manuscript-v3/SPEC.md": "344832dc48116ac5ef12e697680b9664fb016634a94056d9d2d108f1dd422714",
-      "contracts/manuscript-v3/cases.json": "9f2586cb9448aa34212e74d803803cd93512f47504894f244d51a06813091c92",
+      "contracts/manuscript-v3/SPEC.md": "93a0df5442952890fd86ba61498f6d94b0bd98b61a87651e750e9a2507f7c1cb",
+      "contracts/manuscript-v3/cases.json": "7e0883cbb1c583d42226cd03d11c2d5687210b217661e784462f5f71336c7042",
       "contracts/manuscript-v3/invalid-v3-33-choices.json": "42b57ca834faee19701169dd7064073cac872a6ec586e7096b12852b76f980ab",
       "contracts/manuscript-v3/invalid-v3-33-fields.json": "6617e9c6dd6cc8b2866950f48ea81b76f9210bfa2655f03d122e6eee25e09513",
       "contracts/manuscript-v3/invalid-v3-33-findings.json": "9da53bb9ba4148a743efaeca6968a608066b05788bd46aa1c5b4e6e2002a85de",
@@ -103,7 +103,13 @@
       "contracts/manuscript-v3/valid-v3-inputs-not-current.json": "c475a8afcd0c0f9331412373724156684bf9acf9365d6b9a43edb67377358d7e",
       "contracts/manuscript-v3/valid-v3-integral-numbers.json": "7e5e4d437660601a579d89d055d123e0d3f4c1e5041b7e0e6b22ea3d5d310b5a",
       "contracts/manuscript-v3/valid-v3-over-1mib.json": "42cf30cec812388a19504c78502a38f96fefaa3c15aebc8eace98ec37e041cd6",
-      "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae"
+      "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
+      "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
+      "lib/markdown-report.ts": "c486598b9cb5b85c3898b0385c155ef3e9ad4c3fd5dbaa8083b448613a6bc7dd",
+      "lib/messages.ts": "5df7ea51300289da0283f3db97d20f0b72128f93ef9c4945e75daf0543b32019",
+      "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
+      "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
+      "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c"
     }
   }
 }
