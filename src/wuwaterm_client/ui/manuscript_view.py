@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import copy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
@@ -85,6 +86,31 @@ def _core_key(source_core: tuple[int, int], target_core: tuple[int, int], source
 
 def _blank(text: str) -> bool:
     return all(char in WHITESPACE for char in text)
+
+
+@dataclass
+class _Translation:
+    """One translation run and, once it stops, the cursor to resume it.
+
+    ``target`` is what the next finished pieces are written onto: the blank
+    target the run started from (``written`` False: they replace it) or the
+    target as the partial write left it (``written`` True: they are appended).
+    ``segment`` is the source start of a single untranslated segment, or None
+    for the whole manuscript. ``out`` holds the pieces finished since the last
+    write, each with its separators exactly as a full run writes them.
+    """
+    generation: int
+    source: str
+    direction: str
+    target: str
+    segment: int | None = None
+    written: bool = False
+    retry: bool = False
+    next_piece: int = 0
+    done: int = 0
+    count: int = 0
+    previous: tuple[str, str] | None = None
+    out: list[str] = field(default_factory=list)
 
 
 def _display_map(raw: str) -> tuple[str, list[int]]:
@@ -523,6 +549,12 @@ class ManuscriptView(QWidget):
         self._refreshing_lists = False
         self._translate_task: asyncio.Task | None = None
         self._translate_generation = 0
+        # idle | waiting | retrying | paused | failed. In paused and failed the
+        # run record is the resume cursor; it is kept only while the source,
+        # direction and target are exactly what the run left.
+        self._translate_state = "idle"
+        self._translate_run: _Translation | None = None
+        self._translate_status = ""
         # Pairing a long manuscript is not free; typing never waits for it.
         self._derived_timer = QTimer(self)
         self._derived_timer.setSingleShot(True)
@@ -1780,6 +1812,7 @@ class ManuscriptView(QWidget):
                 self.lookup_requested.emit(term)
 
     def _update_controls(self) -> None:
+        self._sync_translation()
         busy = self._busy()
         composing = self.source_edit._ime_active or self.target_edit._ime_active
         # Long manuscripts are reviewed per segmentation-v1 pair, so any
@@ -1792,9 +1825,11 @@ class ManuscriptView(QWidget):
         self.review_button.setText(strings.MANUSCRIPT_REVIEW_CONTINUE if partial else strings.MANUSCRIPT_REVIEW)
         self.cancel_button.setEnabled(busy)
         self.cancel_button.setVisible(busy)
-        self.cancel_button.setText(strings.MANUSCRIPT_REVIEW_PAUSE if self._semantic_running() else strings.CANCEL_BUTTON)
+        self.cancel_button.setText(strings.MANUSCRIPT_REVIEW_PAUSE if self._semantic_running() or self._translating()
+                                   else strings.CANCEL_BUTTON)
         self.translate_button.setEnabled(self._translate_ready())
         self.translate_segment_button.setEnabled(self._translate_ready())
+        self._render_translate_offer()
         self.auto_align_button.setEnabled(self._payload["alignments"] is not None)
         self.findings.setEnabled(not composing)
         self.lookup_button.setEnabled(not composing)
@@ -2135,9 +2170,9 @@ class ManuscriptView(QWidget):
 
     def _cancel_review(self) -> None:
         if self._translating():
+            run = self._translate_run
             self._stop_translation()
-            self.status_label.setText(strings.STATUS_CANCELLED_NOTE)
-            self._update_controls()
+            self._translation_stopped(run, "paused")
             return
         if self._semantic_running():
             self._stop_semantic("paused")
@@ -2432,95 +2467,197 @@ class ManuscriptView(QWidget):
                     and not _blank(self._payload["source"]))
 
     def _stop_translation(self) -> None:
+        """Hard stop: nothing is written and nothing is offered afterwards."""
         self._translate_generation += 1
         task, self._translate_task = self._translate_task, None
+        self._translate_run, self._translate_state = None, "idle"
         if task is not None and not task.done():
             task.cancel()
 
+    def _resumable(self) -> _Translation | None:
+        """The stopped run, while the text is exactly what it left."""
+        run = self._translate_run
+        if run is None or self._translate_state not in ("paused", "failed") or self._translating():
+            return None
+        payload = self._payload
+        same = (payload["source"] == run.source and payload["direction"] == run.direction
+                and payload["target"] == run.target)
+        return run if same else None
+
+    def _sync_translation(self) -> None:
+        """An edit, an undo or a redo withdraws the offer to continue."""
+        if self._translate_state in ("paused", "failed") and self._resumable() is None:
+            self._translate_run, self._translate_state = None, "idle"
+            if self.status_label.text() == self._translate_status:
+                self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
+
+    def _render_translate_offer(self) -> None:
+        """Both translate buttons say what the next press does."""
+        offer = {"paused": strings.MANUSCRIPT_TRANSLATE_CONTINUE,
+                 "failed": strings.MANUSCRIPT_TRANSLATE_RETRY}.get(self._translate_state)
+        button = self.translate_button
+        if button.text() != (offer or ""):
+            button.setText(offer or "")
+            if offer:
+                button.setMinimumWidth(0)
+                button.setMaximumWidth(16777215)  # Qt's QWIDGETSIZE_MAX: the icon button grows to fit its label
+            else:
+                button.setFixedWidth(34)
+        button.setToolTip(f"{offer or strings.MANUSCRIPT_TRANSLATE}（Ctrl+Shift+T）")
+        button.setAccessibleName(offer or strings.MANUSCRIPT_TRANSLATE)
+        self.translate_segment_button.setText(offer or strings.MANUSCRIPT_TRANSLATE_SEGMENT)
+
     def _translate(self) -> None:
         """Translate a blank translation or one untranslated segment; never
-        overwrite text the owner already has."""
+        overwrite text the owner already has. After a pause or a failure the
+        same press continues from the first unfinished piece."""
         if not self._input_ready() or not self._translate_ready():
             return
-        source, target = self._payload["source"], self._payload["target"]
+        source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
+        cursor = self._resumable()
         pair = None
-        if not _blank(target):
+        if cursor is not None and cursor.segment is not None:
+            pair = next((p for p in self._current_pairs()
+                         if p.status == STATUS_UNTRANSLATED and p.source.core_start == cursor.segment), None)
+            if pair is None:
+                cursor = None
+        if cursor is None and not _blank(target):
             pair = self._current_segment() if self.track_stack.currentIndex() == TRACK_SEGMENTS else None
             if pair is None or pair.status != STATUS_UNTRANSLATED:
                 self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
                 return
+        retry = cursor is not None and self._translate_state == "failed"
         self._stop_translation()
-        generation = self._translate_generation
-        self._translate_task = asyncio.ensure_future(
-            self._run_translation(generation, pair, source, target, self._payload["direction"]))
-        self._translate_task.add_done_callback(lambda _task: self._update_controls())
+        # A new record, so the ended task's callback never sees this run's identity.
+        fresh = {"generation": self._translate_generation, "retry": retry, "out": []}
+        run = replace(cursor, **fresh) if cursor is not None else _Translation(
+            source=source, direction=direction, target=target,
+            segment=None if pair is None else pair.source.core_start, **fresh)
+        text = source if pair is None else source[pair.source.core_start:pair.source.core_end]
+        pieces = segment_text(text, SEGMENT_LIMIT)
+        run.count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
+        self._translate_run, self._translate_state = run, "retrying" if retry else "waiting"
+        self._translate_task = asyncio.ensure_future(self._run_translation(run, pair, text, pieces))
+        self._translate_task.add_done_callback(lambda _task: self._translate_done(run))
         self._update_controls()
 
-    async def _run_translation(self, generation: int, pair, source: str, target: str, direction: str) -> None:
+    def _translate_done(self, run: _Translation) -> None:
+        """A task that ended without an outcome (an unexpected error) is a failure."""
+        if run.generation == self._translate_generation and self._translate_state in ("waiting", "retrying"):
+            self._translation_stopped(run, "failed", strings.ERROR_MSG_UNKNOWN)
+        self._update_controls()
+
+    async def _run_translation(self, run: _Translation, pair, text: str, pieces: list) -> None:
+        generation = run.generation
+        base = 0 if pair is None else pair.source.core_start
         try:
             # Capabilities are part of the basis: probe again, never reuse.
             self._capabilities = await self._api_client.get_capabilities()
             context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
-            if pair is None:
-                text, base = source, 0
-            else:
-                text, base = source[pair.source.core_start:pair.source.core_end], pair.source.core_start
             candidates = (sessions.precedent_candidates(self._payload, self._current_pairs())
                           if context_on and self.precedents_check.isChecked() else [])
-            pieces = segment_text(text, SEGMENT_LIMIT)
-            count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
-            out: list[str] = []
-            previous: tuple[str, str] | None = None
-            done = 0
-            for piece in pieces:
+            template = strings.MANUSCRIPT_TRANSLATE_RETRYING if run.retry else strings.MANUSCRIPT_TRANSLATING
+            for position in range(run.next_piece, len(pieces)):
+                piece = pieces[position]
                 core = text[piece.core_start:piece.core_end]
                 if not core:
-                    out.append(text[piece.start:piece.end])
+                    run.out.append(text[piece.start:piece.end])
+                    run.next_piece = position + 1
                     continue
-                done += 1
-                self.status_label.setText(strings.MANUSCRIPT_TRANSLATING.format(index=done, total=count))
+                self.status_label.setText(template.format(index=run.done + 1, total=run.count))
                 context = None
                 if context_on:
-                    before = semantic.context_before(*previous) if previous is not None else None
+                    before = semantic.context_before(*run.previous) if run.previous is not None else None
                     precedents = semantic.select_precedents(candidates, core, base + piece.core_start)
                     context = {**({"before": before} if before is not None else {}),
                                **({"precedents": precedents} if precedents else {})} or None
-                result = await self._api_client.translate(core, to=direction, context=context)
+                result = await self._api_client.translate(core, to=run.direction, context=context)
                 if generation != self._translate_generation:
                     return
-                out.append(text[piece.start:piece.core_start] + result.text + text[piece.core_end:piece.end])
-                previous = (core, result.text)
+                run.out.append(text[piece.start:piece.core_start] + result.text + text[piece.core_end:piece.end])
+                run.next_piece, run.previous = position + 1, (core, result.text)
+                run.done += 1
         except ClientError as exc:
-            if generation == self._translate_generation and exc.code != ERROR_CANCELLED:
-                self.status_label.setText(exc.message)
+            if generation == self._translate_generation:
+                if exc.code == ERROR_CANCELLED:
+                    self._translation_stopped(run, "paused")
+                else:
+                    self._translation_stopped(run, "paused" if exc.code in _QUOTA_CODES else "failed",
+                                              exc.message, quota=exc.code in _QUOTA_CODES)
             return
         if generation != self._translate_generation:
             return
         self._translate_task = None
-        if (self._payload["source"] != source or self._payload["target"] != target
-                or self._payload["direction"] != direction):
+        if not self._translation_basis_unchanged(run):
+            self._translate_run, self._translate_state = None, "idle"
             self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+            self._update_controls()
             return
-        translated = "".join(out)
+        if not self._write_translation(run, "".join(run.out), pair):
+            self._translate_run, self._translate_state = None, "idle"
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            self._update_controls()
+            return
+        self._translate_run, self._translate_state = None, "idle"
+        self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
+        self._update_controls()
+
+    def _translation_basis_unchanged(self, run: _Translation) -> bool:
+        payload = self._payload
+        return (payload["source"] == run.source and payload["direction"] == run.direction
+                and payload["target"] == run.target)
+
+    def _write_translation(self, run: _Translation, added: str, pair=None) -> bool:
+        """Write finished pieces as one undoable edit; False if the editor
+        cannot show the result. Without ``pair`` they go to the whole target:
+        replacing the blank one, or appended to the part already written."""
+        target = run.target
         if pair is None:
-            changed = translated
-            edit = ("target", 0, len(target), len(changed))
+            changed = (target if run.written else "") + added
+            edit = ("target", len(target) if run.written else 0, len(target), len(added))
         else:
             position = pair.target.core_start
             left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
             right = "\n\n" if position < len(target) and target[position] not in WHITESPACE else ""
-            inserted = left + translated + right
+            inserted = left + added + right
             changed = target[:position] + inserted + target[position:]
             edit = ("target", position, position, len(inserted))
         if not self.target_edit.can_display(changed):
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            return
+            return False
         value = self._draft_snapshot()
         value["target"] = changed
         if value["alignments"] is not None:
             value["alignments"] = []
         self._apply_edit(value, edits=[edit])
-        self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
+        return True
+
+    def _translation_stopped(self, run: _Translation, state: str, reason: str = "", *, quota: bool = False) -> None:
+        """The run ended before its last piece: the owner paused it, the
+        service asked to wait, or a piece failed. What is finished is written
+        as one edit and the run stays as the cursor for the next press."""
+        self._translate_task = None
+        if not self._translation_basis_unchanged(run):
+            self._translate_run, self._translate_state = None, "idle"
+            self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+            self._update_controls()
+            return
+        kept = "".join(run.out) if run.segment is None else ""
+        if kept:
+            if not self._write_translation(run, kept):
+                self._translate_run, self._translate_state = None, "idle"
+                self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+                self._update_controls()
+                return
+            run.target, run.written = self._payload["target"], True
+        run.out = []
+        if state == "failed":
+            text = strings.MANUSCRIPT_TRANSLATE_FAILED.format(
+                index=run.done + 1, total=run.count, done=run.done, reason=reason)
+        else:
+            text = (strings.MANUSCRIPT_TRANSLATE_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_PAUSED).format(
+                done=run.done, total=run.count)
+        self._translate_run, self._translate_state, self._translate_status = run, state, text
+        self.status_label.setText(text)
         self._update_controls()
 
     def _select_finding(self, index: int) -> None:
