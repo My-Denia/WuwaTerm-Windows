@@ -501,20 +501,25 @@ def test_a_report_export_sends_nothing_changes_nothing_and_is_not_a_manuscript(q
         core = Core()
         view = make_view(core)
         await review(view)
+        assert "当前报告：与当前文本" in exported(view, tmp_path / "first.md", monkeypatch), "every segment current"
         choose(view, 1, 0)  # 甲术 in segment 2: the official pair; the segment awaits its re-check
         view._path = tmp_path / "work.json"
         assert view.save_document()
         sent, saved = len(core.requests), view._saved_payload
         report = tmp_path / "report.md"
         text = exported(view, report, monkeypatch)
+        assert "需要重新核对：报告与当前文本或选择已不一致" in text
         assert len(core.requests) == sent and view._saved_payload is saved and not view.document_dirty
         assert view.document_path == tmp_path / "work.json"
         assert "## 逐段术语核对（3 段）" in text and "### 第 1 段\n" in text
         assert "### 第 2 段 · 需重新核对：文字、对应方式、选择或服务依据已变化" in text
         start = SOURCE.index("甲术段02")
         assert f"- 术语选择 · `甲术` · 原文位置 {start + 1}–{start + 2} · `甲术` / `Alpha` · 已确认，随核对提交" in text
-        # A report never opens as a manuscript; the open document stays.
+        # A report never opens or imports as a manuscript; the open document stays.
         assert not view.open_path(report)
+        assert view.status_label.text() == strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT
+        assert not view.import_files([str(report)], "source")
+        assert view.status_label.text() == strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT
         assert view.document_path == tmp_path / "work.json" and view._payload["source"] == SOURCE
         view.new_document()
         assert view.open_path(tmp_path / "work.json")
@@ -567,18 +572,32 @@ def test_a_truncated_segment_says_it_has_more_findings_and_still_takes_choices(q
         await review(view)
         view._show_track(TRACK_SEGMENTS)
         rows = [view.segment_list.item(i).text() for i in range(view.segment_list.count())]
-        marked = [strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK in row for row in rows]
-        assert marked == [False, True, False]
+        shown = len(view._payload["segments"][1]["result"]["findings"])
+        mark = strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK.format(count=shown)
+        assert [mark in row for row in rows] == [False, True, False]
+        note = strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(number=2, count=shown)
         select_segment(view, 1)
-        assert strings.MANUSCRIPT_SEGMENT_HINT["term_truncated"] in view.segment_hint.text()
+        assert note in view.segment_hint.text()
         view._show_track(TRACK_TERMS)
         row = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 1)
         view.findings.setCurrentRow(row)
         notes = view.candidates_label.text()
-        assert strings.MANUSCRIPT_CANDIDATES_TRUNCATED in notes and strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED in notes
+        assert strings.MANUSCRIPT_CANDIDATES_TRUNCATED in notes and note in notes
         choose(view, 1, 0)  # the shown finding still takes a choice
         assert [c["confirmed"] for c in view._payload["segments"][1]["choices"]] == [True]
         other = next(r for r, ref in enumerate(view._finding_refs) if ref[0] == 0)
         view.findings.setCurrentRow(other)
-        assert strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED not in view.candidates_label.text()
+        assert note not in view.candidates_label.text()
+    asyncio.run(scenario())
+
+
+def test_a_long_manuscript_report_leaves_out_a_document_report_from_a_shorter_text(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        view = make_view(Core(), "甲术在此。", "Alpha here.")
+        await review(view)
+        assert view._payload["history"], "the short text has a document report"
+        type_at(view.source_edit, len("甲术在此。"), "\n\n" + "文" * 2100)
+        view._refresh_derived()
+        text = exported(view, tmp_path / "report.md", monkeypatch)
+        assert "## 结论摘要" not in text and "当前没有审校报告" in text
     asyncio.run(scenario())

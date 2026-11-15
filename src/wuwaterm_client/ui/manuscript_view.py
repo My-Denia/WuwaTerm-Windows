@@ -1806,7 +1806,7 @@ class ManuscriptView(QWidget):
             if pair.index in sr.parts_of(self._payload).progress["completed"]:
                 status += strings.MANUSCRIPT_SEGMENT_FINISHED_MARK
             if record["result"] is not None and record["result"]["truncated"]:
-                status += strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK
+                status += strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK.format(count=len(record["result"]["findings"]))
             if record["choices"]:
                 unconfirmed = sum(1 for choice in record["choices"] if not choice["confirmed"])
                 status += strings.MANUSCRIPT_SEGMENT_CHOICES_MARK.format(count=len(record["choices"])) + (
@@ -1834,7 +1834,8 @@ class ManuscriptView(QWidget):
             if record is not None and status != "reviewed" and pair.index in sr.parts_of(self._payload).progress["completed"]:
                 hints.append(strings.MANUSCRIPT_SEGMENT_HINT["finished_recheck"])
             if record is not None and record["result"] is not None and record["result"]["truncated"]:
-                hints.append(strings.MANUSCRIPT_SEGMENT_HINT["term_truncated"])
+                hints.append(strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(
+                    number=pair.index + 1, count=len(record["result"]["findings"])))
             self.segment_hint.setText("\n".join(hints))
             self.translate_segment_button.setVisible(pair.status == STATUS_UNTRANSLATED)
             self.translate_segment_button.setEnabled(self._translate_ready())
@@ -2149,7 +2150,8 @@ class ManuscriptView(QWidget):
         ref = self._finding_record(index)
         record = self._payload["segments"][ref[0]] if ref is not None else None
         if record is not None and record["result"] is not None and record["result"]["truncated"]:
-            notes.append(strings.MANUSCRIPT_FINDING_SEGMENT_TRUNCATED)
+            notes.append(strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(
+                number=ref[0] + 1, count=len(record["result"]["findings"])))
         self.candidates_label.setTextFormat(Qt.TextFormat.PlainText)
         self.candidates_label.setText("\n".join([strings.MANUSCRIPT_CANDIDATES, *pairs, *notes]))
         self.lookup_button.setVisible(bool(source.get("text")))
@@ -3508,6 +3510,9 @@ class ManuscriptView(QWidget):
             if not self.source_edit.can_display(value["source"]) or not self.target_edit.can_display(value["target"]):
                 raise ValueError(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
             return value
+        if self._is_report_file(Path(name)):
+            self.status_label.setText(strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT)
+            return False
         try:
             read_candidate()
         except (OSError, WorkfileError, ValueError) as exc:
@@ -3592,7 +3597,12 @@ class ManuscriptView(QWidget):
                 return None
             return {**entry, "resolutions": entry.get("resolutions"),
                     "trusted": any(entry == own for own in self._session_snapshots)}
-        history = payload["history"]
+        # A long manuscript's result is its segment reports (the Web export's
+        # rule): a document report left from an earlier, shorter text is not
+        # exported, and the result is current only when every segment is
+        # ready and every record current.
+        long = self._long_now()
+        history = [] if long else payload["history"]
         latest = snapshot(history[-1] if history else None)
         previous = snapshot(history[-2] if len(history) > 1 else None)
         current = bool(latest and latest["trusted"] and latest["source"] == source and latest["target"] == target
@@ -3638,6 +3648,15 @@ class ManuscriptView(QWidget):
             semantic_part = {"items": items, "resolved": sum(1 for item in items
                                                              if item["status"] in ("accepted", "adjusted", "ignored")),
                              "segments": {"total": len(ready), "reviewed": reviewed}}
+        if long:
+            records = records or []
+            if not any(record["result"] is not None for record in records):
+                currency = "none"
+            elif (all(pair.status == STATUS_READY for pair in self._current_pairs())
+                  and all(self._term_state(record) == "current" for record in records)):
+                currency = "current"
+            else:
+                currency = "stale"
         return {
             "draft": draft, "latest": latest, "previous": previous, "currency": currency,
             "choices": payload["choices"],
@@ -3751,10 +3770,25 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.IMPORT_TOO_LARGE)
             return None
         try:
-            return data.decode("utf-8-sig")
+            text = data.decode("utf-8-sig")
         except UnicodeDecodeError:
             self.status_label.setText(strings.IMPORT_NOT_UTF8)
             return None
+        if mdr.is_report_export(text):
+            self.status_label.setText(strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT)
+            return None
+        return text
+
+    @staticmethod
+    def _is_report_file(path: Path) -> bool:
+        """An exported report, by the Web's rule (its first line); unreadable
+        files are left to the manuscript reader's own message."""
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(4096)
+        except OSError:
+            return False
+        return mdr.is_report_export(head.decode("utf-8", errors="replace"))
 
     def _replace_side(self, side: str, text: str) -> bool:
         """Replace one whole side as a single undoable edit."""

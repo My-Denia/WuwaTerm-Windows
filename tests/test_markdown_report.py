@@ -145,3 +145,10 @@ def test_segment_choices_follow_their_segment_and_user_text_stays_literal() -> N
     assert "选择历史：2 条" in text
     # Backticks in user text are fenced with a longer run, never closed early.
     assert "``` 理由`x` ```" not in text and "`` 理由`x` ``" in text
+
+
+def test_an_exported_report_is_recognized_by_its_first_line_as_on_the_web() -> None:
+    text = mdr.render(sample())
+    assert mdr.is_report_export(text) and mdr.is_report_export("\ufeff" + text.replace("\n", "\r\n"))
+    assert mdr.is_report_export("# WuwaTerm terminology review report\nbody")
+    assert not mdr.is_report_export("# WuwaTerm 术语审校报告（副本）\n") and not mdr.is_report_export("正文\n" + text)

@@ -170,6 +170,18 @@ SUMMARY = {
 COLON, SEMICOLON = "：", "；"
 
 
+# The report title in the Web's two languages (lib/messages.ts ``md.title``).
+REPORT_TITLES = ("WuwaTerm 术语审校报告", "WuwaTerm terminology review report")
+
+
+def is_report_export(text: str) -> bool:
+    """Web ``isMarkdownReportExport``: a text whose first line, after a BOM, is
+    the report title in either language is an exported report. A report is not
+    a manuscript and not a backup, so it is never opened or imported as one."""
+    first = re.split(r"\r?\n", text.removeprefix("\ufeff"), maxsplit=1)[0]
+    return any(first == "# " + title for title in REPORT_TITLES)
+
+
 def fill(template: str, **values: Any) -> str:
     for key, value in values.items():
         template = template.replace("{" + key + "}", str(value))
