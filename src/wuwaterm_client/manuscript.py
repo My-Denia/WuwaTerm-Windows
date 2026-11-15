@@ -760,13 +760,18 @@ def _order_result(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
 def _order_record(record: Mapping[str, Any]) -> dict[str, Any]:
     basis = record["basis"]
+    # A pending record writes its choices unconfirmed (SPEC "Writing"); in the session they may still hold
+    # their confirmed values until the re-check after an edit of the target alone (SPEC "Runtime" step 6).
+    choices = [_order_choice(c) for c in record["choices"]]
+    if record["status"] == "pending":
+        choices = [{**c, "confirmed": False} for c in choices]
     return {"index": record["index"], "segmentation_version": record["segmentation_version"],
             "source_start": record["source_start"], "source_end": record["source_end"],
             "target_start": record["target_start"], "target_end": record["target_end"],
             "source_hash": record["source_hash"], "target_hash": record["target_hash"], "status": record["status"],
             "direction": record["direction"], "alignment_input": record["alignment_input"],
             "basis": None if basis is None else _order_basis(basis), "result": _order_result(record["result"]),
-            "choices": [_order_choice(c) for c in record["choices"]]}
+            "choices": choices}
 
 
 def _v1_v2_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:

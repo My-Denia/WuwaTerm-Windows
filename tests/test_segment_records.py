@@ -261,6 +261,91 @@ def test_realignment_keeps_matching_choices_confirms_them_and_never_drops_one() 
     assert sr.unchoose(payload, 0, 4, 6).segments[0]["status"] == "stale"
 
 
+def _fixture_after_target_edit(contract_source, at_core_end: bool) -> tuple[dict, dict, dict]:
+    """valid-v3-all-parts.json read by the real parser, with record 1's choice for
+    示例名 unconfirmed (its finding and candidate still exist; 示例物 stays
+    confirmed, 示例城 has no finding), then one scalar typed in record 1's
+    target and the parts normalized as the view does.
+    Returns the payload, the session basis (record 1's) and a Core stand-in's
+    term table taken from the fixture's own result."""
+    folder = contract_source("web") / "contracts" / "manuscript-v3"
+    raw = json.loads((folder / "valid-v3-all-parts.json").read_text(encoding="utf-8"))
+    choice = raw["segments"][1]["choices"][0]
+    assert choice["source_span"]["text"] == "示例名" and choice["confirmed"]
+    choice["confirmed"] = False
+    payload = manuscript.parse_workfile(json.dumps(raw, ensure_ascii=False))
+    record = payload["segments"][1]
+    basis = record["basis"]
+    assert statuses(payload) == ["pending", "done", "stale"]
+    assert [c["confirmed"] for c in record["choices"]] == [False, True, False]
+    core = payload["source"][record["source_start"]:record["source_end"]]
+    terms = {core[f["source"][0]:f["source"][1]]: f["candidates"] for f in record["result"]["findings"]}
+    assert sorted(terms) == ["示例名", "示例物"]
+    before = payload["target"]
+    # Typed right after the core is no hit for apply_edit: only normalize sees the core grow.
+    at = record["target_end"] if at_core_end else record["target_start"] + 40
+    edited = sr.with_parts({**payload, "target": before[:at] + "加" + before[at:]},
+                           sr.apply_edit(sr.parts_of(payload), before, "target", at, at, 1))
+    edited = sr.with_parts(edited, sr.normalize(edited, pairs_of(edited), basis))
+    assert statuses(edited) == ["pending", "pending", "stale"]
+    # SPEC step 6: the choices keep their confirmed values until the re-check ...
+    assert [c["confirmed"] for c in edited["segments"][1]["choices"]] == [False, True, False]
+    # ... and the file written meanwhile holds a pending record with its choices unconfirmed.
+    meanwhile = manuscript.parse_workfile(manuscript.serialize_workfile(edited))
+    assert meanwhile["segments"][1]["status"] == "pending"
+    assert [c["confirmed"] for c in meanwhile["segments"][1]["choices"]] == [False, False, False]
+    assert "prior" not in manuscript.serialize_workfile(edited)
+    return edited, basis, terms
+
+
+def _recheck_record_1(payload: dict, basis: dict, terms: dict) -> tuple[dict, dict, list]:
+    """Record 1's check as the view runs it: the planned request, then one more while ``again``."""
+    sent = []
+    request = sr.plan_request(payload, 1, basis)
+    for _ in range(3):
+        sent.append(request)
+        applied = sr.apply_response(payload, request, core_report(request, basis, terms, ("示例物",)), basis)
+        assert applied.outcome == "stored"
+        payload, basis = sr.with_parts(payload, applied.parts), applied.basis
+        if not applied.again:
+            break
+        request = sr.plan_request(payload, 1, basis)
+    return payload, basis, sent
+
+
+@pytest.mark.parametrize("at_core_end", [False, True], ids=["typed-inside-the-core", "typed-at-the-core-end"])
+def test_a_target_edit_re_check_never_confirms_a_choice_that_was_unconfirmed(contract_source, at_core_end) -> None:
+    """SPEC step 6, the target-only paragraph: the re-check realigns, but a choice
+    that was unconfirmed before the edit stays unconfirmed even though its
+    finding and candidate still exist; one that was confirmed and still
+    matches is confirmed again."""
+    payload, basis, terms = _fixture_after_target_edit(contract_source, at_core_end)
+    payload, basis, sent = _recheck_record_1(payload, basis, terms)
+    assert statuses(payload) == ["pending", "done", "stale"]
+    written = manuscript.parse_workfile(manuscript.serialize_workfile(payload))
+    record = written["segments"][1]
+    assert record["status"] == "done"
+    assert [(c["source_span"]["text"], c["confirmed"]) for c in record["choices"]] == [
+        ("示例名", False), ("示例物", True), ("示例城", False)]
+    # This client first realigns without resolutions, then sends what was confirmed before the edit.
+    assert [r.resolutions for r in sent] == [[], [{"mention_id": "6:9:示例物", "choice": "not_a_term"}]]
+
+
+def test_a_new_direction_ends_what_a_target_edit_kept_even_when_it_is_switched_back(contract_source) -> None:
+    """A direction change leaves every choice unconfirmed (Web drops what it remembers),
+    so after switching back the re-check realigns by step 7: every matching choice is confirmed."""
+    payload, basis, terms = _fixture_after_target_edit(contract_source, False)
+    for direction in ("zh", "en"):
+        payload = {**payload, "direction": direction}
+        payload = sr.with_parts(payload, sr.normalize(payload, pairs_of(payload), basis))
+        assert [c["confirmed"] for c in payload["segments"][1]["choices"]] == [False, False, False]
+        assert "prior" not in payload["segments"][1]
+    payload, _, sent = _recheck_record_1(payload, basis, terms)
+    written = manuscript.parse_workfile(manuscript.serialize_workfile(payload))
+    assert [(c["source_span"]["text"], c["confirmed"]) for c in written["segments"][1]["choices"]] == [
+        ("示例名", True), ("示例物", True), ("示例城", False)]
+
+
 def test_an_edit_inside_one_segment_makes_only_that_record_pending() -> None:
     payload, basis = review_all(manuscript_of([500] * 12, {4: "甲术丙术"}), B1)
     # Paragraph 4 is the second of segment 1, so its terms start at 502 + 4 in the core.

@@ -36,6 +36,18 @@ confirmed choices as resolutions. When the confirmed choices change after the
 result, the record becomes ``stale``. Unconfirmed choices are never sent and
 never change the status.
 
+After an edit of the target alone (SPEC "Runtime" step 6, last paragraph) a
+record loses its result, but its choices keep their ``confirmed`` values until
+the re-check, and the record remembers what its result was computed for
+(``_Prior``, under the record key ``prior``). The re-check then confirms only
+what was confirmed before, and only while it still matches its findings: a
+choice that was unconfirmed before the edit stays unconfirmed even when it
+matches. These are runtime values: ``manuscript._order_record`` never writes
+``prior`` and writes the choices of a pending record unconfirmed. Any other
+change that makes a record pending (a source edit, a new direction) leaves its
+choices unconfirmed, and the re-check realigns them by step 7: a kept choice
+becomes confirmed.
+
 Order of use: ``apply_edit`` for every replacement the editor performed, then
 ``normalize`` against the current pairing before planning, display or save.
 The planner and the request functions expect normalized parts: one record per
@@ -508,9 +520,14 @@ def apply_response(payload: Mapping[str, Any], request: Request, report: Mapping
         if record["status"] == "done":
             parts = _replace(parts, request.index, {**record, "status": "stale"})
         return Applied(parts, current, "not_storable")
+    prior = record.get(PRIOR)
+    target_only = (prior is not None and prior.source_hash == content_hash(request.source)
+                   and prior.direction == request.direction and same_basis(prior.basis, basis))
     choices = []
     for choice in record["choices"]:
-        kept = (request.realign or choice["confirmed"]) and _choice_holds(choice, result)
+        # Step 6, last paragraph: after a target-only edit nothing becomes confirmed that was not.
+        confirmable = choice["confirmed"] if target_only else request.realign or choice["confirmed"]
+        kept = confirmable and _choice_holds(choice, result)
         choices.append(choice if choice["confirmed"] == kept else {**choice, "confirmed": kept})
     sent = sorted(json.dumps(r, sort_keys=True) for r in request.resolutions)
     confirmed = sorted(json.dumps(_resolution(c), sort_keys=True) for c in choices if c["confirmed"])
@@ -518,6 +535,7 @@ def apply_response(payload: Mapping[str, Any], request: Request, report: Mapping
     stored = {**record, "source_hash": content_hash(request.source), "target_hash": content_hash(request.target),
               "status": status, "direction": request.direction, "alignment_input": request.alignment_input,
               "basis": new_basis, "result": result, "choices": choices}
+    stored.pop(PRIOR, None)
     return Applied(_replace(parts, request.index, stored), current, "stored", again=status == "stale")
 
 
@@ -528,9 +546,32 @@ def _history_entry(choice: Mapping, source_hash: str) -> dict:
             "candidate": choice["candidate"], "offered": choice["offered"]}
 
 
-def _pending(record: Mapping, choices: list, **changes: Any) -> dict:
-    return {**record, **changes, "status": "pending", "direction": None, "alignment_input": None, "basis": None,
-            "result": None, "choices": [_unconfirmed(c) for c in choices]}
+class _Prior(NamedTuple):
+    """What a record's result was computed for, before an edit of the target alone dropped it."""
+
+    source_hash: str
+    direction: str
+    basis: dict
+
+
+PRIOR = "prior"   # runtime only: ``manuscript._order_record`` writes named keys, never this one
+
+
+def _pending(record: Mapping, choices: list, *, target_only: bool = False, **changes: Any) -> dict:
+    """The record without its result. ``target_only``: only the target changed, so
+    the choices keep their confirmed values and the record keeps (or takes)
+    its ``prior``; otherwise the choices become unconfirmed and no ``prior``
+    is kept."""
+    prior = None
+    if target_only:
+        prior = record.get(PRIOR) or (None if record["status"] == "pending" else _Prior(
+            record["source_hash"], record["direction"], record["basis"]))
+    out = {**{k: v for k, v in record.items() if k != PRIOR}, **changes, "status": "pending", "direction": None,
+           "alignment_input": None, "basis": None, "result": None,
+           "choices": list(choices) if target_only else [_unconfirmed(c) for c in choices]}
+    if prior is not None:
+        out[PRIOR] = prior
+    return out
 
 
 def apply_edit(parts: Parts, before: str, side: str, start: int, old_end: int, new_len: int) -> Parts:
@@ -539,7 +580,9 @@ def apply_edit(parts: Parts, before: str, side: str, start: int, old_end: int, n
 
     Records the edit does not touch shift (``semantic_session._shift``). A
     record whose core it hits becomes pending and covers the edited range;
-    its index leaves ``progress.completed``. Its choices become unconfirmed.
+    its index leaves ``progress.completed``. On the target side its choices keep
+    their confirmed values (see the module docstring); on the source side they
+    become unconfirmed.
     On the source side, a choice whose span the edit overlaps moves to the
     history with the pre-edit core's hash, and the others keep their place.
     The ranges are provisional until ``normalize``."""
@@ -566,7 +609,7 @@ def apply_edit(parts: Parts, before: str, side: str, start: int, old_end: int, n
                 if (cs - na, ce - na) != (span["start"], span["end"]):
                     choice = {**choice, "source_span": {"start": cs - na, "end": ce - na, "text": span["text"]}}
             choices.append(choice)
-        segments.append(_pending(record, choices, **{first: na, last: nb}))
+        segments.append(_pending(record, choices, target_only=side == "target", **{first: na, last: nb}))
     if not hit_indexes:
         return parts._replace(segments=segments)
     completed = [i for i in parts.progress["completed"] if i not in hit_indexes]
@@ -687,8 +730,13 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
         status = record["status"]
         same_content = status != "pending" and (record["source_hash"], record["target_hash"]) == now
         if not same_content or pairs[j].status != STATUS_READY or record["direction"] != direction:
-            if status != "pending" or len(choices) != len(record["choices"]):
-                record = _pending(record, choices)
+            prior = record.get(PRIOR)
+            # A new direction or source core ends what a pending record remembers (it is pending, unconfirmed).
+            gone = prior is not None and (prior.direction != direction or prior.source_hash != now[0])
+            if status != "pending" or len(choices) != len(record["choices"]) or gone:
+                only_target = (status != "pending" and record["direction"] == direction
+                               and record["source_hash"] == now[0] and record["target_hash"] != now[1])
+                record = _pending(record, choices, target_only=only_target)
         else:
             if status == "done" and (lost_confirmed or (basis is not None and not same_basis(record["basis"], basis))
                                      or alignment_input(payload["alignments"], source, target, core[0], core[1])
