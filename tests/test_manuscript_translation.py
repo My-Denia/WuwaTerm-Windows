@@ -318,7 +318,7 @@ def test_a_failed_single_segment_is_offered_again(qapp) -> None:
         view.translate_segment_button.click()
         await settle(view)
         assert view._translate_state == "failed" and view._payload["target"] == target
-        assert view.status_label.text() == strings.MANUSCRIPT_TRANSLATE_FAILED.format(
+        assert view.status_label.text() == strings.MANUSCRIPT_TRANSLATE_SEGMENT_FAILED.format(
             index=1, total=1, done=0, reason=strings.ERROR_MSG_INTERNAL)
         assert view.translate_segment_button.text() == strings.MANUSCRIPT_TRANSLATE_RETRY
         view.translate_segment_button.click()
@@ -326,4 +326,37 @@ def test_a_failed_single_segment_is_offered_again(qapp) -> None:
         assert [b["text"] for b in transport.sent] == ["乙。", "乙。"]
         assert view._payload["target"] == "A.\n\n[乙。]\n\nC."
         assert view.translate_segment_button.text() == strings.MANUSCRIPT_TRANSLATE_SEGMENT
+    asyncio.run(scenario())
+
+
+def test_a_two_piece_segment_keeps_its_first_piece_across_a_failed_second_one(qapp) -> None:
+    """A single untranslated segment longer than one piece writes nothing until
+    it is complete (a partial write would stop it being untranslated), so the
+    finished piece is kept with the run and written with the rest."""
+    first, second = "甲段。" * 400, "乙段。" * 400
+    long_paragraph = first + "\n\n" + second
+    source, target = "开头。\n\n" + long_paragraph + "\n\n结尾。", "Start.\n\nEnd."
+
+    def span(text, quote):
+        start = text.index(quote)
+        return {"start": start, "end": start + len(quote), "text": quote}
+    alignments = [{"source": span(source, "开头。"), "target": span(target, "Start.")},
+                  {"source": span(source, long_paragraph), "target": None},
+                  {"source": span(source, "结尾。"), "target": span(target, "End.")}]
+
+    async def scenario():
+        transport = Transport(fail={2: failure()})
+        view = make_view(transport, source, target, alignments)
+        view._show_track(TRACK_SEGMENTS)
+        view.segment_list.setCurrentRow([p.status for p in view._segment_rows].index("untranslated"))
+        view.translate_segment_button.click()
+        await settle(view)
+        assert view._translate_state == "failed" and view._payload["target"] == target, "nothing written yet"
+        assert view.status_label.text() == strings.MANUSCRIPT_TRANSLATE_SEGMENT_FAILED.format(
+            index=2, total=2, done=1, reason=strings.ERROR_MSG_INTERNAL)
+        view.translate_segment_button.click()
+        await settle(view)
+        assert [b["text"] for b in transport.sent] == [first, second, second]
+        assert f"[{first}]\n\n[{second}]" in view._payload["target"]
+        assert view._translate_state == "idle" and len(view._undo_history) == 1, "one write, once complete"
     asyncio.run(scenario())

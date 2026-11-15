@@ -398,3 +398,50 @@ def test_a_handled_semantic_suggestion_stays_handled_after_reopening_a_v3_file(q
         # The two tracks keep their own names and counts: term findings are not suggestions.
         assert reopened.terms_track_button.text() == strings.MANUSCRIPT_TRACK_TERMS.format(count=7)
     asyncio.run(scenario())
+
+
+class GatedCore(Core):
+    """Refuses the first request that carries resolutions with 400, but only
+    once the test opens ``gate``, so the test can edit while it is out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate, self.waiting = asyncio.Event(), False
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.url.path == "/v1/reviews" and body.get("resolutions") and not self.waiting:
+            self.requests.append((request.url.path, body))
+            self.waiting = True
+            await self.gate.wait()
+            return self.refuse(400, "invalid_request")
+        return Core.__call__(self, request)
+
+
+def test_an_edit_while_a_refused_request_is_out_sends_no_fallback_for_the_old_segment(qapp) -> None:
+    async def scenario():
+        core = GatedCore()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        view._start_review()
+        for _ in range(500):
+            if core.waiting:
+                break
+            await asyncio.sleep(0)
+        assert core.waiting, "the request with the choice went out"
+        sent = len(core.sent())
+        # The owner deletes segments 1 and 2 while Core is still answering.
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(SOURCE.index("甲术段02") - 2)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        core.gate.set()
+        for _ in range(200):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                break
+            await asyncio.wait(tasks)
+        assert view._semantic_state != "error"
+        assert len(core.sent()) == sent, "no fallback for a segment that is gone"
+    asyncio.run(scenario())

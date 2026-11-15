@@ -2829,6 +2829,17 @@ class ManuscriptView(QWidget):
         or the error."""
         request = sr.plan_request(self._payload, index, self._term_basis)
         fell_back = False
+
+        def still_there() -> bool:
+            # The owner may have edited while the refused request was out:
+            # replan only for the same segment, with the same cores, in long mode.
+            records = self._records() if self._term_mode == "segments" else None
+            if records is None or not 0 <= index < len(records):
+                return False
+            record, payload = records[index], self._payload
+            return (payload["direction"] == request.direction
+                    and payload["source"][record["source_start"]:record["source_end"]] == request.source
+                    and payload["target"][record["target_start"]:record["target_end"]] == request.target)
         for _ in range(3):
             try:
                 report = await self._api_client.review_pair(
@@ -2838,6 +2849,8 @@ class ManuscriptView(QWidget):
                 if (exc.code == ERROR_INVALID_REQUEST and request.resolutions and not fell_back
                         and generation == self._semantic_generation):
                     fell_back = True
+                    if not still_there():
+                        return "changed"
                     request = sr.plan_request(self._payload, index, self._term_basis, allow_resolutions=False)
                     continue
                 return exc
@@ -3089,7 +3102,9 @@ class ManuscriptView(QWidget):
         retry = cursor is not None and self._translate_state == "failed"
         self._stop_translation()
         # A new record, so the ended task's callback never sees this run's identity.
-        fresh = {"generation": self._translate_generation, "retry": retry, "out": []}
+        # A single-segment run carries its unwritten pieces (``out``) along.
+        fresh = {"generation": self._translate_generation, "retry": retry,
+                 "out": [] if cursor is None else list(cursor.out)}
         run = replace(cursor, **fresh) if cursor is not None else _Translation(
             source=source, direction=direction, target=target,
             segment=None if pair is None else pair.source.core_start, **fresh)
@@ -3193,29 +3208,38 @@ class ManuscriptView(QWidget):
 
     def _translation_stopped(self, run: _Translation, state: str, reason: str = "", *, quota: bool = False) -> None:
         """The run ended before its last piece: the owner paused it, the
-        service asked to wait, or a piece failed. What is finished is written
-        as one edit and the run stays as the cursor for the next press."""
+        service asked to wait, or a piece failed. The run stays as the cursor
+        for the next press. A whole-manuscript run writes what is finished as
+        one edit. A single-segment run keeps its finished pieces unwritten and
+        writes them all when the segment completes: writing part of it would
+        make the segment no longer untranslated, so the resume could not find
+        it again."""
         self._translate_task = None
         if not self._translation_basis_unchanged(run):
             self._translate_run, self._translate_state = None, "idle"
             self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
             self._update_controls()
             return
-        kept = "".join(run.out) if run.segment is None else ""
-        if kept:
-            if not self._write_translation(run, kept):
-                self._translate_run, self._translate_state = None, "idle"
-                self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-                self._update_controls()
-                return
-            run.target, run.written = self._payload["target"], True
-        run.out = []
+        segment = run.segment is not None
+        if not segment:
+            kept = "".join(run.out)
+            if kept:
+                if not self._write_translation(run, kept):
+                    self._translate_run, self._translate_state = None, "idle"
+                    self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+                    self._update_controls()
+                    return
+                run.target, run.written = self._payload["target"], True
+            run.out = []
         if state == "failed":
-            text = strings.MANUSCRIPT_TRANSLATE_FAILED.format(
+            text = (strings.MANUSCRIPT_TRANSLATE_SEGMENT_FAILED if segment else strings.MANUSCRIPT_TRANSLATE_FAILED).format(
                 index=run.done + 1, total=run.count, done=run.done, reason=reason)
         else:
-            text = (strings.MANUSCRIPT_TRANSLATE_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_PAUSED).format(
-                done=run.done, total=run.count)
+            if segment:
+                template = strings.MANUSCRIPT_TRANSLATE_SEGMENT_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_SEGMENT_PAUSED
+            else:
+                template = strings.MANUSCRIPT_TRANSLATE_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_PAUSED
+            text = template.format(done=run.done, total=run.count)
         self._translate_run, self._translate_state, self._translate_status = run, state, text
         self.status_label.setText(text)
         self._update_controls()
