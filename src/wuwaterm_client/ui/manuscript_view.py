@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import bisect
 import copy
+import os
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from .. import markdown_report as mdr
 from .. import segment_records as sr
 from .. import semantic, strings
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
@@ -622,6 +625,13 @@ class ManuscriptView(QWidget):
         self.cancel_button = QPushButton(strings.CANCEL_BUTTON, self)
         self.cancel_button.clicked.connect(self._cancel_review)
         self.auto_align_button = QPushButton(strings.MANUSCRIPT_AUTO_ALIGN, self)
+        # A report is a read-only snapshot for reading or sharing, never a
+        # manuscript: it is written as Markdown and cannot be opened to resume.
+        self.export_report_button = QPushButton(strings.MANUSCRIPT_EXPORT_REPORT, self)
+        self.export_report_button.clicked.connect(self.export_report)
+        # Document reports checked in this session (the Web's "trusted"): only
+        # these can be current; any other history came from a file.
+        self._session_snapshots: list[dict] = []
         self.auto_align_button.clicked.connect(self._use_auto_alignment)
         self.findings = QListWidget(self)
         self.findings.setMinimumHeight(76)
@@ -948,6 +958,7 @@ class ManuscriptView(QWidget):
         more.addWidget(self.finding_positions)
         more.addWidget(self.history_label)
         more.addWidget(self.auto_align_button)
+        more.addWidget(self.export_report_button)
         self.request_id_label.setObjectName("secondaryText")
         self.request_id_label.setWordWrap(True)
         more.addWidget(self.request_id_label)
@@ -1428,7 +1439,13 @@ class ManuscriptView(QWidget):
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
         tone, bar = "neutral", None
         if self._semantic_running():
-            text = strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=done + 1, done=done, total=total)
+            # Name the segment actually in flight, numbered as in the segment
+            # list; the count of segments already reviewed is separate.
+            checking = self._session.pending
+            pairs = self._cached_pairs() or ()
+            text = (strings.MANUSCRIPT_SEMANTIC_RUNNING.format(index=checking.index + 1, count=len(pairs),
+                                                               done=done, total=total)
+                    if checking is not None else strings.MANUSCRIPT_SEMANTIC_STARTING.format(done=done, total=total))
             tone, bar = "busy", (done, total)
         elif self._semantic_state == "paused":
             text = strings.MANUSCRIPT_SEMANTIC_PAUSED.format(done=done, total=total)
@@ -2608,6 +2625,7 @@ class ManuscriptView(QWidget):
                 self._refresh_conflicts()
             return False
         self._payload = candidate
+        self._session_snapshots.append(snapshot)
         self._document_revision += 1
         self._show_term_report(report)
         self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
@@ -2899,7 +2917,7 @@ class ManuscriptView(QWidget):
                 sent_source=key[4], sent_target=key[5],
                 source_core=(pair.source.core_start, pair.source.core_end),
                 target_core=(pair.target.core_start, pair.target.core_end),
-                hard_cut=pair.hard_cut, report=None)
+                hard_cut=pair.hard_cut, report=None, index=pair.index)
             before = self._context_for(pair)
             precedents = semantic.select_precedents(
                 sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start
@@ -3509,6 +3527,7 @@ class ManuscriptView(QWidget):
         self._set_payload(value)
         self._reset_term_session((value.get("progress") or {}).get("current"))
         self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
+        self._session_snapshots = []
         # The loaded texts are the versions on-file decisions usually refer to;
         # keep them so an edit before the next review does not lose them.
         for text in (value["source"], value["target"]):
@@ -3545,10 +3564,110 @@ class ManuscriptView(QWidget):
         self._set_payload(value)
         self._reset_term_session(None)
         self._known_texts = {}
+        self._session_snapshots = []
         self._saved_payload = _copy_payload(value)
         self._path = None
         self._set_review_state("none")
         self._update_controls()
+        return True
+
+    # -- report export ----------------------------------------------------------
+    def _report_input(self) -> dict:
+        """What the Markdown report shows, with the Web export's meanings."""
+        payload = self._payload
+        source, target, direction = payload["source"], payload["target"], payload["direction"]
+
+        def snapshot(entry: dict | None) -> dict | None:
+            if entry is None:
+                return None
+            return {**entry, "resolutions": entry.get("resolutions"),
+                    "trusted": any(entry == own for own in self._session_snapshots)}
+        history = payload["history"]
+        latest = snapshot(history[-1] if history else None)
+        previous = snapshot(history[-2] if len(history) > 1 else None)
+        current = bool(latest and latest["trusted"] and latest["source"] == source and latest["target"] == target
+                       and latest["direction"] == direction and latest["alignments"] == payload["alignments"])
+        currency = "none" if latest is None else "current" if current else "stale" if latest["trusted"] else "imported"
+        draft = {"source": source, "target": target, "direction": direction, "alignments": payload["alignments"]}
+        segment_terms = None
+        records = self._records()
+        if records is not None:
+            segment_terms = []
+            for index, record in enumerate(records):
+                state = self._term_state(record)
+                if record["result"] is None and not record["choices"]:
+                    continue
+                findings = []
+                if record["result"] is not None:
+                    for finding in sr.expand_result(record, source, target)["findings"]:
+                        findings.append({"verdict": finding["verdict"],
+                                         "source_span": _offset(finding["source_span"], record["source_start"]),
+                                         "target_span": _offset(finding["target_span"], record["target_start"]),
+                                         "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]]})
+                choices = [{**choice, "source_span": _offset(choice["source_span"], record["source_start"])}
+                           for choice in record["choices"]]
+                segment_terms.append({"index": index, "state": state, "stale": state != "current",
+                                      "findings": findings, "choices": choices})
+        semantic_part = None
+        issues = self._session.issues()
+        if issues or self._decisions():
+            statuses = {"needs_reconfirm": "needs_reconfirmation", "ignored_carried": "ignored"}
+            items = []
+            for issue in issues:
+                raw = issue.issue
+                state = self._issue_state(issue)
+                items.append({"issue_id": raw["id"], "category": raw["category"], "confidence": raw["confidence"],
+                              "segment_index": raw.get("segment_index"), "source_excerpt": raw.get("source_excerpt"),
+                              "target_excerpt": raw.get("target_excerpt"), "rationale": raw["rationale"],
+                              "suggestion": raw["suggestion"]["replacement"] if raw.get("suggestion") else None,
+                              "suggestion_withheld": raw.get("suggestion_withheld"),
+                              "status": statuses.get(state, state)})
+            ready = [pair for pair in self._current_pairs() if pair.status == STATUS_READY]
+            reviewed = sum(1 for pair in ready if (result := self._session.result_for(pair, source, target)) is not None
+                           and result.report is not None)
+            semantic_part = {"items": items, "resolved": sum(1 for item in items
+                                                             if item["status"] in ("accepted", "adjusted", "ignored")),
+                             "segments": {"total": len(ready), "reviewed": reviewed}}
+        return {
+            "draft": draft, "latest": latest, "previous": previous, "currency": currency,
+            "choices": payload["choices"],
+            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest),
+            "comparison": mdr.compare_reports(previous, latest) if latest and previous else None,
+            "semantic": semantic_part, "segment_terms": segment_terms,
+            "segment_choice_history": len(payload.get("segment_choice_history") or []),
+        }
+
+    def report_markdown(self) -> str:
+        return mdr.render(self._report_input())
+
+    def export_report(self, _checked: bool = False) -> bool:
+        """Write the Markdown report: a read-only snapshot, not a manuscript.
+        It sends nothing and leaves the path, the saved state and the recent
+        list alone; the open dialog never offers it as a manuscript."""
+        if not self._input_ready():
+            return False
+        name, _ = QFileDialog.getSaveFileName(self, strings.MANUSCRIPT_EXPORT_REPORT, "wuwaterm-report.md",
+                                              strings.MANUSCRIPT_REPORT_FILTER)
+        if not name:
+            return False
+        destination = Path(name)
+        content = self.report_markdown().encode("utf-8")
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    file.write(content)
+                os.replace(temporary, destination)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+        except OSError as exc:
+            self.status_label.setText(strings.MANUSCRIPT_EXPORT_FAILED.format(reason=str(exc)))
+            return False
+        self.status_label.setText(strings.MANUSCRIPT_EXPORT_DONE)
         return True
 
     # -- file continuity: import, clipboard, work position -------------------
