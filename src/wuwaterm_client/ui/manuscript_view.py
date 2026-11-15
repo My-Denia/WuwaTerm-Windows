@@ -2624,8 +2624,10 @@ class ManuscriptView(QWidget):
             return False
         if generation != self._generation:
             return False
+        # The resolutions this check sent: a short manuscript sends none, and
+        # [] (not unknown) lets the next check compare with it, as on the Web.
         snapshot = {"source": source, "target": target, "direction": direction,
-                    "alignments": alignments, "report": report}
+                    "alignments": alignments, "report": report, "resolutions": []}
         candidate = _copy_payload(self._payload)
         candidate["history"] = (candidate["history"] + [snapshot])[-2:]
         try:

@@ -641,3 +641,16 @@ def test_a_report_never_overwrites_the_open_manuscript(qapp, tmp_path, monkeypat
     assert not view.export_report()
     assert view._path.read_bytes() == before and not view.document_dirty
     assert view.status_label.text() == strings.MANUSCRIPT_EXPORT_OVER_MANUSCRIPT
+
+
+def test_two_short_checks_in_a_session_compare_as_automatic_checks(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        view = make_view(Core(), "甲术在此。", "Alpha here.")
+        await review(view)
+        type_at(view.target_edit, len("Alpha here."), " Again.")  # only the translation changes
+        await review(view)
+        # Both checks sent no resolutions; the file and the comparison say so.
+        assert [snapshot["resolutions"] for snapshot in view._payload["history"]] == [[], []]
+        text = exported(view, tmp_path / "report.md", monkeypatch)
+        assert "### 仍待确认（1）" in text and "前后选择不同或选择记录未知" not in text
+    asyncio.run(scenario())
