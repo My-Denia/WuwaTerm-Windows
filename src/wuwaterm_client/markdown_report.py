@@ -614,6 +614,8 @@ def render(data: Mapping[str, Any]) -> str:
                     else MD["segmentTermsStale"] if segment["stale"] else "")
             out.extend(["### " + fill(MD["segmentTermsLabel"], n=segment["index"] + 1) + (" · " + mark if mark else ""),
                         ""])
+            if segment.get("truncated"):
+                paragraph(MD["truncatedLine"])
             if state == "pending":
                 paragraph(MD["segmentTermsNoResult"])
             elif not segment["findings"]:
@@ -626,6 +628,7 @@ def render(data: Mapping[str, Any]) -> str:
                        if f["target_span"] else " · " + MD["noTargetSpan"])
                     + (" · " + SEMICOLON.join(inline(c["zh"]) + " / " + inline(c["en"]) for c in f["candidates"])
                        if f["candidates"] else "")
+                    + (" · " + MD["candidatesTruncatedLine"] if f.get("candidates_truncated") else "")
                     for f in segment["findings"]]), ""])
             if segment.get("choices"):
                 out.extend([*_bullets([
@@ -661,4 +664,11 @@ def render(data: Mapping[str, Any]) -> str:
             ]), ""])
 
     paragraph(MD["notCertifiedLine"])
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).rstrip() + "\n"
+    # Only structural spacing is normalized: a run of empty entries becomes one
+    # blank line. A fenced block's text is one entry and keeps its blank lines,
+    # so the report stays an exact snapshot of the manuscript (the Web's rule).
+    lines: list[str] = []
+    for entry in out:
+        if not (entry == "" and lines and lines[-1] == ""):
+            lines.append(entry)
+    return "\n".join(lines).rstrip() + "\n"

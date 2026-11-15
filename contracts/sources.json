@@ -30,7 +30,7 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "7f9a73c34ea3e0063450dbad0985104843b198ad",
+    "commit": "bcd0b67faf4ed7be4521103f19c4fd041080cb83",
     "files": {
       "package.json": "28e114f54b75c4299c72b2c5797aac51a93a07d5915a23a12694c6617e37ded9",
       "lib/manuscript.js": "ede1fa15b8e1671a144b8ee66ef22989cc06d1e13fb9a251fa9b16d3cb478e5a",
@@ -105,8 +105,8 @@
       "contracts/manuscript-v3/valid-v3-over-1mib.json": "42cf30cec812388a19504c78502a38f96fefaa3c15aebc8eace98ec37e041cd6",
       "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
       "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
-      "lib/markdown-report.ts": "c486598b9cb5b85c3898b0385c155ef3e9ad4c3fd5dbaa8083b448613a6bc7dd",
-      "lib/messages.ts": "5df7ea51300289da0283f3db97d20f0b72128f93ef9c4945e75daf0543b32019",
+      "lib/markdown-report.ts": "b404f2046d0f8d96aa1d06ad4adf4e510f711de5d487a2574c665de3c21a22ef",
+      "lib/messages.ts": "0fd88f378cc3f290b2641bfbd44816557ff8c5d55721bdb27645883c4a22c5fa",
       "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
       "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
       "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c"

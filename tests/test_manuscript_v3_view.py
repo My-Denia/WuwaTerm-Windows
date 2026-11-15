@@ -20,6 +20,7 @@ from test_manuscript_semantic import issue as semantic_issue, semantic_report
 from wuwaterm_client import strings
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.manuscript import load_workfile
+from wuwaterm_client.markdown_report import MD
 from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC, TRACK_TERMS, ManuscriptView
 
 
@@ -653,4 +654,16 @@ def test_two_short_checks_in_a_session_compare_as_automatic_checks(qapp, tmp_pat
         assert [snapshot["resolutions"] for snapshot in view._payload["history"]] == [[], []]
         text = exported(view, tmp_path / "report.md", monkeypatch)
         assert "### 仍待确认（1）" in text and "前后选择不同或选择记录未知" not in text
+    asyncio.run(scenario())
+
+
+def test_an_exported_long_report_says_which_segment_was_truncated(qapp, tmp_path, monkeypatch) -> None:
+    async def scenario():
+        view = make_view(TruncatingCore("甲术段02"))
+        await review(view)
+        text = exported(view, tmp_path / "report.md", monkeypatch)
+        sections = text.split("### 第 ")
+        second = next(part for part in sections if part.startswith("2 段"))
+        assert MD["truncatedLine"] in second and " · " + MD["candidatesTruncatedLine"] in second
+        assert not any(MD["truncatedLine"] in part for part in sections if part.startswith(("1 段", "3 段")))
     asyncio.run(scenario())

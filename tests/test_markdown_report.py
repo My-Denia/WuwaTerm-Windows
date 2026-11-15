@@ -91,6 +91,24 @@ def sample() -> dict:
     }
 
 
+def truncated_long_sample() -> dict:
+    """A long-manuscript export: a truncated segment, a cut candidate list and
+    blank lines that a fence must keep exactly."""
+    source = "first\n\n\n\nsecond 甲术"
+    hit = span(source, "甲术")
+    return {
+        "draft": {"source": source, "target": "one\n\n\ntwo", "direction": "en", "alignments": None},
+        "latest": None, "previous": None, "currency": "stale", "choices": [], "reconciled": [], "comparison": None,
+        "semantic": None,
+        "segment_terms": [
+            {"index": 0, "state": "current", "stale": False, "truncated": True,
+             "findings": [{"verdict": "needs_review", "source_span": hit, "target_span": None,
+                           "candidates": [{"zh": "甲术", "en": "Alpha"}], "candidates_truncated": True}]},
+            {"index": 1, "state": "stale", "stale": True, "truncated": True, "findings": []},
+        ],
+    }
+
+
 def test_the_report_matches_the_web_renderer_line_for_line(contract_source) -> None:
     web_root = contract_source("web")
     if not shutil.which("node"):
@@ -98,31 +116,36 @@ def test_the_report_matches_the_web_renderer_line_for_line(contract_source) -> N
             pytest.fail("Node is required for the Web report contract")
         pytest.skip("Node is required for the Web report contract")
     data = sample()
+    long = truncated_long_sample()
     heads = [mdr.render(data), "\ufeff# WuwaTerm terminology review report\r\nx", "# WuwaTerm 术语审校报告 \n",
              "正文\n# WuwaTerm 术语审校报告", ""]
     program = """
       import { readFileSync } from 'node:fs';
       import { isMarkdownReportExport, renderMarkdownReport } from './lib/markdown-report.ts';
       import { compareReports, reconcileChoices } from './lib/manuscript.js';
-      const { data, heads } = JSON.parse(readFileSync(0, 'utf8'));
+      const { data, long, heads } = JSON.parse(readFileSync(0, 'utf8'));
       const strip = c => Object.fromEntries(Object.entries(c).map(([k, v]) => [k, v.map(x => ({ mention: x.mention, code: x.code }))]));
       process.stdout.write(JSON.stringify({
         markdown: renderMarkdownReport({ ...data, segmentTerms: data.segment_terms }, 'zh'),
+        long: renderMarkdownReport({ ...long, segmentTerms: long.segment_terms }, 'zh'),
         reconciled: reconcileChoices(data.choices, data.draft, data.latest).map(r => [r.status, r.code]),
         comparison: strip(compareReports(data.previous, data.latest)),
         reports: heads.map(isMarkdownReportExport),
       }));
     """
     result = subprocess.run(["node", "--no-warnings", "--experimental-strip-types", "--input-type=module", "-e", program],
-                            cwd=web_root, input=json.dumps({"data": data, "heads": heads}, ensure_ascii=False), text=True, encoding="utf-8",
+                            cwd=web_root, input=json.dumps({"data": data, "long": long, "heads": heads}, ensure_ascii=False), text=True, encoding="utf-8",
                             capture_output=True, check=True, timeout=60)
     web = json.loads(result.stdout)
-    ours = mdr.render(data).split("\n")
-    theirs = web["markdown"].split("\n")
-    assert len(ours) == len(theirs)
-    # The one wording change: a desktop window, not a web page, makes the snapshot.
-    different = [i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b]
-    assert different == [2] and ours[2] == mdr.MD["snapshotLine"]
+    for rendered, theirs in ((mdr.render(data), web["markdown"]), (mdr.render(long), web["long"])):
+        ours, theirs = rendered.split("\n"), theirs.split("\n")
+        assert len(ours) == len(theirs)
+        # The one wording change: a desktop window, not a web page, makes the snapshot.
+        different = [i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b]
+        assert different == [2] and ours[2] == mdr.MD["snapshotLine"]
+    text = mdr.render(long)
+    assert "```\nfirst\n\n\n\nsecond 甲术\n```" in text and "one\n\n\ntwo" in text, "fenced text is exact"
+    assert text.count(mdr.MD["truncatedLine"]) == 2 and " · " + mdr.MD["candidatesTruncatedLine"] in text
     assert web["reconciled"] == [[r["status"], r["code"]] for r in data["reconciled"]]
     assert web["comparison"] == data["comparison"]
     assert web["reports"] == [mdr.is_report_export(head) for head in heads] == [True, True, False, False, False]
