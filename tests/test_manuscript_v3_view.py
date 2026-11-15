@@ -1,0 +1,447 @@
+"""Resumable long-manuscript term review in the workbench (manuscript v3).
+
+Real widgets, the real ApiClient and parser; a MockTransport stands in for
+Core and honours review-v2 resolutions the way Core does: a resolved finding
+comes back verified (or not evaluated), and a stale context or an unknown
+mention is refused with 400. All text is synthetic.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+
+import httpx
+import pytest
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QApplication
+
+from test_manuscript_semantic import issue as semantic_issue, semantic_report
+from wuwaterm_client import strings
+from wuwaterm_client.api import ApiClient
+from wuwaterm_client.manuscript import load_workfile
+from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC, TRACK_TERMS, ManuscriptView
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def candidate(zh: str, en: str) -> dict:
+    return {"zh": zh, "en": en, "category": "resonator", "sources": [], "candidate_id": digest(zh + en)}
+
+
+TERMS = {"甲术": [candidate("甲术", "Alpha")], "乙术": [candidate("乙术", "Beta"), candidate("乙术", "Bett")]}
+# Six paragraphs, two per segment: three segments, the source well over 2,000 scalars.
+SOURCE = "\n\n".join(f"甲术段{i:02d}" + ("乙术" if i == 3 else "") + "文" * 690 for i in range(6))
+TARGET = "\n\n".join(f"Paragraph {i:02d} ".ljust(300, "x") for i in range(6))
+
+
+class Core:
+    """Counts requests and answers like review-v2 for the exact cores sent."""
+
+    def __init__(self, capabilities=(), issues=None) -> None:
+        self.capabilities, self.issues = capabilities, issues
+        self.matcher, self.revision = "a" * 64, "b" * 64
+        self.fail_once: set[str] = set()  # source-core prefixes refused once with 500
+        self.requests: list[tuple[str, dict | None]] = []
+
+    def sent(self, path: str = "/v1/reviews") -> list[dict]:
+        return [body for p, body in self.requests if p == path]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        self.requests.append((request.url.path, body))
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"api_version": "v1", "capabilities": list(self.capabilities),
+                                             "request_id": "caps"})
+        if request.url.path == "/v1/semantic-reviews":
+            return httpx.Response(200, json=semantic_report(body["source"], body["target"],
+                                                            self.issues(body["source"], body["target"])))
+        assert request.url.path == "/v1/reviews" and request.headers["x-wuwaterm-matcher-basis"] == "1"
+        return self.review(body)
+
+    def refuse(self, status: int, code: str) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"code": code, "message": "x"}, "request_id": "e"})
+
+    def review(self, body: dict) -> httpx.Response:
+        source, target = body["source"], body["target"]
+        prefix = next((p for p in self.fail_once if source.startswith(p)), None)
+        if prefix is not None:
+            self.fail_once.discard(prefix)
+            return self.refuse(500, "internal")
+        resolved = {item["mention_id"]: item for item in body.get("resolutions", [])}
+        if resolved and body["resolution_context"] != {
+                "source_revision": digest(source), "rule_version": "review-v2",
+                "dictionary_revision": self.revision, "matcher_revision": self.matcher}:
+            return self.refuse(400, "invalid_request")
+        findings = []
+        for start in range(len(source)):
+            for surface, candidates in TERMS.items():
+                if not source.startswith(surface, start):
+                    continue
+                mention = f"{start}:{start + len(surface)}:{surface}"
+                choice = resolved.pop(mention, None)
+                verdict = "confirmed_conflict"
+                if choice is not None and choice["choice"] == "not_a_term":
+                    verdict = "not_evaluated"
+                elif choice is not None:
+                    if choice["candidate_id"] not in [c["candidate_id"] for c in candidates]:
+                        return self.refuse(400, "invalid_request")
+                    verdict = "verified_constraint"
+                findings.append({"id": mention, "rule_id": "review.term_pair", "verdict": verdict,
+                                 "source_span": {"start": start, "end": start + len(surface), "text": surface},
+                                 "target_span": None, "candidates": candidates, "candidates_truncated": False})
+        if resolved:
+            return self.refuse(400, "invalid_request")
+        return httpx.Response(200, json={
+            "request_id": "term", "source_revision": digest(source), "target_revision": digest(target),
+            "rule_version": "review-v2", "matcher_revision": self.matcher,
+            "dictionary": {"schema_version": "1", "source_commit": "c" * 40, "term_count": 3, "revision": self.revision},
+            "coverage": {"evaluated": len(findings), "not_evaluated": 0,
+                         "rules": ["review.term_pair", "review.sentence_meaning"]},
+            "findings": findings, "truncated": False})
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+def make_view(core: Core, source: str = SOURCE, target: str = TARGET) -> ManuscriptView:
+    view = ManuscriptView(ApiClient("https://example.invalid", token_provider=lambda: "test-token",
+                                    _test_transport=httpx.MockTransport(core)))
+    value = {"format": "wuwaterm-manuscript-v1", "source": source, "target": target, "direction": "en",
+             "alignments": None, "choices": [], "history": []}
+    view._set_payload(value)
+    view._saved_payload = view._payload.copy()
+    view._update_controls()
+    return view
+
+
+async def review(view: ManuscriptView) -> None:
+    view._start_review()
+    for _ in range(200):
+        tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+        if not tasks:
+            await asyncio.sleep(0)
+            view._refresh_derived()
+            return
+        await asyncio.wait(tasks)
+    raise AssertionError("the review did not settle")
+
+
+def reopen(view: ManuscriptView, path, core: Core) -> ManuscriptView:
+    """Save, then open the file again in the same window, as the owner would."""
+    view._path = path
+    assert view.save_document()
+    view.new_document()
+    assert view.open_path(path)
+    view._refresh_derived()
+    return view
+
+
+def statuses(view: ManuscriptView) -> list[str]:
+    return [view._segment_status(pair) for pair in view._current_pairs()]
+
+
+def choose(view: ManuscriptView, segment: int, occurrence: int, option: int = 0) -> None:
+    """Pick ``option`` (a candidate, or the last: not a term) at a finding of ``segment``."""
+    view._show_track(TRACK_TERMS)
+    rows = [row for row, ref in enumerate(view._finding_refs) if ref[0] == segment]
+    view.findings.setCurrentRow(rows[occurrence])
+    view.choice_combo.setCurrentIndex(option)
+    assert view.choice_button.isEnabled()
+    view.choice_button.click()
+
+
+def select_segment(view: ManuscriptView, index: int) -> None:
+    view._show_track(TRACK_SEGMENTS)
+    view.segment_list.setCurrentRow(index)
+
+
+def type_at(editor, position: int, text: str) -> None:
+    cursor = editor.textCursor()
+    cursor.setPosition(position)
+    editor.setTextCursor(cursor)
+    editor.insertPlainText(text)
+
+
+def test_reopening_restores_choices_marks_and_position_and_one_probe_confirms_everything(qapp, tmp_path) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        assert statuses(view) == ["reviewed"] * 3 and len(core.sent()) == 3
+        choose(view, 1, 0)
+        await review(view)
+        select_segment(view, 0)
+        view.finish_button.click()
+        select_segment(view, 2)
+        assert strings.MANUSCRIPT_SEGMENT_FINISHED_MARK in view.segment_list.item(0).text()
+        sent = len(core.requests)
+        reopened = reopen(view, tmp_path / "long.json", core)
+        assert len(core.requests) == sent, "opening sends nothing"
+        assert reopened._payload["progress"] == {"current": 2, "completed": [0]}
+        assert [c["confirmed"] for c in reopened._payload["segments"][1]["choices"]] == [True]
+        assert statuses(reopened) == ["saved"] * 3 and reopened._review_state == "saved"
+        assert reopened.report_label.text() == strings.MANUSCRIPT_SAVED_REPORT.format(count=7)
+        reopened._show_track(TRACK_SEGMENTS)
+        assert reopened.segment_list.currentRow() == 2
+        assert not reopened.choice_button.isEnabled(), "no choice against a result not checked yet"
+        before = len(core.sent())
+        await review(reopened)
+        [probe] = core.sent()[before:]
+        assert "resolutions" not in probe and probe["source"].startswith("甲术段04"), "the probe is progress.current"
+        assert statuses(reopened) == ["reviewed"] * 3 and not reopened.document_dirty
+    asyncio.run(scenario())
+
+
+def test_a_choice_goes_out_as_a_resolution_and_is_not_raised_again_after_reopening(qapp, tmp_path) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        assert view._payload["segments"][1]["status"] == "stale"
+        assert view.status_label.text() == strings.MANUSCRIPT_TERM_CHOICE_RECORDED
+        before = len(core.sent())
+        await review(view)
+        [sent] = core.sent()[before:]
+        assert sent["resolutions"] == [{"mention_id": "0:2:甲术", "choice": "official_pair",
+                                        "candidate_id": TERMS["甲术"][0]["candidate_id"]}]
+        assert sent["resolution_context"] == {"source_revision": digest(sent["source"]), "rule_version": "review-v2",
+                                              "dictionary_revision": core.revision, "matcher_revision": core.matcher}
+        reopened = reopen(view, tmp_path / "chosen.json", core)
+        await review(reopened)
+        row = next(row for row, ref in enumerate(reopened._finding_refs) if ref == (1, 0, 2))
+        assert reopened._report["findings"][row]["verdict"] == "verified_constraint"
+        assert strings.MANUSCRIPT_VERDICT_CONFLICT not in reopened.findings.item(row).text()
+    asyncio.run(scenario())
+
+
+def test_a_matcher_change_re_checks_every_record_keeps_marks_and_sends_choices_again(qapp, tmp_path) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        await review(view)
+        select_segment(view, 0)
+        view.finish_button.click()
+        reopened = reopen(view, tmp_path / "matcher.json", core)
+        core.matcher = "d" * 64
+        before = len(core.sent())
+        await review(reopened)
+        again = core.sent()[before:]
+        # The probe, the two other segments, and the kept choice sent once more.
+        assert len(again) == 4 and "resolutions" not in again[0]
+        [resolved] = [body for body in again if "resolutions" in body]
+        assert resolved["source"].startswith("甲术段02") and resolved["resolution_context"] == {
+            "source_revision": digest(resolved["source"]), "rule_version": "review-v2",
+            "dictionary_revision": core.revision, "matcher_revision": "d" * 64}
+        assert statuses(reopened) == ["reviewed"] * 3
+        assert reopened._payload["progress"]["completed"] == [0]
+    asyncio.run(scenario())
+
+
+def test_a_refused_resolution_context_falls_back_once_and_the_choice_goes_out_again(qapp) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        core.matcher = "e" * 64  # Core moved on after this session's last check
+        before = len(core.sent())
+        await review(view)
+        sent = core.sent()[before:]
+        # Refused (stale context), the same segment without resolutions, then
+        # with the kept choice under the new basis; the other two re-checked.
+        assert ["resolutions" in body for body in sent] == [True, False, True, False, False]
+        assert sent[2]["resolution_context"]["matcher_revision"] == "e" * 64
+        assert statuses(view) == ["reviewed"] * 3
+        assert [c["confirmed"] for c in view._payload["segments"][1]["choices"]] == [True]
+    asyncio.run(scenario())
+
+
+def test_an_edit_inside_one_segment_makes_only_it_pending_and_drops_only_its_mark(qapp) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        for index in (0, 1):
+            select_segment(view, index)
+            view.finish_button.click()
+        choose(view, 1, 2, option=2)  # 乙术 in paragraph 3: not a term
+        records = list(view._payload["segments"])
+        assert view._draft_snapshot()["segments"] is view._payload["segments"], "snapshots share the records"
+        at = SOURCE.index("甲术段02") + 20  # in segment 1, before the choice
+        type_at(view.source_edit, at, "改")
+        assert view._payload["segments"][0] is records[0], "a keystroke copies no untouched record"
+        view._refresh_derived()
+        assert view.source_edit.raw_cursor_offset() == at + 1, "the refreshed list does not move the caret"
+        assert statuses(view) == ["reviewed", "pending", "reviewed"]
+        assert view._payload["progress"]["completed"] == [0]
+        [kept] = view._payload["segments"][1]["choices"]
+        start = view._payload["segments"][1]["source_start"] + kept["source_span"]["start"]
+        assert view._payload["source"][start:start + 2] == "乙术" and not kept["confirmed"], "kept, to reconfirm"
+        view.segment_list.setCurrentRow(2)
+        view._next_pending()
+        assert view.segment_list.currentRow() == 1
+        view._undo_replace()
+        view._refresh_derived()
+        # Back to the choice just made: its segment awaits the check that sends it.
+        assert statuses(view) == ["reviewed", "stale", "reviewed"]
+        assert view._payload["progress"]["completed"] == [0, 1]
+    asyncio.run(scenario())
+
+
+def test_undo_after_a_review_keeps_the_results_of_segments_the_undo_does_not_change(qapp) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        view._refresh_derived()
+        type_at(view.source_edit, SOURCE.index("甲术段02") + 20, "改")
+        await review(view)
+        view._undo_replace()
+        view._refresh_derived()
+        assert statuses(view) == ["reviewed", "pending", "reviewed"]
+    asyncio.run(scenario())
+
+
+def test_a_failed_segment_keeps_the_others_and_the_next_run_continues_from_it(qapp) -> None:
+    async def scenario():
+        core = Core()
+        core.fail_once = {"甲术段02"}
+        view = make_view(core)
+        await review(view)
+        assert statuses(view) == ["reviewed", "failed", "reviewed"]
+        before = len(core.sent())
+        await review(view)
+        assert [body["source"][:5] for body in core.sent()[before:]] == ["甲术段02"]
+        assert statuses(view) == ["reviewed"] * 3
+    asyncio.run(scenario())
+
+
+def test_leaving_long_mode_moves_choices_to_history_and_the_file_stays_v3(qapp, tmp_path) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 0, 0)
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(SOURCE.index("甲术段02"))
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        view.source_edit.setTextCursor(cursor)
+        cursor.removeSelectedText()
+        view._refresh_derived()
+        assert "segments" not in view._payload or view._payload["segments"] == []
+        [entry] = view._payload["segment_choice_history"]
+        assert entry["source_span"]["text"] == "甲术" and entry["choice"] == "official_pair"
+        view._path = tmp_path / "short.json"
+        assert view.save_document()
+        assert load_workfile(view._path)["format"] == "wuwaterm-manuscript-v3"
+    asyncio.run(scenario())
+
+
+def test_automatic_alignment_says_how_many_segment_results_are_checked_again(qapp) -> None:
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        view._payload["alignments"] = []
+        await review(view)
+        view._use_auto_alignment()
+        view._refresh_derived()
+        assert view.status_label.text() == strings.MANUSCRIPT_AUTO_ALIGN_RECHECK.format(count=3)
+        assert statuses(view) == ["stale"] * 3
+    asyncio.run(scenario())
+
+
+def test_a_save_over_the_history_cap_changes_nothing_and_lists_entries_to_remove(qapp, tmp_path) -> None:
+    async def scenario():
+        view = make_view(Core())
+        view._refresh_derived()
+        entry = {"source_hash": "0" * 64, "source_span": {"start": 0, "end": 2, "text": "甲术"},
+                 "choice": "not_a_term", "candidate": None, "offered": []}
+        view._payload["segment_choice_history"] = [entry] * 513
+        path = tmp_path / "full.json"
+        view._path = path
+        assert not view.save_document() and not path.exists()
+        assert "512" in view.status_label.text() and view.conflict_list.count() == 513
+        view.conflict_list.setCurrentRow(0)
+        view.remove_choice_button.click()
+        assert len(view._payload["segment_choice_history"]) == 512 and view.conflict_list.isHidden()
+        assert view.save_document() and path.exists()
+    asyncio.run(scenario())
+
+
+def test_a_handled_semantic_suggestion_stays_handled_after_reopening_a_v3_file(qapp, tmp_path) -> None:
+    def issues(source, target):
+        if not source.startswith("甲术段02"):
+            return []
+        return [semantic_issue(source, target, source_quote="甲术段02", target_quote="Paragraph 02",
+                               replace="Paragraph 02", replacement="Paragraph two")]
+
+    async def scenario():
+        core = Core(capabilities=("semantic-review-v1",), issues=issues)
+        view = make_view(core)
+        await review(view)
+        view._show_track(TRACK_SEMANTIC)
+        view.semantic_list.setCurrentRow(0)
+        view.ignore_button.click()
+        reopened = reopen(view, tmp_path / "semantic.json", core)
+        assert load_workfile(tmp_path / "semantic.json")["format"] == "wuwaterm-manuscript-v3"
+        await review(reopened)
+        [live] = reopened._session.issues()
+        assert reopened._issue_state(live) == "ignored_carried"
+        assert reopened.semantic_track_button.text() == strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=0)
+        # The two tracks keep their own names and counts: term findings are not suggestions.
+        assert reopened.terms_track_button.text() == strings.MANUSCRIPT_TRACK_TERMS.format(count=7)
+    asyncio.run(scenario())
+
+
+class GatedCore(Core):
+    """Refuses the first request that carries resolutions with 400, but only
+    once the test opens ``gate``, so the test can edit while it is out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate, self.waiting = asyncio.Event(), False
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.url.path == "/v1/reviews" and body.get("resolutions") and not self.waiting:
+            self.requests.append((request.url.path, body))
+            self.waiting = True
+            await self.gate.wait()
+            return self.refuse(400, "invalid_request")
+        return Core.__call__(self, request)
+
+
+def test_an_edit_while_a_refused_request_is_out_sends_no_fallback_for_the_old_segment(qapp) -> None:
+    async def scenario():
+        core = GatedCore()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        view._start_review()
+        for _ in range(500):
+            if core.waiting:
+                break
+            await asyncio.sleep(0)
+        assert core.waiting, "the request with the choice went out"
+        sent = len(core.sent())
+        # The owner deletes segments 1 and 2 while Core is still answering.
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(SOURCE.index("甲术段02") - 2)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        core.gate.set()
+        for _ in range(200):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                break
+            await asyncio.wait(tasks)
+        assert view._semantic_state != "error"
+        assert len(core.sent()) == sent, "no fallback for a segment that is gone"
+    asyncio.run(scenario())

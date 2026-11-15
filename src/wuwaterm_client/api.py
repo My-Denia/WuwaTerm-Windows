@@ -565,13 +565,23 @@ class ApiClient:
     async def review_pair(
         self, source: str, target: str, direction: str, *,
         alignments: list[dict[str, Any]] | None = None,
+        resolutions: list[dict[str, Any]] | None = None,
+        resolution_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """One review-v2 term check. ``resolutions`` and ``resolution_context``
+        go out only when there are resolutions: review-v2 rejects a null
+        field, and non-empty resolutions need their context."""
+        if resolutions and resolution_context is None:
+            raise ValueError("resolutions need a resolution_context")
         body: dict[str, Any] = {
             "source": source, "target": target, "direction": direction,
             "review_version": "review-v2",
         }
         if alignments is not None:
             body["alignments"] = alignments
+        if resolutions:
+            body["resolutions"] = list(resolutions)
+            body["resolution_context"] = resolution_context
         response = await self._request(
             "POST", "/v1/reviews", json=body, matcher_basis=True,
         )

@@ -82,7 +82,8 @@ def term_report(source: str, target: str) -> dict:
         "request_id": "term", "source_revision": digest(source), "target_revision": digest(target),
         "rule_version": "review-v2", "matcher_revision": "a" * 64,
         "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "a" * 64},
-        "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["term"]}, "findings": [], "truncated": False,
+        "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "findings": [], "truncated": False,
     }
 
 
@@ -804,7 +805,7 @@ def test_editing_inside_an_ignored_issue_needs_reconfirmation_and_undo_restores_
     asyncio.run(scenario())
 
 
-def test_saving_again_after_history_was_trimmed_away_keeps_memory_and_file_in_step(qapp, tmp_path) -> None:
+def test_saving_a_long_manuscript_over_1_mib_keeps_memory_and_file_in_step(qapp, tmp_path) -> None:
     async def scenario():
         source = "\n\n".join(["甲。" * 550] * 125)
         target = "\n\n".join(["One. " * 220] * 125)
@@ -815,9 +816,12 @@ def test_saving_again_after_history_was_trimmed_away_keeps_memory_and_file_in_st
         view._path = tmp_path / "trimmed.json"
         assert view.save_document()
         written = load_workfile(view._path)
-        # Web's writer drops history to fit 1 MiB and still writes v2.
-        assert written["format"] == "wuwaterm-manuscript-v2" and written["semantic_history"] == []
-        assert view._payload["semantic_history"] == [], "memory holds what was written"
+        # A long manuscript carries its segment records, so it is written as v3
+        # (manuscript v3 SPEC "Which format"); v3 drops semantic history only
+        # over 44 MiB, not at the v1/v2 1 MiB cap.
+        assert written["format"] == "wuwaterm-manuscript-v3" and written["semantic_history"]
+        assert written["semantic_history"] == view._payload["semantic_history"], "memory holds what was written"
+        assert written["segments"] == view._payload["segments"]
         assert not view.document_dirty
         assert view.save_document()
         assert load_workfile(view._path)["source"] == source

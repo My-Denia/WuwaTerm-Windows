@@ -388,7 +388,9 @@ def test_oversized_files_drop_oldest_history_and_never_a_decision(fixtures) -> N
     written = json.loads(manuscript.serialize_workfile(payload))
     assert len(written["semantic_history"]) == 1
     assert written["semantic_decisions"] == payload["semantic_decisions"]
-    payload["source"] = payload["target"] = "长" * 400_000
+    # Over 1 MiB the writer falls back to v3 (manuscript v3 SPEC "Which
+    # format"), so only a file over the 44 MiB v3 cap still fails.
+    payload["source"] = payload["target"] = "长" * 8_000_000
     payload["semantic_history"] = []
     with pytest.raises(manuscript.WorkfileError) as raised:
         manuscript.serialize_workfile(payload)

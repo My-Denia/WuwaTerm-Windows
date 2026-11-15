@@ -162,7 +162,7 @@ def _term_report(source: str, target: str) -> dict:
         "request_id": "req-term-0001", "source_revision": _digest(source), "target_revision": _digest(target),
         "rule_version": "review-v2", "matcher_revision": "a" * 64,
         "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "a" * 64},
-        "coverage": {"evaluated": len(findings), "not_evaluated": 0, "rules": ["term"]},
+        "coverage": {"evaluated": len(findings), "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
         "findings": findings, "truncated": False,
     }
 

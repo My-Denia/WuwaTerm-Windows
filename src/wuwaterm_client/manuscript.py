@@ -1,7 +1,14 @@
-"""Read and safely save the public Web's v1 manuscript workfiles.
+"""Read and safely save the public Web's manuscript workfiles (v1, v2 and v3).
 
-Reports and decisions in imported files are historical data.  This module does
-not grant them runtime trust; a presentation layer must request a new review.
+Reports and decisions in v1/v2 files, and the document-mode choices in them, stay
+historical data (Core ADR 0015, unchanged): this module does not grant them runtime
+trust, and a presentation layer must request a new review.
+
+v3 segment records are the one exception.  A saved segment result is reused only
+when the content hashes, the request inputs and the live basis all match (public
+Web ``contracts/manuscript-v3/SPEC.md``, "Design note").  This module only parses and
+writes: it computes no hashes or digests, so whether a record is current is decided
+by the caller.
 """
 
 from __future__ import annotations
@@ -19,19 +26,53 @@ from .semantic import CATEGORIES, REVIEW_VERSION, valid_semantic_report
 
 WORKFILE_FORMAT = "wuwaterm-manuscript-v1"
 WORKFILE_FORMAT_V2 = "wuwaterm-manuscript-v2"
-MAX_WORKFILE_BYTES = 1_048_576
+WORKFILE_FORMAT_V3 = "wuwaterm-manuscript-v3"
+MAX_WORKFILE_BYTES = 1_048_576  # v1 and v2
+MAX_V3_BYTES = 46_137_344  # 44 MiB
+MAX_V3_TEXT_SCALARS = 46_137_344  # source, target and the semantic texts of a v3 file
 MAX_CHOICES = 32
 MAX_HISTORY = 2
 MAX_SEMANTIC_DECISIONS = 128
 MAX_SEMANTIC_HISTORY = 2
 MAX_SEMANTIC_TEXTS = 16
 MAX_HISTORY_SEGMENTS = 64
+MAX_V3_ITEMS = 512  # array items, any array of a v3 file (v1/v2: 128)
+MAX_SEGMENTS = 512
+MAX_SEGMENT_CHOICE_HISTORY = 512
+MAX_SEGMENT_CHOICES = 32  # per segment record
+MAX_RESULT_FINDINGS = 32
+MAX_FINDING_CANDIDATES = 8
+MAX_OFFERED = 8
+MAX_CORE_SCALARS = 2000  # a done or stale record's cores are 1 to 2,000 scalars
+SEGMENTATION_VERSION = "segmentation-v1"
+ALIGNMENT_AUTOMATIC = "automatic"
 _HEX = re.compile(r"^[a-f0-9]{64}$")
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 _TOP = {"format", "source", "target", "direction", "alignments", "choices", "history"}
 _TOP_V2 = _TOP | {"semantic_decisions", "semantic_texts", "semantic_history"}
+_V2_PART = ("source", "target", "direction", "alignments", "choices", "history",
+            "semantic_decisions", "semantic_texts", "semantic_history")
+_TOP_V3 = _TOP_V2 | {"segments", "segment_choice_history", "progress"}
+_RECORD_KEYS = {"index", "segmentation_version", "source_start", "source_end", "target_start", "target_end",
+                "source_hash", "target_hash", "status", "direction", "alignment_input", "basis", "result", "choices"}
+_RESULT_KEYS = {"truncated", "evaluated", "not_evaluated", "findings"}
+_FINDING_KEYS = {"verdict", "source", "target", "candidates", "candidates_truncated"}
+_CANDIDATE_KEYS = {"candidate_id", "zh", "en", "category"}
+_SEGMENT_CHOICE_KEYS = {"source_span", "choice", "candidate", "offered", "confirmed"}
+_HISTORY_CHOICE_KEYS = {"source_hash", "source_span", "choice", "candidate", "offered"}
 _DECISION_KEYS = {"issue_id", "fingerprint", "category", "segment_index", "source_revision",
                   "target_revision", "source_span", "target_span", "decision", "applied_text", "basis"}
 _VERDICTS = {"verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated"}
+
+_MSG_NOT_JSON = "无法读取 JSON 稿件文件。"
+_MSG_TOO_LARGE = "稿件文件超过大小上限（v1/v2 为 1 MiB，v3 为 44 MiB）；请把稿件拆成较小的几份。"
+_MSG_TOO_MANY_ENTRIES = "稿件文件条目过多；超过 512 段的稿件请拆成几份保存，选择历史过多时请先移除部分记录。"
+_MSG_SEGMENT_INVALID = "稿件的分段记录无效；当前稿件未被替换。"
+_MSG_SEGMENT_ORDER = "稿件的分段顺序或位置无效；当前稿件未被替换。"
+_MSG_SEGMENT_ANCHOR = "稿件的逐段术语选择位置无效；当前稿件未被替换。"
+_MSG_PROGRESS = "稿件的进度记录无效；当前稿件未被替换。"
+_MSG_INVALID_CONTENT = "稿件内容、选择或位置依据无效；当前稿件未被替换。"
+_MSG_DUPLICATE_CHOICES = "稿件包含同一位置的重复选择，未导入。"
 
 
 class WorkfileError(ValueError):
@@ -53,7 +94,7 @@ def _keys(value: Any, fields: set[str]) -> bool:
 
 def _text(value: Any, maximum: int = 2000, empty: bool = True) -> bool:
     return (isinstance(value, str) and (empty or bool(value)) and len(value) <= maximum
-            and not any(0xD800 <= ord(c) <= 0xDFFF for c in value))
+            and _LONE_SURROGATE.search(value) is None)
 
 
 def _int(value: Any, *, safe: bool = False) -> bool:
@@ -278,8 +319,8 @@ def occurrence_key(decision: Mapping[str, Any]) -> str:
                        bounds(decision["source_span"]), bounds(decision["target_span"])], separators=(",", ":"))
 
 
-def _semantic_text(value: Any) -> bool:
-    return _keys(value, {"revision", "text"}) and _hex(value["revision"]) and _text(value["text"], MAX_WORKFILE_BYTES)
+def _semantic_text(value: Any, text_limit: int) -> bool:
+    return _keys(value, {"revision", "text"}) and _hex(value["revision"]) and _text(value["text"], text_limit)
 
 
 def _history_segment(item: Any, source: str, target: str) -> bool:
@@ -291,10 +332,10 @@ def _history_segment(item: Any, source: str, target: str) -> bool:
             and valid_semantic_report(item["report"], source[a:b], target[c:d]))
 
 
-def _semantic_snapshot(value: Any) -> bool:
+def _semantic_snapshot(value: Any, text_limit: int) -> bool:
     """One semantic run over a whole manuscript: untrusted reference data."""
     return (_keys(value, {"source", "target", "direction", "segments"})
-            and _text(value["source"], MAX_WORKFILE_BYTES) and _text(value["target"], MAX_WORKFILE_BYTES)
+            and _text(value["source"], text_limit) and _text(value["target"], text_limit)
             and _direction(value["direction"]) and isinstance(value["segments"], list)
             and len(value["segments"]) <= MAX_HISTORY_SEGMENTS
             and all(_history_segment(item, value["source"], value["target"]) for item in value["segments"]))
@@ -355,63 +396,288 @@ def choice_conflict_groups(payload: Mapping[str, Any]) -> list[list[int]]:
     return [indices for indices in groups.values() if len(indices) > 1]
 
 
-def _safe_tree(value: Any, depth: int = 0) -> None:
+def _safe_tree(value: Any, depth: int = 0, items: int = 128) -> None:
     if depth > 16:
         raise WorkfileError("workfile_too_deep", "稿件文件嵌套过深。")
     if isinstance(value, list):
-        if len(value) > 128:
-            raise WorkfileError("workfile_too_many_entries", "稿件文件条目过多。")
+        if len(value) > items:
+            raise WorkfileError("workfile_too_many_entries", _MSG_TOO_MANY_ENTRIES)
         for child in value:
-            _safe_tree(child, depth + 1)
+            _safe_tree(child, depth + 1, items)
     elif isinstance(value, dict):
         if len(value) > 32:
             raise WorkfileError("workfile_too_many_fields", "稿件文件字段过多。")
         for key, child in value.items():
             if key in ("__proto__", "constructor", "prototype"):
                 raise WorkfileError("workfile_forbidden_field", "稿件文件含不支持的字段。")
-            _safe_tree(child, depth + 1)
+            _safe_tree(child, depth + 1, items)
 
 
-def parse_workfile(content: str) -> dict[str, Any]:
-    try:
-        size = len(content.encode("utf-8"))
-    except (AttributeError, UnicodeEncodeError) as exc:
-        raise WorkfileError("workfile_not_json", "无法读取 JSON 稿件文件。") from exc
-    if size > MAX_WORKFILE_BYTES:
-        raise WorkfileError("workfile_too_large", "稿件文件不能超过 1 MiB。")
-    try:
-        value = json.loads(content, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-    except (ValueError, RecursionError) as exc:
-        raise WorkfileError("workfile_not_json", "无法读取 JSON 稿件文件。") from exc
-    _safe_tree(value)
-    v2 = isinstance(value, dict) and value.get("format") == WORKFILE_FORMAT_V2
-    if not _keys(value, _TOP_V2 if v2 else _TOP) or value["format"] not in (WORKFILE_FORMAT, WORKFILE_FORMAT_V2):
-        raise WorkfileError("workfile_unsupported_format", "不支持此稿件格式或版本。")
+def _too_large() -> WorkfileError:
+    return WorkfileError("workfile_too_large", _MSG_TOO_LARGE)
+
+
+def _too_many() -> WorkfileError:
+    return WorkfileError("workfile_too_many_entries", _MSG_TOO_MANY_ENTRIES)
+
+
+def _segment_invalid() -> WorkfileError:
+    return WorkfileError("workfile_segment_invalid", _MSG_SEGMENT_INVALID)
+
+
+def _check_legacy_parts(value: dict[str, Any], v2: bool, text_limit: int) -> None:
+    """The v1 part, and the v2 part when ``v2``, with the v2 checks and codes.
+
+    ``text_limit`` is the only value that depends on the file format: the scalar
+    limit of the texts that are bounded by the file size."""
     source, target, choices, history = value["source"], value["target"], value["choices"], value["history"]
-    if (not _text(source, MAX_WORKFILE_BYTES) or not _text(target, MAX_WORKFILE_BYTES)
+    if (not _text(source, text_limit) or not _text(target, text_limit)
             or not _direction(value["direction"]) or not _alignments(value["alignments"], source, target)
             or not isinstance(choices, list) or len(choices) > MAX_CHOICES or not all(_choice(c) for c in choices)
             or not isinstance(history, list) or len(history) > MAX_HISTORY or not all(_snapshot(h) for h in history)):
-        raise WorkfileError("workfile_invalid_content", "稿件内容、选择或位置依据无效；当前稿件未被替换。")
+        raise WorkfileError("workfile_invalid_content", _MSG_INVALID_CONTENT)
     original = [(c["source"], c["direction"], _mention(c["source_span"])) for c in choices]
     if len(set(original)) != len(original) or choice_conflict_groups(value):
-        raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
+        raise WorkfileError("workfile_duplicate_choices", _MSG_DUPLICATE_CHOICES)
     if v2:
         decisions, texts, snapshots = value["semantic_decisions"], value["semantic_texts"], value["semantic_history"]
         if (not isinstance(decisions, list) or len(decisions) > MAX_SEMANTIC_DECISIONS
                 or not all(_decision(d) for d in decisions)
                 or not isinstance(texts, list) or len(texts) > MAX_SEMANTIC_TEXTS
-                or not all(_semantic_text(t) for t in texts)
+                or not all(_semantic_text(t, text_limit) for t in texts)
                 or len({t["revision"] for t in texts}) != len(texts)
                 or not isinstance(snapshots, list) or len(snapshots) > MAX_SEMANTIC_HISTORY
-                or not all(_semantic_snapshot(h) for h in snapshots)):
-            raise WorkfileError("workfile_invalid_content", "稿件内容、选择或位置依据无效；当前稿件未被替换。")
+                or not all(_semantic_snapshot(h, text_limit) for h in snapshots)):
+            raise WorkfileError("workfile_invalid_content", _MSG_INVALID_CONTENT)
         keys = [occurrence_key(d) for d in decisions]
         if len(set(keys)) != len(keys):
-            raise WorkfileError("workfile_duplicate_choices", "稿件包含同一位置的重复选择，未导入。")
+            raise WorkfileError("workfile_duplicate_choices", _MSG_DUPLICATE_CHOICES)
+
+
+def _normalize_integral_numbers(root: Any) -> None:
+    """Integral JSON numbers such as 3.0 read as 3, as they do in JavaScript."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        for key, child in list(node.items() if isinstance(node, dict) else enumerate(node)):
+            if isinstance(child, float) and child.is_integer():
+                node[key] = int(child)
+            elif isinstance(child, (dict, list)):
+                stack.append(child)
+
+
+# ---- v3 (public Web contracts/manuscript-v3/SPEC.md, "Reading" steps 3 to 10) ----
+
+def _nonempty(value: Any, maximum: int) -> bool:
+    return _text(value, maximum, False)
+
+
+def _pair_shape(value: Any) -> bool:
+    return (isinstance(value, list) and len(value) == 2 and _int(value[0], safe=True)
+            and _int(value[1], safe=True) and 0 <= value[0] < value[1])
+
+
+def _candidate_shape(value: Any) -> bool:
+    return (_keys(value, _CANDIDATE_KEYS) and _hex(value["candidate_id"]) and _nonempty(value["zh"], 2000)
+            and _nonempty(value["en"], 2000) and _nonempty(value["category"], 256))
+
+
+def _choice_span_shape(span: Any) -> bool:
+    return (_keys(span, {"start", "end", "text"}) and _int(span["start"], safe=True) and _int(span["end"], safe=True)
+            and span["start"] >= 0 and span["end"] > span["start"] and _nonempty(span["text"], 2000)
+            and span["end"] - span["start"] == len(span["text"]))
+
+
+def _basis_v3(value: Any) -> bool:
+    """A v3 basis: nothing is null or missing."""
+    dictionary = value.get("dictionary") if isinstance(value, dict) else None
+    return (_keys(value, {"rule_version", "dictionary", "matcher_revision"}) and value["rule_version"] == "review-v2"
+            and _keys(dictionary, {"schema_version", "source_commit", "term_count", "revision"})
+            and _nonempty(dictionary["schema_version"], 4096) and _nonempty(dictionary["source_commit"], 4096)
+            and _int(dictionary["term_count"], safe=True) and dictionary["term_count"] >= 0
+            and _hex(dictionary["revision"]) and _hex(value["matcher_revision"]))
+
+
+def _check_result_shape(result: Any) -> None:
+    if not (_keys(result, _RESULT_KEYS) and isinstance(result["truncated"], bool)
+            and _int(result["evaluated"], safe=True) and result["evaluated"] >= 0
+            and _int(result["not_evaluated"], safe=True) and result["not_evaluated"] >= 0
+            and isinstance(result["findings"], list)):
+        raise _segment_invalid()
+    if len(result["findings"]) > MAX_RESULT_FINDINGS:
+        raise _too_many()
+    for finding in result["findings"]:
+        if not (_keys(finding, _FINDING_KEYS) and isinstance(finding["verdict"], str) and finding["verdict"] in _VERDICTS
+                and _pair_shape(finding["source"]) and (finding["target"] is None or _pair_shape(finding["target"]))
+                and isinstance(finding["candidates_truncated"], bool) and isinstance(finding["candidates"], list)):
+            raise _segment_invalid()
+        candidates = finding["candidates"]
+        if len(candidates) > MAX_FINDING_CANDIDATES:
+            raise _too_many()
+        if (not all(_candidate_shape(c) for c in candidates)
+                or len({c["candidate_id"] for c in candidates}) != len(candidates)):
+            raise _segment_invalid()
+
+
+def _check_choice_shape(choice: Any, history: bool) -> None:
+    """A record choice (step 6) or a history choice (step 9)."""
+    if (not _keys(choice, _HISTORY_CHOICE_KEYS if history else _SEGMENT_CHOICE_KEYS)
+            or (history and not _hex(choice["source_hash"])) or not _choice_span_shape(choice["source_span"])):
+        raise _segment_invalid()
+    if choice["choice"] == "official_pair":
+        if not _candidate_shape(choice["candidate"]):
+            raise _segment_invalid()
+    elif choice["choice"] != "not_a_term" or choice["candidate"] is not None:
+        raise _segment_invalid()
+    offered = choice["offered"]
+    if not isinstance(offered, list):
+        raise _segment_invalid()
+    if len(offered) > MAX_OFFERED:
+        raise _too_many()
+    ascending = all(_hex(item) and (i == 0 or offered[i - 1] < item) for i, item in enumerate(offered))
+    if (len(offered) != 0) if choice["choice"] == "official_pair" else not ascending:
+        raise _segment_invalid()
+    if not history and not isinstance(choice["confirmed"], bool):
+        raise _segment_invalid()
+
+
+def _check_record_shape(record: Any, source_length: int, target_length: int) -> None:
+    if not _keys(record, _RECORD_KEYS):
+        raise _segment_invalid()
+
+    def within(start: Any, end: Any, length: int) -> bool:
+        return _int(start, safe=True) and _int(end, safe=True) and 0 <= start <= end <= length
+
+    if (not _int(record["index"], safe=True) or record["segmentation_version"] != SEGMENTATION_VERSION
+            or not within(record["source_start"], record["source_end"], source_length)
+            or not within(record["target_start"], record["target_end"], target_length)
+            or not _hex(record["source_hash"]) or not _hex(record["target_hash"])
+            or not (isinstance(record["status"], str) and record["status"] in ("pending", "done", "stale"))):
+        raise _segment_invalid()
+    # direction, alignment_input, basis and result are null exactly when the record is pending.
+    live = record["status"] != "pending"
+    if any((record[key] is None) == live for key in ("direction", "alignment_input", "basis", "result")):
+        raise _segment_invalid()
+    if live and (not _direction(record["direction"])
+                 or not (record["alignment_input"] == ALIGNMENT_AUTOMATIC or _hex(record["alignment_input"]))):
+        raise _segment_invalid()
+    if record["basis"] is not None and not _basis_v3(record["basis"]):
+        raise _segment_invalid()
+    if record["result"] is not None:
+        _check_result_shape(record["result"])
+    choices = record["choices"]
+    if not isinstance(choices, list):
+        raise _segment_invalid()
+    if len(choices) > MAX_SEGMENT_CHOICES:
+        raise _too_many()
+    for choice in choices:
+        _check_choice_shape(choice, False)
+    if not live and any(choice["confirmed"] for choice in choices):
+        raise _segment_invalid()
+
+
+def _check_record_content(record: dict[str, Any], source: str, target: str) -> None:
+    source_core = source[record["source_start"]:record["source_end"]]
+    target_core = target[record["target_start"]:record["target_end"]]
+    live = record["status"] != "pending"
+    findings = record["result"]["findings"] if live else []
+    if live:
+        if not (1 <= len(source_core) <= MAX_CORE_SCALARS and 1 <= len(target_core) <= MAX_CORE_SCALARS):
+            raise _segment_invalid()
+        seen: set[tuple[int, int]] = set()
+        for finding in findings:
+            span = (finding["source"][0], finding["source"][1])
+            if (span[1] > len(source_core) or (finding["target"] is not None and finding["target"][1] > len(target_core))
+                    or span in seen):
+                raise _segment_invalid()
+            seen.add(span)
+    anchor = WorkfileError("workfile_segment_anchor_invalid", _MSG_SEGMENT_ANCHOR)
+    for choice in record["choices"]:
+        span = choice["source_span"]
+        start, end = span["start"], span["end"]
+        if end > len(source_core) or source_core[start:end] != span["text"]:
+            raise anchor
+        if not live or not choice["confirmed"]:
+            continue
+        finding = next((f for f in findings if f["source"][0] == start and f["source"][1] == end), None)
+        if finding is None:
+            raise anchor
+        if choice["choice"] == "official_pair":
+            if choice["candidate"] not in finding["candidates"]:
+                raise anchor
+        elif sorted(c["candidate_id"] for c in finding["candidates"]) != choice["offered"]:
+            raise anchor
+    places = [(c["source_span"]["start"], c["source_span"]["end"]) for c in record["choices"]]
+    if len(set(places)) != len(places):
+        raise WorkfileError("workfile_duplicate_choices", _MSG_DUPLICATE_CHOICES)
+
+
+def _parse_v3(value: dict[str, Any]) -> dict[str, Any]:
+    _safe_tree(value, items=MAX_V3_ITEMS)  # step 3
+    if not _keys(value, _TOP_V3):  # step 4
+        raise WorkfileError("workfile_unsupported_format", "不支持此稿件格式或版本。")
+    # Step 5: what lib parseWorkfile does to the v1/v2 part, including the v2 array cap.
+    _safe_tree({"format": WORKFILE_FORMAT_V2, **{key: value[key] for key in _V2_PART}})
+    _check_legacy_parts(value, True, MAX_V3_TEXT_SCALARS)
+    _normalize_integral_numbers(value)
+    segments, source, target = value["segments"], value["source"], value["target"]
+    if not isinstance(segments, list):
+        raise _segment_invalid()
+    for record in segments:  # step 6
+        _check_record_shape(record, len(source), len(target))
+    for position, record in enumerate(segments):  # step 7
+        if record["index"] != position or (position and (
+                record["source_start"] < segments[position - 1]["source_end"]
+                or record["target_start"] < segments[position - 1]["target_end"])):
+            raise WorkfileError("workfile_segment_order", _MSG_SEGMENT_ORDER)
+    for record in segments:  # step 8
+        _check_record_content(record, source, target)
+    if not isinstance(value["segment_choice_history"], list):  # step 9
+        raise _segment_invalid()
+    for choice in value["segment_choice_history"]:
+        _check_choice_shape(choice, True)
+    progress = value["progress"]  # step 10
+    invalid = WorkfileError("workfile_progress_invalid", _MSG_PROGRESS)
+    if not _keys(progress, {"current", "completed"}):
+        raise invalid
+    current, completed = progress["current"], progress["completed"]
+    if current is not None and not (_int(current, safe=True) and 0 <= current < len(segments)):
+        raise invalid
+    if not isinstance(completed, list) or not all(
+            _int(n, safe=True) and (i == 0 or completed[i - 1] < n) and 0 <= n < len(segments)
+            and segments[n]["status"] in ("done", "stale") for i, n in enumerate(completed)):
+        raise invalid
+    return value
+
+
+def parse_workfile(content: str) -> dict[str, Any]:
+    """Read a v1, v2 or v3 workfile (public Web contracts/manuscript-v3/SPEC.md, "Reading")."""
+    try:
+        size = len(content.encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise WorkfileError("workfile_not_json", _MSG_NOT_JSON) from exc
+    if size > MAX_V3_BYTES:
+        raise _too_large()
+    try:
+        value = json.loads(content, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        parsed = True
+    except (ValueError, RecursionError):
+        value, parsed = None, False
+    if parsed and isinstance(value, dict) and value.get("format") == WORKFILE_FORMAT_V3:
+        return _parse_v3(value)
+    # Every other input gets the v2 reader's result, starting with its own 1 MiB check.
+    if size > MAX_WORKFILE_BYTES:
+        raise _too_large()
+    if not parsed:
+        raise WorkfileError("workfile_not_json", _MSG_NOT_JSON)
+    _safe_tree(value)
+    v2 = isinstance(value, dict) and value.get("format") == WORKFILE_FORMAT_V2
+    if not _keys(value, _TOP_V2 if v2 else _TOP) or value["format"] not in (WORKFILE_FORMAT, WORKFILE_FORMAT_V2):
+        raise WorkfileError("workfile_unsupported_format", "不支持此稿件格式或版本。")
+    _check_legacy_parts(value, v2, MAX_WORKFILE_BYTES)
     # Validation accepts integral JSON numbers such as 1200.0 (JavaScript
     # compatibility); offsets are used for slicing, so they become int here.
-    for items in [value["alignments"]] + [snapshot["alignments"] for snapshot in history]:
+    for items in [value["alignments"]] + [snapshot["alignments"] for snapshot in value["history"]]:
         for item in items or ():
             for span in (item["source"], item["target"]):
                 if span is not None:
@@ -438,28 +704,146 @@ def _dump(value: Mapping[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
 
 
+def _minify(value: Mapping[str, Any]) -> str:
+    """The canonical bytes of a v3 file: minified, no trailing newline (SPEC "Canonical bytes")."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+# Every dict of a v3 part is rebuilt in the SPEC's key order, so the order of the
+# input never leaks into the output.
+
+def _order_span(span: Mapping[str, Any]) -> dict[str, Any]:
+    return {"start": span["start"], "end": span["end"], "text": span["text"]}
+
+
+def _order_basis(basis: Mapping[str, Any]) -> dict[str, Any]:
+    dictionary = basis["dictionary"]
+    return {"rule_version": basis["rule_version"],
+            "dictionary": {"schema_version": dictionary["schema_version"], "source_commit": dictionary["source_commit"],
+                           "term_count": dictionary["term_count"], "revision": dictionary["revision"]},
+            "matcher_revision": basis["matcher_revision"]}
+
+
+def _order_candidate(candidate: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    return {"candidate_id": candidate["candidate_id"], "zh": candidate["zh"], "en": candidate["en"],
+            "category": candidate["category"]}
+
+
+def _order_choice(choice: Mapping[str, Any]) -> dict[str, Any]:
+    return {"source_span": _order_span(choice["source_span"]), "choice": choice["choice"],
+            "candidate": _order_candidate(choice["candidate"]), "offered": list(choice["offered"]),
+            "confirmed": choice["confirmed"]}
+
+
+def _order_history_choice(choice: Mapping[str, Any]) -> dict[str, Any]:
+    return {"source_hash": choice["source_hash"], "source_span": _order_span(choice["source_span"]),
+            "choice": choice["choice"], "candidate": _order_candidate(choice["candidate"]),
+            "offered": list(choice["offered"])}
+
+
+def _order_finding(finding: Mapping[str, Any]) -> dict[str, Any]:
+    target = finding["target"]
+    return {"verdict": finding["verdict"], "source": list(finding["source"]),
+            "target": None if target is None else list(target),
+            "candidates": [_order_candidate(c) for c in finding["candidates"]],
+            "candidates_truncated": finding["candidates_truncated"]}
+
+
+def _order_result(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {"truncated": result["truncated"], "evaluated": result["evaluated"],
+            "not_evaluated": result["not_evaluated"], "findings": [_order_finding(f) for f in result["findings"]]}
+
+
+def _order_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    basis = record["basis"]
+    return {"index": record["index"], "segmentation_version": record["segmentation_version"],
+            "source_start": record["source_start"], "source_end": record["source_end"],
+            "target_start": record["target_start"], "target_end": record["target_end"],
+            "source_hash": record["source_hash"], "target_hash": record["target_hash"], "status": record["status"],
+            "direction": record["direction"], "alignment_input": record["alignment_input"],
+            "basis": None if basis is None else _order_basis(basis), "result": _order_result(record["result"]),
+            "choices": [_order_choice(c) for c in record["choices"]]}
+
+
+def _v1_v2_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
+    """v1 bytes without semantic data; otherwise v2, dropping the oldest semantic
+    history snapshot until the file fits 1 MiB. Decisions are never dropped."""
+    decisions = list(payload.get("semantic_decisions") or [])
+    snapshots = list(payload.get("semantic_history") or [])[-MAX_SEMANTIC_HISTORY:]
+    if not decisions and not snapshots:
+        return _dump({"format": WORKFILE_FORMAT, **value})
+    texts = _semantic_texts_needed(payload)
+
+    def v2(history: list) -> str:
+        return _dump({"format": WORKFILE_FORMAT_V2, **value, "semantic_decisions": decisions,
+                      "semantic_texts": texts, "semantic_history": history})
+    content = v2(snapshots)
+    while snapshots and len(content.encode("utf-8")) > MAX_WORKFILE_BYTES:
+        snapshots.pop(0)
+        content = v2(snapshots)
+    return content
+
+
+def _v3_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
+    """Minified canonical v3 bytes. Only the oldest semantic history snapshots are
+    dropped, and only while the file is over 44 MiB; a file still too large fails."""
+    decisions = list(payload.get("semantic_decisions") or [])
+    snapshots = list(payload.get("semantic_history") or [])[-MAX_SEMANTIC_HISTORY:]
+    texts = _semantic_texts_needed(payload)
+    try:
+        records = [_order_record(r) for r in payload.get("segments") or []]
+    except (KeyError, TypeError) as exc:
+        raise _segment_invalid() from exc
+    try:
+        entries = [_order_history_choice(c) for c in payload.get("segment_choice_history") or []]
+    except (KeyError, TypeError) as exc:
+        raise _segment_invalid() from exc
+    try:
+        progress = payload.get("progress")
+        if progress is None:
+            progress = {"current": None, "completed": []}
+        ordered = {"current": progress["current"], "completed": list(progress["completed"])}
+    except (KeyError, TypeError) as exc:
+        raise WorkfileError("workfile_progress_invalid", _MSG_PROGRESS) from exc
+
+    def write(history: list) -> str:
+        return _minify({"format": WORKFILE_FORMAT_V3, **value, "semantic_decisions": decisions,
+                        "semantic_texts": texts, "semantic_history": history, "segments": records,
+                        "segment_choice_history": entries, "progress": ordered})
+    content = write(snapshots)
+    size = len(content.encode("utf-8"))
+    while snapshots and size > MAX_V3_BYTES:
+        snapshots.pop(0)
+        content = write(snapshots)
+        size = len(content.encode("utf-8"))
+    if size > MAX_V3_BYTES:
+        raise _too_large()
+    return content
+
+
 def serialize_workfile(payload: Mapping[str, Any]) -> str:
-    """v1 bytes without semantic data; otherwise v2, dropping the oldest
-    semantic history snapshot until the file fits. Decisions are never dropped."""
+    """The lowest format that holds the payload (SPEC "Writing").
+
+    Without ``segments`` and ``segment_choice_history``, the v1 or v2 bytes
+    (pretty-printed, as before) while they fit 1 MiB.  Otherwise v3: minified
+    canonical bytes of up to 44 MiB.  The payload may carry ``segments``,
+    ``segment_choice_history`` and ``progress`` (default: no position, nothing
+    completed).  The output is validated through ``parse_workfile``."""
     if not isinstance(payload, Mapping):
         raise WorkfileError("workfile_invalid_content", "稿件内容无效。")
     try:
         value = {key: payload[key] for key in ("source", "target", "direction", "alignments", "choices")}
         value["history"] = list(payload["history"])[-MAX_HISTORY:]
-        decisions = list(payload.get("semantic_decisions") or [])
-        snapshots = list(payload.get("semantic_history") or [])[-MAX_SEMANTIC_HISTORY:]
-        if decisions or snapshots:
-            texts = _semantic_texts_needed(payload)
-
-            def v2(history: list) -> str:
-                return _dump({"format": WORKFILE_FORMAT_V2, **value, "semantic_decisions": decisions,
-                              "semantic_texts": texts, "semantic_history": history})
-            content = v2(snapshots)
-            while snapshots and len(content.encode("utf-8")) > MAX_WORKFILE_BYTES:
-                snapshots.pop(0)
-                content = v2(snapshots)
-        else:
-            content = _dump({"format": WORKFILE_FORMAT, **value})
+        if not payload.get("segments") and not payload.get("segment_choice_history"):
+            content = _v1_v2_content(payload, value)
+            if len(content.encode("utf-8")) <= MAX_WORKFILE_BYTES:
+                parse_workfile(content)
+                return content
+        content = _v3_content(payload, value)
         parse_workfile(content)
         return content
     except (KeyError, TypeError, ValueError, RecursionError) as exc:
@@ -469,7 +853,7 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
 
 
 def semantic_payload_fits(payload: Mapping[str, Any]) -> bool:
-    """Whether the payload can be saved: valid and within the 1 MiB file limit."""
+    """Whether the payload can be saved: valid and within the file limit (44 MiB in v3)."""
     try:
         serialize_workfile(payload)
     except WorkfileError:
@@ -479,13 +863,14 @@ def semantic_payload_fits(payload: Mapping[str, Any]) -> bool:
 
 def load_workfile(path: str | Path) -> dict[str, Any]:
     with Path(path).open("rb") as file:
-        data = file.read(MAX_WORKFILE_BYTES + 1)
-    if len(data) > MAX_WORKFILE_BYTES:
-        raise WorkfileError("workfile_too_large", "稿件文件不能超过 1 MiB。")
+        data = file.read(MAX_V3_BYTES + 1)
+    if len(data) > MAX_V3_BYTES:
+        raise _too_large()
     try:
-        return parse_workfile(data.decode("utf-8"))
+        content = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise WorkfileError("workfile_not_json", "无法读取 JSON 稿件文件。") from exc
+        raise WorkfileError("workfile_not_json", _MSG_NOT_JSON) from exc
+    return parse_workfile(content)
 
 
 def save_workfile(path: str | Path, payload: Mapping[str, Any]) -> None:

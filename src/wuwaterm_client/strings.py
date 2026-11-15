@@ -571,12 +571,14 @@ MANUSCRIPT_ACCEPTED = "已采纳这条建议；可以撤销。"
 MANUSCRIPT_ADJUSTED = "已按调整修改译文；可以撤销。"
 MANUSCRIPT_IGNORED = "已忽略这条疑点；可以撤销。"
 MANUSCRIPT_RECONFIRM_NEEDED = "当前译文与疑点记录的位置不一致，未执行替换；需重新确认。"
-MANUSCRIPT_DECISIONS_FULL = "处理记录已满或稿件将超过 1 MiB，这条决定没有记录；请先保存并整理稿件。"
+MANUSCRIPT_DECISIONS_FULL = "处理记录已满或稿件超过大小上限，这条决定没有记录；请先保存并整理稿件。"
 MANUSCRIPT_ALL_HANDLED = "所有疑点都已处理。"
 MANUSCRIPT_SEGMENTS_NOTE = "长稿按段落配对审校，每段每侧最多 1,800 字。"
 MANUSCRIPT_SEGMENT_ITEM = "第 {number} 段 · {status}（原文 {source} 字，译文 {target} 字）"
 MANUSCRIPT_SEGMENT_STATUS = {
     "reviewed": "已审",
+    "saved": "已保存，待核对",
+    "stale": "待复核",
     "pending": "待审",
     "failed": "未完成",
     "not_reviewed": "模型输出无效，未审",
@@ -591,6 +593,9 @@ MANUSCRIPT_SEGMENT_HINT = {
     "unpaired_target": "译文多出一段，在原文里没有对应，可能是增译。这是确定性提示，没有调用模型。",
     "hard_cut": "此处为强制切分，边界附近可能误判。",
     "failed": "这一段的请求没有完成，继续审校时会重试。",
+    "saved": "这一段的术语结果是保存时的结果。开始审校时会先与服务核对一次，内容和依据都没变就直接沿用，不再重复审校。",
+    "stale": "这一段的术语结果已过期（审校依据、段落对应或选择有变），下次审校会重新核对。",
+    "finished_recheck": "这一段已标记完成，结果待重新核对。",
     "not_reviewed": "模型这次的输出无法使用，这一段没有审校；继续审校时会重试。",
     "truncated": "这一段疑点较多，另有 {count} 条没有显示。",
     "dropped": "模型提出的 {count} 条疑点无法在正文中定位，已舍弃。",
@@ -598,6 +603,16 @@ MANUSCRIPT_SEGMENT_HINT = {
 MANUSCRIPT_TRANSLATE = "翻译"
 MANUSCRIPT_TRANSLATE_SEGMENT = "翻译此段"
 MANUSCRIPT_TRANSLATING = "正在翻译第 {index}/{total} 段…"
+MANUSCRIPT_TRANSLATE_RETRYING = "正在重试第 {index}/{total} 段…"
+MANUSCRIPT_TRANSLATE_PAUSED = "翻译已暂停，已写入前 {done}/{total} 段，可以继续。"
+MANUSCRIPT_TRANSLATE_QUOTA = "服务暂时限额，翻译已暂停，已写入前 {done}/{total} 段；稍后可以继续。"
+MANUSCRIPT_TRANSLATE_FAILED = "第 {index}/{total} 段翻译失败：{reason} 已写入前 {done} 段，可以重试。"
+# A single-segment run writes its pieces only when the whole segment is done.
+MANUSCRIPT_TRANSLATE_SEGMENT_PAUSED = "翻译已暂停，这一段已译好 {done}/{total} 部分，尚未写入译文；继续翻译完成后一起写入。"
+MANUSCRIPT_TRANSLATE_SEGMENT_QUOTA = "服务暂时限额，翻译已暂停，这一段已译好 {done}/{total} 部分，尚未写入译文；稍后可以继续。"
+MANUSCRIPT_TRANSLATE_SEGMENT_FAILED = "这一段第 {index}/{total} 部分翻译失败：{reason} 已译好的 {done} 部分已保留、尚未写入译文，可以重试。"
+MANUSCRIPT_TRANSLATE_CONTINUE = "继续翻译"
+MANUSCRIPT_TRANSLATE_RETRY = "重试"
 MANUSCRIPT_TRANSLATED = "已写入机器翻译；请检查后再审校。可以撤销。"
 MANUSCRIPT_TRANSLATE_ONLY_BLANK = "只翻译空白的译文或尚未翻译的段落，不会覆盖已有译文。"
 MANUSCRIPT_TRANSLATE_CHANGED = "翻译期间正文已更改，没有写入译文。"
@@ -629,3 +644,48 @@ RECENT_MISSING_SUFFIX = "（文件不存在）"
 RECENT_REMOVE_MISSING = "移除不存在的条目"
 RECENT_CLEAR = "清除最近文件"
 RECENT_FILE_MISSING = "文件已不存在，无法打开：{name}"
+
+
+# -- Long manuscripts: resumable segment term review (manuscript v3) -----
+MANUSCRIPT_SAVED_REPORT = "已保存的逐段术语结果：{count} 条发现。尚未与当前服务核对，开始审校时会先核对一次。"
+MANUSCRIPT_REPORT_RECHECK = "其中 {count} 条所在的段落待重新核对。"
+MANUSCRIPT_SEGMENTS_SAVED = "{count} 段有已保存的术语结果；开始审校时先核对一次，未变的段落不再重复审校。"
+MANUSCRIPT_SEGMENTS_RECHECK = "{count} 段的术语结果需要重新核对。"
+MANUSCRIPT_SEGMENTS_FINISHED = "已标记完成 {count} 段。"
+MANUSCRIPT_FINDING_CHOSEN = "已记录选择"
+MANUSCRIPT_FINDING_RECONFIRM = "选择待重新确认"
+MANUSCRIPT_FINDING_RECHECK = "待复核"
+MANUSCRIPT_TERM_CHOICE_LABEL = "这一处的术语选择"
+MANUSCRIPT_TERM_CHOICE_RECORD = "记录选择"
+MANUSCRIPT_TERM_CHOICE_RECONFIRM = "重新确认"
+MANUSCRIPT_TERM_CHOICE_REMOVE = "移除选择"
+MANUSCRIPT_TERM_CHOICE_WAIT = "这是已保存的结果。开始审校、与服务核对之后，才能在这里记录选择。"
+MANUSCRIPT_TERM_CHOICE_NONE = "还没有记录选择。记录后，这一段下次审校时会把选择一并交给服务核对。"
+MANUSCRIPT_TERM_CHOICE_CHOSEN = "已记录：{choice}。"
+MANUSCRIPT_TERM_CHOICE_UNCONFIRMED = "待重新确认：{choice}。审校结果已变化，这条选择暂不生效；请重新确认或移除。"
+MANUSCRIPT_TERM_CHOICE_RECORDED = "已记录这一处的术语选择，这一段下次审校时会重新核对；可以撤销。"
+MANUSCRIPT_TERM_CHOICE_REMOVED = "已移除这一处的术语选择；可以撤销。"
+MANUSCRIPT_TERM_CHOICE_FAILED = "当前结果里已没有这一处或这个候选，选择没有记录。"
+MANUSCRIPT_CHOICE_OFFICIAL_SHORT = "官方术语 {candidate}"
+MANUSCRIPT_SEGMENT_FINISHED_MARK = "，已标记完成"
+MANUSCRIPT_SEGMENT_CHOICES_MARK = "，选择 {count} 条"
+MANUSCRIPT_SEGMENT_RECONFIRM_MARK = "（{count} 条待重新确认）"
+MANUSCRIPT_SEGMENT_FINISH = "标记完成"
+MANUSCRIPT_SEGMENT_UNFINISH = "取消完成"
+MANUSCRIPT_SEGMENT_FINISHED = "已把这一段标记为完成；可以撤销。"
+MANUSCRIPT_SEGMENT_UNFINISHED = "已取消这一段的完成标记；可以撤销。"
+MANUSCRIPT_NEXT_PENDING = "下一处待处理"
+MANUSCRIPT_NO_PENDING_SEGMENT = "没有待处理的段落。"
+MANUSCRIPT_SEGMENT_CHOICES = "这一段的术语选择"
+MANUSCRIPT_SEGMENT_CHOICE_ITEM = "{text} · {choice}"
+MANUSCRIPT_SEGMENT_CHOICE_UNCONFIRMED = "{text} · {choice}（待重新确认）"
+MANUSCRIPT_SEGMENT_CHOICE_HISTORY = "{text} · {choice}（历史选择，可恢复）"
+MANUSCRIPT_SEGMENT_CHOICE_RESTORE = "恢复选择"
+MANUSCRIPT_SEGMENT_CHOICE_RESTORED = "已把历史选择恢复到这一段，待重新确认；可以撤销。"
+MANUSCRIPT_TERM_RECHECK_COUNT = "{count} 段的术语结果需要重新核对。"
+MANUSCRIPT_AUTO_ALIGN_RECHECK = "已改为自动对应：{count} 段的术语结果需要重新核对，请重新审校。"
+MANUSCRIPT_TERM_NOT_STORABLE = "服务返回的术语结果缺少可核对的依据，无法保存为逐段结果；审校已停止。"
+MANUSCRIPT_HISTORY_FULL = "无法保存：选择历史有 {count} 条，超过上限 {limit} 条。请选中不再需要的历史选择移除，直到不超过上限再保存；移除可以撤销。"
+MANUSCRIPT_HISTORY_ITEM = "历史选择 {number}：{text} · {choice}"
+MANUSCRIPT_REMOVE_HISTORY_CHOICE = "移除选中的历史选择"
+MANUSCRIPT_HISTORY_CHOICE_REMOVED = "已移除选中的历史选择；可以撤销。"
