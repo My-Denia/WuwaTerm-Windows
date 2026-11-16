@@ -572,6 +572,8 @@ class ManuscriptView(QWidget):
         self._rows_dirty = False
         self._index: sessions.DecisionIndex | None = None
         self._segment_rows: list = []
+        # The pairing the rows were listed from (identity only).
+        self._segment_rows_from: list | None = None
         self._refreshing_lists = False
         self._translate_task: asyncio.Task | None = None
         self._translate_generation = 0
@@ -1789,7 +1791,7 @@ class ManuscriptView(QWidget):
             row = self._segment_cursor  # restored from progress.current on open
         self._refreshing_lists = True
         try:
-            self._segment_rows = list(pairs)
+            self._segment_rows, self._segment_rows_from = list(pairs), pairs
             self.segment_list.clear()
             for pair in pairs:
                 self.segment_list.addItem(strings.MANUSCRIPT_SEGMENT_ITEM.format(
@@ -1822,6 +1824,13 @@ class ManuscriptView(QWidget):
         return status
 
     def _current_segment(self):
+        """The selected row's pair, only while the rows list the current
+        pairing. Until the list is rebuilt after an edit, a row's offsets and
+        index belong to the old text: selecting, finishing or translating it
+        would act on the wrong range."""
+        pairs = self._cached_pairs()
+        if pairs is None or pairs is not self._segment_rows_from:
+            return None
         row = self.segment_list.currentRow()
         return self._segment_rows[row] if 0 <= row < len(self._segment_rows) else None
 

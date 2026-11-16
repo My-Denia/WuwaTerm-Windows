@@ -827,3 +827,33 @@ def test_opening_another_long_manuscript_lists_its_segments_and_marks_the_one_se
         assert view.new_document()
         assert_lists(view, 0)
     asyncio.run(scenario())
+
+
+def test_a_row_listed_before_an_undo_into_long_mode_does_nothing_until_the_list_follows(qapp) -> None:
+    """Undo back into long mode keeps the short text's rows listed until the debounced
+    refresh. Clicking one paired the text itself and enabled 「标记完成」 for a row whose
+    offsets and index were the short text's. Such a row now selects and marks nothing;
+    once the list follows, the selected row is the segment that gets marked."""
+    async def scenario():
+        view = make_view(Core())
+        await review(view)
+        view._show_track(TRACK_SEGMENTS)
+        assert view._replace_side("source", "\n\n".join(f"甲术段{i:02d}" + "文" * 100 for i in range(6)))
+        view._refresh_derived()
+        assert not view._long_now() and view.segment_list.count() > 1
+        view._undo_replace()
+        assert view._long_now() and view.segment_list.currentRow() != 1
+        view.segment_list.setCurrentRow(1)  # within the debounce: the short text's row
+        assert not view.finish_button.isEnabled()
+        assert not view.source_edit.textCursor().hasSelection() and not view.target_edit.textCursor().hasSelection()
+        view._refresh_derived()
+        pair = view._current_pairs()[1]
+        view.segment_list.setCurrentRow(0)
+        view.segment_list.setCurrentRow(1)
+        for editor, region in ((view.source_edit, pair.source), (view.target_edit, pair.target)):
+            cursor = editor.textCursor()
+            assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end), editor.side
+        assert view.finish_button.isEnabled()
+        view.finish_button.click()
+        assert view._payload["progress"]["completed"] == [1]
+    asyncio.run(scenario())
