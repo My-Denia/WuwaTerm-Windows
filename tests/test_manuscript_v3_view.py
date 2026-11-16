@@ -14,7 +14,7 @@ import json
 import httpx
 import pytest
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from test_manuscript_semantic import issue as semantic_issue, semantic_report
 from wuwaterm_client import strings
@@ -772,4 +772,115 @@ def test_an_unconfirmed_choice_of_a_checked_segment_still_asks_for_reconfirmatio
         assert_reconfirm("reviewed")
         reopen(view, tmp_path / "moved.json", core)
         assert_reconfirm("saved")
+    asyncio.run(scenario())
+
+
+def test_opening_another_long_manuscript_lists_its_segments_and_marks_the_one_selected(qapp, tmp_path, monkeypatch) -> None:
+    """Native acceptance of 0.5.0: with 「段落」 showing, opening a three-segment manuscript
+    after a five-segment one kept the five old rows (「0 / 5」 under 「段落 3」); a stale
+    row selected its old range across two segments of the new text, and 「标记完成」
+    marked that index in the new file. Each open, and a new document, lists exactly its
+    own segments, so the selected row is the segment that gets marked."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+    # One paragraph per segment, cores 905 scalars long against 1,392 in SOURCE.
+    five = ("\n\n".join(f"甲术节{i:02d}" + "字" * 900 for i in range(5)),
+            "\n\n".join(f"Section {i:02d} ".ljust(400, "y") for i in range(5)))
+
+    def assert_lists(view: ManuscriptView, count: int) -> None:
+        pairs, records = view._current_pairs(), view._records()
+        assert len(pairs) == count
+        assert [view.segment_list.item(row).text() for row in range(view.segment_list.count())] == [
+            strings.MANUSCRIPT_SEGMENT_ITEM.format(
+                number=pair.index + 1, status=view._segment_row_status(pair, records),
+                source=pair.source.core_end - pair.source.core_start,
+                target=pair.target.core_end - pair.target.core_start) for pair in pairs]
+        row = view.segment_list.currentRow()
+        assert view.finding_count.text() == strings.MANUSCRIPT_FINDING_COUNT.format(
+            current=row + 1 if row >= 0 else 0, total=count)
+        assert view.segments_track_button.text() == strings.MANUSCRIPT_TRACK_SEGMENTS.format(count=count)
+
+    async def scenario():
+        core = Core()
+        for name, (source, target) in (("five.json", five), ("three.json", (SOURCE, TARGET))):
+            author = make_view(core, source, target)
+            await review(author)
+            author._path = tmp_path / name
+            assert author.save_document()
+        view = make_view(core, "", "")
+        view._show_track(TRACK_SEGMENTS)
+        for name, count in (("five.json", 5), ("three.json", 3)):
+            assert view.open_path(tmp_path / name)
+            assert_lists(view, count)
+        pair = view._current_pairs()[1]
+        assert view.segment_list.currentRow() != 1
+        view.segment_list.setCurrentRow(1)  # as a click: no track switch that would rebuild the list
+        for editor, region in ((view.source_edit, pair.source), (view.target_edit, pair.target)):
+            cursor = editor.textCursor()  # BMP text without CR: scalar == Qt position
+            assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end), editor.side
+        assert view.finish_button.isEnabled()
+        view.finish_button.click()
+        assert view._payload["progress"]["completed"] == [1]
+        assert [strings.MANUSCRIPT_SEGMENT_FINISHED_MARK in view.segment_list.item(row).text()
+                for row in range(view.segment_list.count())] == [False, True, False]
+        assert view.save_document()
+        assert load_workfile(tmp_path / "three.json")["progress"]["completed"] == [1]
+        assert view.new_document()
+        assert_lists(view, 0)
+    asyncio.run(scenario())
+
+
+def test_a_row_listed_before_an_undo_into_long_mode_does_nothing_until_the_list_follows(qapp) -> None:
+    """Undo back into long mode keeps the short text's rows listed until the debounced
+    refresh. Clicking one paired the text itself and enabled 「标记完成」 for a row whose
+    offsets and index were the short text's. Such a row now selects and marks nothing;
+    once the list follows, the selected row is the segment that gets marked."""
+    async def scenario():
+        view = make_view(Core())
+        await review(view)
+        view._show_track(TRACK_SEGMENTS)
+        assert view._replace_side("source", "\n\n".join(f"甲术段{i:02d}" + "文" * 100 for i in range(6)))
+        view._refresh_derived()
+        assert not view._long_now() and view.segment_list.count() > 1
+        view._undo_replace()
+        assert view._long_now() and view.segment_list.currentRow() != 1
+        view.segment_list.setCurrentRow(1)  # within the debounce: the short text's row
+        assert not view.finish_button.isEnabled()
+        assert not view.source_edit.textCursor().hasSelection() and not view.target_edit.textCursor().hasSelection()
+        view._refresh_derived()
+        pair = view._current_pairs()[1]
+        view.segment_list.setCurrentRow(0)
+        view.segment_list.setCurrentRow(1)
+        for editor, region in ((view.source_edit, pair.source), (view.target_edit, pair.target)):
+            cursor = editor.textCursor()
+            assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end), editor.side
+        assert view.finish_button.isEnabled()
+        view.finish_button.click()
+        assert view._payload["progress"]["completed"] == [1]
+    asyncio.run(scenario())
+
+
+def test_a_row_clicked_before_the_list_follows_an_edit_is_the_selected_segment_afterwards(qapp, tmp_path, monkeypatch) -> None:
+    """A click between an edit and the list's refresh selects nothing at once; once the
+    list follows, that row is the selected segment: both editors select its cores and a
+    save writes it as progress.current, not the row selected before the edit."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        path = tmp_path / "position.json"
+        reopen(view, path, core)
+        view._show_track(TRACK_SEGMENTS)
+        view.segment_list.setCurrentRow(0)
+        type_at(view.target_edit, TARGET.index("Paragraph 00") + 20, "改")
+        view.segment_list.setCurrentRow(2)  # within the debounce
+        view._refresh_derived()
+        assert view.segment_list.currentRow() == 2
+        pair = view._current_pairs()[2]
+        for editor, region in ((view.source_edit, pair.source), (view.target_edit, pair.target)):
+            cursor = editor.textCursor()
+            assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end), editor.side
+        assert view.save_document()
+        assert load_workfile(path)["progress"]["current"] == 2
     asyncio.run(scenario())
