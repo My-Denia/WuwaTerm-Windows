@@ -507,7 +507,7 @@ job 名是 `locked dependencies (critical/high)`。每条阻断的漏洞会有�
 
 `release.yml` 手动构建指定的完整 main 祖先提交，要求该提交在 `main` 上的 CI 完整成功——`push` 运行，或对同一提交手动 dispatch 的 `ci.yml` 运行；默认只构建，取消 dry run 才创建草稿。只改 `README.md`、`README.*.md`、`CHANGELOG.md`、`docs/**`、`provenance/**` 的提交不启动 `ci.yml`，因为这类改动到不了运行时、契约、依赖和打包出的 exe；发布必须改 `pyproject.toml` 和 `src/wuwaterm_client/__init__.py` 里的版本，这两个文件不在跳过清单里，所以发布源码总有自己的一次完整运行。因此不要把 `ci.yml` 的 job 设成 required status check：只改文档的 PR 不会启动它，设了就会永远等一个不会出现的状态。需要时可以用 `workflow_dispatch` 对 `main` 手动跑整套 CI。草稿包含 ZIP、`SHA256SUMS` 和记录版本、源码提交、ZIP 哈希及未签名状态的 manifest。检查产物及实际 Windows 启动后，再单独发布草稿。发布草稿和构建是两个步骤。
 
-检查产物并在 Windows 上真实启动后，用下面的命令发布草稿（`vX.Y.Z` 换成这次的标签，`<源码提交>` 换成发布的完整源码提交）：
+发布草稿用下面的命令（`vX.Y.Z` 换成这次的标签，`<源码提交>` 换成发布的完整源码提交）：
 
 ```bash
 gh release edit vX.Y.Z --repo My-Denia/WuwaTerm-Windows --draft=false --prerelease=false --latest --target <源码提交>
