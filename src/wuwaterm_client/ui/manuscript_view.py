@@ -1801,7 +1801,13 @@ class ManuscriptView(QWidget):
             self.segment_list.setCurrentRow(row if row < len(pairs) else -1)
         finally:
             self._refreshing_lists = False
-        self._render_segment(self._current_segment())
+        pair = self._current_segment()
+        if pair is not None and pair.index != self._segment_cursor:
+            # A row clicked while the list still held the old text: now that
+            # it lists this text, the row is the selected segment.
+            self._segment_cursor = pair.index
+            self._select_cores(pair)
+        self._render_segment(pair)
 
     def _segment_row_status(self, pair, records: list | None) -> str:
         """The row's state, its finished mark and its choices, in words."""
@@ -2008,8 +2014,11 @@ class ManuscriptView(QWidget):
             self._segment_cursor = pair.index
         self._render_segment(pair)
         self._update_tracks()
-        if pair is None:
-            return
+        if pair is not None:
+            self._select_cores(pair)
+
+    def _select_cores(self, pair) -> None:
+        """Select the pair's source and target cores in the editors."""
         source, target = self._payload["source"], self._payload["target"]
         for editor, text, region in ((self.source_edit, source, pair.source), (self.target_edit, target, pair.target)):
             if region.core_end > region.core_start:

@@ -857,3 +857,30 @@ def test_a_row_listed_before_an_undo_into_long_mode_does_nothing_until_the_list_
         view.finish_button.click()
         assert view._payload["progress"]["completed"] == [1]
     asyncio.run(scenario())
+
+
+def test_a_row_clicked_before_the_list_follows_an_edit_is_the_selected_segment_afterwards(qapp, tmp_path, monkeypatch) -> None:
+    """A click between an edit and the list's refresh selects nothing at once; once the
+    list follows, that row is the selected segment: both editors select its cores and a
+    save writes it as progress.current, not the row selected before the edit."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        path = tmp_path / "position.json"
+        reopen(view, path, core)
+        view._show_track(TRACK_SEGMENTS)
+        view.segment_list.setCurrentRow(0)
+        type_at(view.target_edit, TARGET.index("Paragraph 00") + 20, "改")
+        view.segment_list.setCurrentRow(2)  # within the debounce
+        view._refresh_derived()
+        assert view.segment_list.currentRow() == 2
+        pair = view._current_pairs()[2]
+        for editor, region in ((view.source_edit, pair.source), (view.target_edit, pair.target)):
+            cursor = editor.textCursor()
+            assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end), editor.side
+        assert view.save_document()
+        assert load_workfile(path)["progress"]["current"] == 2
+    asyncio.run(scenario())
