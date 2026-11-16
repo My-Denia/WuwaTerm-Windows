@@ -667,3 +667,32 @@ def test_an_exported_long_report_says_which_segment_was_truncated(qapp, tmp_path
         assert MD["truncatedLine"] in second and " · " + MD["candidatesTruncatedLine"] in second
         assert not any(MD["truncatedLine"] in part for part in sections if part.startswith(("1 段", "3 段")))
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("before", [0, 2], ids=["forward", "back"])
+def test_a_segment_jump_shows_the_start_of_a_segment_taller_than_the_editor(qapp, before) -> None:
+    """Native acceptance at 150%: jumping back to a segment taller than the editor left
+    only its last line on screen. Forward and back, both editors show the core's first
+    line, and the core stays selected."""
+    view = make_view(Core())
+    view.resize(900, 520)
+    view.show()
+    qapp.processEvents()
+    view._refresh_derived()
+    pairs = view._current_pairs()
+
+    def at(editor, position: int):
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(position)  # SOURCE and TARGET are BMP text without CR: scalar == Qt position
+        return editor.cursorRect(cursor)
+
+    select_segment(view, before)
+    select_segment(view, 1)
+    qapp.processEvents()
+    for editor, region in ((view.source_edit, pairs[1].source), (view.target_edit, pairs[1].target)):
+        cursor = editor.textCursor()
+        assert (cursor.selectionStart(), cursor.selectionEnd()) == (region.core_start, region.core_end)
+        assert editor.viewport().rect().contains(at(editor, region.core_start)), editor.side
+    assert not view.source_edit.viewport().rect().contains(at(view.source_edit, pairs[1].source.core_end)), \
+        "the source segment is taller than the editor"
+    view.close()

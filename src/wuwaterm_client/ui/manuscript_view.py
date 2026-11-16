@@ -459,9 +459,14 @@ class LosslessEditor(QPlainTextEdit):
             left, right = self._bounds.index(start), self._bounds.index(end)
         except ValueError:
             return False
+        # Qt scrolls to the caret, not the anchor. Show the end first, then put the
+        # caret on the start: a span that fits the editor is wholly in view, and one
+        # taller than the editor shows its first line instead of its last.
         cursor = self.textCursor()
-        cursor.setPosition(_utf16_position(self._shown, left))
-        cursor.setPosition(_utf16_position(self._shown, right), QTextCursor.MoveMode.KeepAnchor)
+        cursor.setPosition(_utf16_position(self._shown, right))
+        if move_cursor:
+            self.setTextCursor(cursor)
+        cursor.setPosition(_utf16_position(self._shown, left), QTextCursor.MoveMode.KeepAnchor)
         if move_cursor:
             self.setTextCursor(cursor)
         selection = QTextEdit.ExtraSelection()
