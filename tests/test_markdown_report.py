@@ -168,10 +168,29 @@ def test_segment_choices_follow_their_segment_and_user_text_stays_literal() -> N
     data["segment_choice_history"] = 2
     text = mdr.render(data)
     assert ("### 第 3 段 · 尚未核对\n\n此段还没有核对结果。\n\n- 术语选择 · `乙术` · 原文位置 7–8 · 这里不是术语 · "
-            "需重新确认，不会自动应用") in text
+            "等待此段核对后生效") in text
     assert "选择历史：2 条" in text
     # Backticks in user text are fenced with a longer run, never closed early.
     assert "``` 理由`x` ```" not in text and "`` 理由`x` ``" in text
+
+
+def test_choices_of_a_pending_segment_wait_and_only_a_checked_segment_asks_for_reconfirmation() -> None:
+    """A pending record has no result: its choices, confirmed or not, wait for the
+    segment's check, which realigns them (SPEC "Runtime" step 7), as the workbench
+    shows them. Only an unconfirmed choice of a record with a result needs
+    reconfirmation and is not applied."""
+    data = sample()
+
+    def choice(start: int, end: int, confirmed: bool) -> dict:
+        return {"source_span": {"start": start, "end": end, "text": SOURCE[start:end]}, "choice": "not_a_term",
+                "candidate": None, "offered": [], "confirmed": confirmed}
+
+    choices = [choice(0, 2, True), choice(6, 8, False)]
+    data["segment_terms"] = [{"index": 0, "state": "pending", "stale": True, "findings": [], "choices": choices},
+                             {"index": 1, "state": "stale", "stale": True, "findings": [], "choices": choices}]
+    lines = [line for line in mdr.render(data).split("\n") if line.startswith("- 术语选择 · ")]
+    assert [line.rsplit(" · ", 1)[1] for line in lines] == [
+        "等待此段核对后生效", "等待此段核对后生效", "已确认，随核对提交", "需重新确认，不会自动应用"]
 
 
 def test_an_exported_report_is_recognized_by_its_first_line_as_on_the_web() -> None:

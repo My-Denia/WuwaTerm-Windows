@@ -104,6 +104,8 @@ MD = {
     "segmentChoiceLabel": "术语选择",
     "segmentChoiceConfirmed": "已确认，随核对提交",
     "segmentChoiceUnconfirmed": "需重新确认，不会自动应用",
+    # A pending segment's choices wait for its check, which realigns them (the Web's ``choiceWaiting``).
+    "segmentChoiceWaiting": "等待此段核对后生效",
     "segmentChoiceHistory": "选择历史：{n} 条（原位置已不在任何段落中，不会应用；保留在稿件中）。",
     "semanticCoverage": "已审校段落：{reviewed} / {total}",
     "semanticResolved": "已处理 {n} 条；这不代表整句语义已认证。",
@@ -634,7 +636,8 @@ def render(data: Mapping[str, Any]) -> str:
                 out.extend([*_bullets([
                     MD["segmentChoiceLabel"] + " · " + inline(c["source_span"]["text"]) + " · " + _span_label(c["source_span"])
                     + " · " + _pair(c["candidate"]) + " · "
-                    + (MD["segmentChoiceConfirmed"] if c["confirmed"] else MD["segmentChoiceUnconfirmed"])
+                    + (MD["segmentChoiceWaiting"] if state == "pending"
+                       else MD["segmentChoiceConfirmed"] if c["confirmed"] else MD["segmentChoiceUnconfirmed"])
                     for c in segment["choices"]]), ""])
     if data.get("segment_choice_history"):
         paragraph(fill(MD["segmentChoiceHistory"], n=data["segment_choice_history"]))
