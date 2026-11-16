@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.4.2**(2026-11-12 发布,见下文「发布」一节的发布记录;下载步骤以它为例)。这是一次界面修复:未配置状态下术语页的标题/状态行与空状态卡片不再拉伸,查词区的 Tab 顺序按视觉顺序经过分类筛选。它有自己的版本号,与服务端的版本号分开走。
+当前版本 **0.5.0**(发布日期与资产见下文「发布」一节的发布记录;下载步骤以它为例)。这一版让长稿件可以接着做:逐段术语记录、选择和进度随稿件保存为 `wuwaterm-manuscript-v3`,可与公共 Web 互读;只改译文不再取消未确认的选择;审校报告可导出为 Markdown,审校会说明正在处理哪一段。它有自己的版本号,与服务端的版本号分开走。
 
 这个客户端说的是 HTTP 接口的 **`v1`** 版本 —— 也就是 `/v1/*` 这组路径,以及
 `GET /v1/meta` 回复里的 `api_version` 字段。稿件审校还需要服务端支持 `review-v2`;语义审校和翻译
@@ -32,11 +32,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载 `WuwaTerm-0.4.2-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
+1. 下载 `WuwaTerm-0.5.0-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.4.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.5.0-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
@@ -65,7 +65,7 @@ Get-FileHash .\WuwaTerm-0.4.2-windows-x64.zip -Algorithm SHA256
 
 ## 它能做什么
 
-以下为 0.4.2 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
+以下为 0.5.0 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
 
 - 通过共享的「词典优先」流水线翻译文本(`POST /v1/translations`),方向可自动判定,
   也可强制指定。
@@ -509,6 +509,7 @@ job 名是 `locked dependencies (critical/high)`。每条阻断的漏洞会有�
 
 ### 发布记录
 
+- v0.5.0（待发布）：长稿件逐段术语记录、选择与进度随稿件保存（`wuwaterm-manuscript-v3`，重开后只发一次核对请求即可接着做）；只改译文时保留未确认的选择；导出 Markdown 审校报告，保留截断提示与围栏中的空行，拒绝写入当前稿件文件；审校显示正在处理的段落；跳到某一段后显示它的第一行；尚未核对的段落里的选择在工作台和 Markdown 报告里标为「等待此段核对后生效」，不再显示成待重新确认；打开另一份长稿件后，段落列表只列出它自己的段落；编辑后立刻点击的段落行会成为选中并保存的位置。150% DPI 单屏原生交互验收已在 owner 设备上完成（MY-201），混合 DPI 多屏拖窗没有验收；发布资产与 SHA-256 在发布后补登。
 - v0.4.2（2026-11-12）：修复空状态卡片内部行高被拉伸、动作行多出的底色带，并让查词区 Tab 顺序按查询→分类→搜索。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.2)，源码提交 `14f0c36ce1767333a8c7bde0085594d61676ca12`，发布 CI 校验的 main push 运行 43224935120。`WuwaTerm-0.4.2-windows-x64.zip` 的 SHA-256 为 `824b694c9b157a121e04ddd4bebb77f8cac2e7eb371fd610e94b39edf05d8d47`。未做 Windows 代码签名；多 DPI、混合 DPI 多屏、输入法和视觉收尾仍待 owner 设备验收。
 - v0.4.1（2026-11-12）：修复未配置状态下术语查词页的标题与状态行拉伸，搜索框回到标题下方。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.1)，源码提交 `cd10a05a4e321700de946c6e3c65fc63bf3ed794`，发布 CI 校验的 main push 运行 43207816423。`WuwaTerm-0.4.1-windows-x64.zip` 的 SHA-256 为 `4d248a0ead40b905d2269698fce62e82152c49c9aff02881d8724ea3cf781cc9`。未做 Windows 代码签名。能力与 0.4.0 相同，无新增服务端能力要求；多 DPI、混合 DPI 多屏、输入法和视觉收尾仍待 owner 设备验收。
 - v0.4.0（2026-11-10）：[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.0)，源码提交 `3b04b28d62bc22613a05f44f8d040d1a783f237a`，发布 CI 校验的 main push 运行 42811759415。`WuwaTerm-0.4.0-windows-x64.zip` 的 SHA-256 为 `32e56eace287be0f1d965c904dcb230a254b2b84570c3b11e7337cd1f81b4c83`。未做 Windows 代码签名。未在真机验收的项：多 DPI、混合 DPI 多屏、输入法（含候选窗位置修复）和视觉收尾，仍待 owner 设备验收；0.3.0 已知的 1 像素边框偏差也未重新核实。新能力需要 Core 0.8.0，旧版 Core 自动降级。
