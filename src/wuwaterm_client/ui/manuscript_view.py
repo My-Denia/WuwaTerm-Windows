@@ -3545,22 +3545,8 @@ class ManuscriptView(QWidget):
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
             return False
-        self.documentLeaving.emit()
-        self._pending_issue_id = None
-        self._restore_serial += 1
-        self._invalidate_report()
-        self._stop_translation()
-        self._clear_semantic()
-        self._undo_history.clear()
-        self._redo_history.clear()
-        self._undo_sessions.clear()
-        self._redo_sessions.clear()
-        self._conflict_mode = self._history_removal = False
-        self._refresh_conflicts()
-        self._set_payload(value)
-        self._reset_term_session((value.get("progress") or {}).get("current"))
+        self._replace_document(value, (value.get("progress") or {}).get("current"))
         self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
-        self._session_snapshots = []
         # The loaded texts are the versions on-file decisions usually refer to;
         # keep them so an edit before the next review does not lose them.
         for text in (value["source"], value["target"]):
@@ -3581,6 +3567,18 @@ class ManuscriptView(QWidget):
     def new_document(self, _checked: bool = False) -> bool:
         if not self.confirm_discard():
             return False
+        value = empty_workfile()
+        self._replace_document(value, None)
+        self._known_texts = {}
+        self._saved_payload = _copy_payload(value)
+        self._path = None
+        self._set_review_state("none")
+        self._update_controls()
+        return True
+
+    def _replace_document(self, value: dict, cursor: int | None) -> None:
+        """Leave the open manuscript and hold ``value`` in its place: the one
+        way opening and New replace the whole document."""
         self.documentLeaving.emit()
         self._pending_issue_id = None
         self._restore_serial += 1
@@ -3593,16 +3591,15 @@ class ManuscriptView(QWidget):
         self._redo_sessions.clear()
         self._conflict_mode = self._history_removal = False
         self._refresh_conflicts()
-        value = empty_workfile()
         self._set_payload(value)
-        self._reset_term_session(None)
-        self._known_texts = {}
+        self._reset_term_session(cursor)
         self._session_snapshots = []
-        self._saved_payload = _copy_payload(value)
-        self._path = None
-        self._set_review_state("none")
-        self._update_controls()
-        return True
+        # Clearing the runs above listed the outgoing manuscript's segments,
+        # and an open caches the new pairing, so no refresh would follow: a
+        # stale row selected its old offsets in the new text and marked its
+        # index. Rebuilt after the cursor reset, so progress.current is the
+        # row selected, never the old one.
+        self._refresh_segments()
 
     # -- report export ----------------------------------------------------------
     def _report_input(self) -> dict:
