@@ -194,6 +194,10 @@ class LosslessEditor(QPlainTextEdit):
         self._ime_active = False
         self._ime_origin: tuple[int, int] | None = None
         self._ignore_ime_changes = False
+        self._placeholder_text = self.placeholderText()
+        self._pending_view: dict | None = None
+        self._ime_view: dict | None = None
+        self.last_edit_view: dict | None = None
         # The raw range the last accepted edit replaced: (start, old_end,
         # new_length) in scalar offsets. It comes from the edit itself, never
         # from comparing texts, so repeated text cannot make it ambiguous.
@@ -205,6 +209,25 @@ class LosslessEditor(QPlainTextEdit):
 
     def raw_text(self) -> str:
         return self._raw
+
+    def setPlaceholderText(self, text: str) -> None:  # noqa: N802
+        self._placeholder_text = text
+        super().setPlaceholderText("" if self._ime_active else text)
+
+    def view_state(self) -> dict:
+        """Transient Qt positions: UTF-16 units, never manuscript offsets."""
+        cursor = self.textCursor()
+        return {"position": cursor.position(), "anchor": cursor.anchor(),
+                "vertical": self.verticalScrollBar().value(), "horizontal": self.horizontalScrollBar().value()}
+
+    def restore_view_state(self, state: dict) -> None:
+        cursor = self.textCursor()
+        end = self.document().characterCount() - 1
+        cursor.setPosition(max(0, min(state["anchor"], end)))
+        cursor.setPosition(max(0, min(state["position"], end)), QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cursor)
+        self.verticalScrollBar().setValue(state["vertical"])
+        self.horizontalScrollBar().setValue(state["horizontal"])
 
     def can_display(self, raw: str) -> bool:
         shown, _ = _display_map(raw)
@@ -226,6 +249,7 @@ class LosslessEditor(QPlainTextEdit):
     def _remember_cursor(self) -> None:
         cursor = self.textCursor()
         self._pending_range = (cursor.selectionStart(), cursor.selectionEnd())
+        self._pending_view = self.view_state()
 
     @staticmethod
     def local_files(mime) -> list[str]:
@@ -285,6 +309,7 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._pending = None
             self._pending_range = None
+            self._pending_view = None
 
     def createMimeDataFromSelection(self) -> QMimeData:  # noqa: N802
         cursor = self.textCursor()
@@ -317,6 +342,7 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._pending = None
             self._pending_range = None
+            self._pending_view = None
 
     def inputMethodQuery(self, query):
         """Report caret rectangles in this widget's coordinates.
@@ -338,10 +364,14 @@ class LosslessEditor(QPlainTextEdit):
     def inputMethodEvent(self, event) -> None:  # noqa: N802
         committed = bool(event.commitString()) or bool(event.replacementLength())
         preedit = event.preeditString()
+        # Qt leaves the document empty during preedit and still paints its
+        # placeholder. Let Qt draw the composition alone until it ends.
+        super().setPlaceholderText("" if preedit else self._placeholder_text)
         if not committed:
             if preedit and not self._ime_active:
                 self._remember_cursor()
                 self._ime_origin = self._pending_range
+                self._ime_view = self._pending_view
                 self._ime_active = True
                 self.compositionChanged.emit()
             self._ignore_ime_changes = True
@@ -350,6 +380,7 @@ class LosslessEditor(QPlainTextEdit):
             finally:
                 self._ignore_ime_changes = False
                 self._pending_range = None
+                self._pending_view = None
             if not preedit and self._ime_active:
                 # Cancelling a preedit after a selection can leave Qt's
                 # provisional deletion in the document. Restore the raw
@@ -361,11 +392,13 @@ class LosslessEditor(QPlainTextEdit):
                     cursor.setPosition(min(position, self.document().characterCount() - 1))
                     self.setTextCursor(cursor)
                 self._ime_active, self._ime_origin = False, None
+                self._ime_view = None
                 self.compositionChanged.emit()
             return
         self._pending = event.commitString()
         self._remember_cursor()
         if self._ime_active and self._ime_origin is not None:
+            self._pending_view = self._ime_view
             start, end = self._ime_origin
             if event.replacementStart() or event.replacementLength():
                 relative = self.textCursor().position() + event.replacementStart()
@@ -382,13 +415,17 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._pending = None
             self._pending_range = None
+            self._pending_view = None
         if preedit:
             self._remember_cursor()
             self._ime_origin = self._pending_range
+            self._ime_view = self._pending_view
             self._pending_range = None
+            self._pending_view = None
             self._ime_active = True
         else:
             self._ime_active, self._ime_origin = False, None
+            self._ime_view = None
             self.compositionChanged.emit()
 
     def _content_changed(self, position: int, removed: int, added: int) -> None:
@@ -408,6 +445,7 @@ class LosslessEditor(QPlainTextEdit):
                 raw = self._raw[:self._bounds[left]] + self._pending + self._raw[self._bounds[right]:]
                 shown, bounds = _display_map(raw)
                 self.last_edit = (self._bounds[left], self._bounds[right], len(self._pending))
+                self.last_edit_view = self._pending_view
                 self._raw, self._shown, self._bounds = raw, shown, bounds
                 self.rawChanged.emit()
                 return
@@ -437,6 +475,7 @@ class LosslessEditor(QPlainTextEdit):
                 # The whole range Qt reported, not the trimmed difference.
                 old_start, old_end = self._bounds[start], self._bounds[end]
                 self.last_edit = (old_start, old_end, len(raw) - len(self._raw) + old_end - old_start)
+                self.last_edit_view = self._pending_view
                 self._raw, self._shown, self._bounds = raw, shown, bounds
                 self.rawChanged.emit()
                 return
@@ -533,6 +572,8 @@ class ManuscriptView(QWidget):
         # Semantic positions at each history step, restored with the text.
         self._undo_sessions: list[dict] = []
         self._redo_sessions: list[dict] = []
+        self._undo_editor_states: list[dict] = []
+        self._redo_editor_states: list[dict] = []
         self._review_state = "none"
         self._review_detail = ""
         self._request_id: str | None = None
@@ -2457,8 +2498,20 @@ class ManuscriptView(QWidget):
             self._derived_timer.start()
         self._update_controls()
 
-    def _push_history(self, stack: list, sessions_stack: list, value: dict) -> tuple[list, list]:
-        return (stack + [value])[-20:], (sessions_stack + [self._session.snapshot()])[-20:]
+    def _editor_state(self) -> dict:
+        return {"side": self._last_side, "source": self.source_edit.view_state(),
+                "target": self.target_edit.view_state()}
+
+    def _restore_editor_state(self, state: dict) -> None:
+        editor = self.source_edit if state["side"] == "source" else self.target_edit
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
+        for side, widget in (("source", self.source_edit), ("target", self.target_edit)):
+            widget.restore_view_state(state[side])
+
+    def _push_history(self, stack: list, sessions_stack: list, editor_states: list, value: dict,
+                      editor_state: dict | None = None) -> tuple[list, list, list]:
+        return ((stack + [value])[-20:], (sessions_stack + [self._session.snapshot()])[-20:],
+                (editor_states + [self._editor_state() if editor_state is None else editor_state])[-20:])
 
     def _apply_edit(self, value: dict, *, editors_already_updated: bool = False, edits: list | None = None,
                     exempt: sessions.LiveIssue | None = None) -> None:
@@ -2471,9 +2524,17 @@ class ManuscriptView(QWidget):
                 value.pop(key, None)
         if value == before:
             return
-        self._undo_history, self._undo_sessions = self._push_history(self._undo_history, self._undo_sessions, before)
+        editor_state = self._editor_state()
+        if editors_already_updated:
+            for side, *_range in edits or []:
+                editor = self.source_edit if side == "source" else self.target_edit
+                if editor.last_edit_view is not None:
+                    editor_state[side] = editor.last_edit_view
+        self._undo_history, self._undo_sessions, self._undo_editor_states = self._push_history(
+            self._undo_history, self._undo_sessions, self._undo_editor_states, before, editor_state)
         self._redo_history.clear()
         self._redo_sessions.clear()
+        self._redo_editor_states.clear()
         self._restore_draft(value)
         self._document_revision += 1
         if self.status_label.text() == strings.MANUSCRIPT_SAVE_DONE:
@@ -3365,11 +3426,14 @@ class ManuscriptView(QWidget):
             return
         value = source.pop()
         saved = (self._undo_sessions if undo else self._redo_sessions).pop()
+        editor_state = (self._undo_editor_states if undo else self._redo_editor_states).pop()
         before = self._draft_snapshot()
         if undo:
-            self._redo_history, self._redo_sessions = self._push_history(self._redo_history, self._redo_sessions, before)
+            self._redo_history, self._redo_sessions, self._redo_editor_states = self._push_history(
+                self._redo_history, self._redo_sessions, self._redo_editor_states, before)
         else:
-            self._undo_history, self._undo_sessions = self._push_history(self._undo_history, self._undo_sessions, before)
+            self._undo_history, self._undo_sessions, self._undo_editor_states = self._push_history(
+                self._undo_history, self._undo_sessions, self._undo_editor_states, before)
         later = sr.parts_of(self._payload)
         self._restore_draft(value)
         if "segments" in self._payload:
@@ -3381,6 +3445,7 @@ class ManuscriptView(QWidget):
         self._after_draft_change(before, value, edits=[])
         self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
         self._update_controls()
+        self._restore_editor_state(editor_state)
 
     def _set_payload(self, value: dict) -> None:
         self._updating = True
@@ -3607,6 +3672,8 @@ class ManuscriptView(QWidget):
         self._redo_history.clear()
         self._undo_sessions.clear()
         self._redo_sessions.clear()
+        self._undo_editor_states.clear()
+        self._redo_editor_states.clear()
         self._conflict_mode = self._history_removal = False
         self._refresh_conflicts()
         self._set_payload(value)
