@@ -572,6 +572,8 @@ class ManuscriptView(QWidget):
         self._rows_dirty = False
         self._index: sessions.DecisionIndex | None = None
         self._segment_rows: list = []
+        # The pairing the rows were listed from (identity only).
+        self._segment_rows_from: list | None = None
         self._refreshing_lists = False
         self._translate_task: asyncio.Task | None = None
         self._translate_generation = 0
@@ -1789,7 +1791,7 @@ class ManuscriptView(QWidget):
             row = self._segment_cursor  # restored from progress.current on open
         self._refreshing_lists = True
         try:
-            self._segment_rows = list(pairs)
+            self._segment_rows, self._segment_rows_from = list(pairs), pairs
             self.segment_list.clear()
             for pair in pairs:
                 self.segment_list.addItem(strings.MANUSCRIPT_SEGMENT_ITEM.format(
@@ -1799,7 +1801,13 @@ class ManuscriptView(QWidget):
             self.segment_list.setCurrentRow(row if row < len(pairs) else -1)
         finally:
             self._refreshing_lists = False
-        self._render_segment(self._current_segment())
+        pair = self._current_segment()
+        if pair is not None and pair.index != self._segment_cursor:
+            # A row clicked while the list still held the old text: now that
+            # it lists this text, the row is the selected segment.
+            self._segment_cursor = pair.index
+            self._select_cores(pair)
+        self._render_segment(pair)
 
     def _segment_row_status(self, pair, records: list | None) -> str:
         """The row's state, its finished mark and its choices, in words."""
@@ -1822,6 +1830,13 @@ class ManuscriptView(QWidget):
         return status
 
     def _current_segment(self):
+        """The selected row's pair, only while the rows list the current
+        pairing. Until the list is rebuilt after an edit, a row's offsets and
+        index belong to the old text: selecting, finishing or translating it
+        would act on the wrong range."""
+        pairs = self._cached_pairs()
+        if pairs is None or pairs is not self._segment_rows_from:
+            return None
         row = self.segment_list.currentRow()
         return self._segment_rows[row] if 0 <= row < len(self._segment_rows) else None
 
@@ -1999,8 +2014,11 @@ class ManuscriptView(QWidget):
             self._segment_cursor = pair.index
         self._render_segment(pair)
         self._update_tracks()
-        if pair is None:
-            return
+        if pair is not None:
+            self._select_cores(pair)
+
+    def _select_cores(self, pair) -> None:
+        """Select the pair's source and target cores in the editors."""
         source, target = self._payload["source"], self._payload["target"]
         for editor, text, region in ((self.source_edit, source, pair.source), (self.target_edit, target, pair.target)):
             if region.core_end > region.core_start:
@@ -3545,22 +3563,8 @@ class ManuscriptView(QWidget):
         except (OSError, WorkfileError, ValueError) as exc:
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
             return False
-        self.documentLeaving.emit()
-        self._pending_issue_id = None
-        self._restore_serial += 1
-        self._invalidate_report()
-        self._stop_translation()
-        self._clear_semantic()
-        self._undo_history.clear()
-        self._redo_history.clear()
-        self._undo_sessions.clear()
-        self._redo_sessions.clear()
-        self._conflict_mode = self._history_removal = False
-        self._refresh_conflicts()
-        self._set_payload(value)
-        self._reset_term_session((value.get("progress") or {}).get("current"))
+        self._replace_document(value, (value.get("progress") or {}).get("current"))
         self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
-        self._session_snapshots = []
         # The loaded texts are the versions on-file decisions usually refer to;
         # keep them so an edit before the next review does not lose them.
         for text in (value["source"], value["target"]):
@@ -3581,6 +3585,18 @@ class ManuscriptView(QWidget):
     def new_document(self, _checked: bool = False) -> bool:
         if not self.confirm_discard():
             return False
+        value = empty_workfile()
+        self._replace_document(value, None)
+        self._known_texts = {}
+        self._saved_payload = _copy_payload(value)
+        self._path = None
+        self._set_review_state("none")
+        self._update_controls()
+        return True
+
+    def _replace_document(self, value: dict, cursor: int | None) -> None:
+        """Leave the open manuscript and hold ``value`` in its place: the one
+        way opening and New replace the whole document."""
         self.documentLeaving.emit()
         self._pending_issue_id = None
         self._restore_serial += 1
@@ -3593,16 +3609,15 @@ class ManuscriptView(QWidget):
         self._redo_sessions.clear()
         self._conflict_mode = self._history_removal = False
         self._refresh_conflicts()
-        value = empty_workfile()
         self._set_payload(value)
-        self._reset_term_session(None)
-        self._known_texts = {}
+        self._reset_term_session(cursor)
         self._session_snapshots = []
-        self._saved_payload = _copy_payload(value)
-        self._path = None
-        self._set_review_state("none")
-        self._update_controls()
-        return True
+        # Clearing the runs above listed the outgoing manuscript's segments,
+        # and an open caches the new pairing, so no refresh would follow: a
+        # stale row selected its old offsets in the new text and marked its
+        # index. Rebuilt after the cursor reset, so progress.current is the
+        # row selected, never the old one.
+        self._refresh_segments()
 
     # -- report export ----------------------------------------------------------
     def _report_input(self) -> dict:
