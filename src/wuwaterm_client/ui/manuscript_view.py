@@ -1813,9 +1813,12 @@ class ManuscriptView(QWidget):
             if record["result"] is not None and record["result"]["truncated"]:
                 status += strings.MANUSCRIPT_SEGMENT_TRUNCATED_MARK.format(count=len(record["result"]["findings"]))
             if record["choices"]:
+                status += strings.MANUSCRIPT_SEGMENT_CHOICES_MARK.format(count=len(record["choices"]))
                 unconfirmed = sum(1 for choice in record["choices"] if not choice["confirmed"])
-                status += strings.MANUSCRIPT_SEGMENT_CHOICES_MARK.format(count=len(record["choices"])) + (
-                    strings.MANUSCRIPT_SEGMENT_RECONFIRM_MARK.format(count=unconfirmed) if unconfirmed else "")
+                if record["status"] == "pending":
+                    status += strings.MANUSCRIPT_SEGMENT_WAITING_MARK
+                elif unconfirmed:
+                    status += strings.MANUSCRIPT_SEGMENT_RECONFIRM_MARK.format(count=unconfirmed)
         return status
 
     def _current_segment(self):
@@ -1853,14 +1856,22 @@ class ManuscriptView(QWidget):
         self._update_segment_actions()
 
     def _render_segment_choices(self, index: int | None) -> None:
-        """The segment's choices, then history choices that can come back to it."""
+        """The segment's choices, then history choices that can come back to it.
+
+        SPEC "Segment choice": in a pending record (no result) every choice
+        waits for the segment's check, which realigns it (Runtime step 7), even
+        one still confirmed after an edit of the translation alone; the Web
+        shows them all as waiting. Only an unconfirmed choice of a record with a
+        result needs reconfirmation."""
         rows: list[tuple] = []
         self.segment_choices.clear()
         if index is not None:
             record = self._payload["segments"][index]
+            pending = record["status"] == "pending"
             for choice in record["choices"]:
                 rows.append(("choice", choice))
-                template = (strings.MANUSCRIPT_SEGMENT_CHOICE_ITEM if choice["confirmed"]
+                template = (strings.MANUSCRIPT_SEGMENT_CHOICE_WAITING if pending
+                            else strings.MANUSCRIPT_SEGMENT_CHOICE_ITEM if choice["confirmed"]
                             else strings.MANUSCRIPT_SEGMENT_CHOICE_UNCONFIRMED)
                 self.segment_choices.addItem(template.format(text=choice["source_span"]["text"],
                                                              choice=self._describe_choice(choice)))

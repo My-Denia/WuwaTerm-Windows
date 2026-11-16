@@ -683,6 +683,9 @@ MANUSCRIPT_SEGMENT_TERMS_TRUNCATED = ("第 {number} 段的发现多于显示的 
 MANUSCRIPT_CANDIDATES_TRUNCATED = "候选词对已截断：可能仍有未显示的官方候选。"
 MANUSCRIPT_SEGMENT_CHOICES_MARK = "，选择 {count} 条"
 MANUSCRIPT_SEGMENT_RECONFIRM_MARK = "（{count} 条待重新确认）"
+# A pending segment's choices wait for its check, which realigns them: nothing to reconfirm yet.
+# The Web's wording (semantic-messages ``choiceWaiting``).
+MANUSCRIPT_SEGMENT_WAITING_MARK = "（等待此段核对后生效）"
 MANUSCRIPT_SEGMENT_FINISH = "标记完成"
 MANUSCRIPT_SEGMENT_UNFINISH = "取消完成"
 MANUSCRIPT_SEGMENT_FINISHED = "已把这一段标记为完成；可以撤销。"
@@ -692,6 +695,7 @@ MANUSCRIPT_NO_PENDING_SEGMENT = "没有待处理的段落。"
 MANUSCRIPT_SEGMENT_CHOICES = "这一段的术语选择"
 MANUSCRIPT_SEGMENT_CHOICE_ITEM = "{text} · {choice}"
 MANUSCRIPT_SEGMENT_CHOICE_UNCONFIRMED = "{text} · {choice}（待重新确认）"
+MANUSCRIPT_SEGMENT_CHOICE_WAITING = "{text} · {choice}（等待此段核对后生效）"
 MANUSCRIPT_SEGMENT_CHOICE_HISTORY = "{text} · {choice}（历史选择，可恢复）"
 MANUSCRIPT_SEGMENT_CHOICE_RESTORE = "恢复选择"
 MANUSCRIPT_SEGMENT_CHOICE_RESTORED = "已把历史选择恢复到这一段，待重新确认；可以撤销。"

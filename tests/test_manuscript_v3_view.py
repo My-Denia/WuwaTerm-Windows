@@ -696,3 +696,80 @@ def test_a_segment_jump_shows_the_start_of_a_segment_taller_than_the_editor(qapp
     assert not view.source_edit.viewport().rect().contains(at(view.source_edit, pairs[1].source.core_end)), \
         "the source segment is taller than the editor"
     view.close()
+
+
+WAITING = "等待此段核对后生效"  # the Web's ``choiceWaiting`` (lib/semantic-messages.ts)
+
+
+def choice_labels(view: ManuscriptView, index: int) -> tuple[str, list[str]]:
+    """Segment ``index``'s row in the segment list and its choice rows, freshly rendered."""
+    view._refresh_derived()
+    select_segment(view, 1 if index == 0 else 0)
+    select_segment(view, index)
+    return (view.segment_list.item(index).text(),
+            [view.segment_choices.item(row).text() for row in range(view.segment_choices.count())])
+
+
+def test_choices_of_a_pending_segment_wait_for_its_check_and_are_not_raised_for_reconfirmation(qapp, tmp_path) -> None:
+    """SPEC: a pending record's choices wait for the next check, which realigns them;
+    「待重新确认」 is for done or stale records, and 重新确认 needs a result. As on the
+    Web, every choice of a pending segment shows as waiting, in the session after a
+    translation edit (still confirmed) and after reopening (written unconfirmed)."""
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        await review(view)
+        type_at(view.target_edit, TARGET.index("Paragraph 02") + 20, "改")  # the translation alone
+
+        def assert_waiting(confirmed: list[bool]) -> None:
+            record = view._payload["segments"][1]
+            assert record["status"] == "pending" and [c["confirmed"] for c in record["choices"]] == confirmed
+            row, items = choice_labels(view, 1)
+            assert WAITING in row and "待重新确认" not in row
+            assert items == [f"甲术 · {view._describe_choice(record['choices'][0])}（{WAITING}）"]
+            view.segment_choices.setCurrentRow(0)
+            assert not view.segment_choice_action.isEnabled()
+
+        assert_waiting([True])
+        assert reopen(view, tmp_path / "waiting.json", core) is view
+        assert_waiting([False])
+        await review(view)
+        record = view._payload["segments"][1]
+        assert record["status"] == "done" and [c["confirmed"] for c in record["choices"]] == [True]
+        row, items = choice_labels(view, 1)
+        assert WAITING not in row and "待重新确认" not in row
+        assert items == [strings.MANUSCRIPT_SEGMENT_CHOICE_ITEM.format(
+            text="甲术", choice=view._describe_choice(record["choices"][0]))]
+    asyncio.run(scenario())
+
+
+def test_an_unconfirmed_choice_of_a_checked_segment_still_asks_for_reconfirmation(qapp, tmp_path, monkeypatch) -> None:
+    """The candidate the choice named is gone after Core's dictionary moved on: the
+    re-check leaves the choice unconfirmed in a done record, which asks for
+    reconfirmation; so does the same record reopened and shown as saved."""
+    async def scenario():
+        core = Core()
+        view = make_view(core)
+        await review(view)
+        choose(view, 1, 0)
+        await review(view)
+        monkeypatch.setitem(TERMS, "甲术", [candidate("甲术", "Alpha Prime")])
+        core.matcher = "f" * 64
+        reopen(view, tmp_path / "moved.json", core)
+        await review(view)
+
+        def assert_reconfirm(status: str) -> None:
+            record = view._payload["segments"][1]
+            assert statuses(view)[1] == status and record["status"] == "done"
+            assert [c["confirmed"] for c in record["choices"]] == [False]
+            row, items = choice_labels(view, 1)
+            assert strings.MANUSCRIPT_SEGMENT_RECONFIRM_MARK.format(count=1) in row and WAITING not in row
+            assert items == [strings.MANUSCRIPT_SEGMENT_CHOICE_UNCONFIRMED.format(
+                text="甲术", choice=view._describe_choice(record["choices"][0]))]
+
+        assert_reconfirm("reviewed")
+        reopen(view, tmp_path / "moved.json", core)
+        assert_reconfirm("saved")
+    asyncio.run(scenario())
