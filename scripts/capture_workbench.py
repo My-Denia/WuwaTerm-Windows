@@ -316,33 +316,75 @@ HOMOGRAPH_TARGET = "\n\n".join([
 # replacement invalidates the segment that holds the second place. Each
 # paragraph stays under the 1,800-scalar segment limit while the whole
 # manuscript is over the 2,000-scalar document limit, so this is long mode.
+# Every sentence is its own: a repeated filler reads as a fixture, not a draft.
 RESONATOR_SOURCE = "\n\n".join([
     (
-        "清晨的巡查从北门开始，共鸣者在庭院里核验刚回收的声骸，随后把结果记入当日的值守名册。"
-        + "军需官在木案上摆好干粮与备用罗盘，斥候逐一收紧行囊绑带，确认每一件装备都能随队出发。" * 9
-        + "高处的观测员把昨日的记录与边庭舆图互相核对，好让前锋避开山脊间不稳定的河谷与碎石坡。" * 9
-        + "待城门缓缓升起，队伍排成两列纵队踏上蜿蜒的栈道，晨光正好穿过云层落在石阶上。" * 9
+        "清晨的巡查从北门开始，共鸣者在庭院里核验刚回收的声骸，随后把结果逐条记入当日的值守名册。"
+        "军需官把干粮、信号焰火与备用罗盘依次摆上木案，斥候们蹲在廊下收紧行囊绑带，确认每件装备都能随队出发。"
+        "高处的观测员把昨日的记录与边庭舆图互相核对，好让前锋避开山脊间不稳定的河谷与碎石坡，也顺手标出了两处塌方。"
+        "待青铜城门缓缓升起，队伍排成两列纵队踏上蜿蜒的栈道，晨光穿过云层落在湿冷的石阶上，把影子拉得很长。"
+        "街市那头的早点摊刚支起蒸笼，白汽顺着檐角散开，挑担的货郎沿青石路慢慢走向东门，扁担吱呀作响。"
+        "城楼上的号手试了三声短调，声音越过屋脊传到码头，船工们抬头看了看风向才继续收缆，谁也没有说话。"
+        "账房先生把昨夜的收支出入誊清，又用细绳把散落的票据扎成一捆，压在那方旧砚台下面，这才端起凉透的茶。"
+        "廊下的学徒抱着一摞洗净的陶碗走过，脚步很轻，怕惊动檐下打盹的那只灰羽雀鸟，连呼吸都放慢了。"
+        "药铺里飘出微苦的气味，掌柜的正把新到的药材按成色分作三堆，一边称量一边低声报数，秤杆在灯下泛着暗光。"
+        "演武场上传来木剑相击的脆响，值日的教头背着手来回踱步，偶尔停下来纠正一两个架势，再退回原处。"
+        "南边的水闸昨夜涨了半尺，管闸的老兵提着灯沿堤走了一圈，把每处渗漏都用炭笔记在木牌上，字迹歪歪扭扭。"
+        "书吏把誊好的公文封进蜡印竹筒，交给等候多时的骑手，叮嘱他务必在日落前送到山脚的驿站，路上别换马。"
+        "后厨的灶火烧得正旺，铁锅里的汤咕嘟作响，掌勺的厨娘掀开盖子尝了一口，又添了小半勺盐，才满意地盖上。"
+        "天色渐亮，屋瓦上的薄霜化成水珠，沿着滴水檐一滴一滴落在石板上，敲出细碎的声响，惊起了墙角的麻雀。"
+        "打更人收起了梆子，靠在巷口的石墩上喘气，袖口被夜露浸得发沉，他把灯芯往上挑了挑，火苗重新亮起来。"
+        "染坊的伙计把新染的布匹搭上竹竿，靛蓝的水迹顺着布边往下淌，在青砖地上汇成一条细流，慢慢渗进缝里。"
+        "城墙根的茶棚里坐着几位歇脚的脚夫，他们把草鞋脱下来磕掉泥块，就着粗瓷碗分一壶烫嘴的粗茶。"
+        "更远处的钟楼传来一声闷响，惊起檐下的鸽子，它们绕着塔尖盘旋两圈，又落回原来的位置。"
+        "铁匠铺的风箱呼哧呼哧地响，火星从炉口溅出来，落在湿地上嘶地一声熄灭，留下一小片黑印。"
+        "采买的车队停在粮行门口，伙计们把麻袋从车上卸下，一袋一袋码进库房，秤上的铁砣换了三次。"
+        "私塾里传出拖长的读书声，先生拿着戒尺在窗边踱步，偶尔停下来敲一敲桌面，提醒走神的学生。"
+        "渡口的浮桥昨夜换了两块新木板，踩上去不再晃，守桥的人用脚后跟试了试，才把拦绳放下来。"
+        "茶楼二楼的窗子支起来一半，说书人清了清嗓子，把醒木往桌上一拍，底下立刻安静了些。"
     ),
     (
         "午后工坊里，共鸣者复核新吸收声骸的稳定性，把每一组线圈与镜片的编号逐笔登记在册。"
-        + "匠人们在放大灯下清理铜制接点，学徒抱着装满零件的木箱走上阁楼，小心避开填塞干草的仪表。" * 9
-        + "门外的灯街上，商贩赶在暮色之前清点布匹与药材，把账目抄进随身的薄册里。" * 9
-        + "等到内城吹响傍晚的号角，长台都已清扫干净，工坊的大门也落下了沉重的铁插销。" * 9
+        "匠人们在放大灯下清理铜制接点，学徒抱着装满零件的木箱走上阁楼，小心避开填塞干草的精密仪表。"
+        "门外的灯街上，商贩赶在暮色之前清点布匹与药材，把账目抄进随身的薄册，又把零钱分成三摞。"
+        "等到内城吹响傍晚的号角，长台都已清扫干净，工坊的大门也落下了沉重的铁插销，门轴发出长长的呻吟。"
+        "檐下的风铃被穿堂风推得乱响，晾在竹竿上的麻布来回摆动，影子在墙上晃成一片模糊的水纹。"
+        "磨坊的水轮转了整整一个下午，石盘边缘渗出细细的面粉，落在木槽里堆成小小的白丘。"
+        "修船的工匠蹲在船腹下面，用桐油灰一点点填平木板的裂缝，锤子敲得很轻，怕震松了刚换上的龙骨。"
+        "驿站的马夫给每匹马添了草料，又用草刷顺着鬃毛刷了两遍，直到马匹安静下来才提灯离开。"
+        "巷尾的豆腐摊收了篷布，老板娘把剩下的几块豆腐分给邻家的孩子，看着他们跑远才转身关门。"
+        "更夫在城墙内侧的墙根点起一盏小灯，把当晚的口令写在纸条上，塞进哨兵伸手就能够到的砖缝。"
+        "书院后院的银杏落了一地，扫地的杂役把叶子堆在墙边，说等晒干了可以拿去引火，省些炭钱。"
+        "酒肆的伙计搬出几坛新酿，拍开泥封时一股甜香散出来，围坐的客人纷纷把碗往前推了推。"
+        "河湾的芦苇被晚风吹得伏下去又立起来，几只白鹭贴着水面滑过，翅尖在暮色里划出细细的银线。"
+        "码头的吊架吱吱作响，苦力们喊着号子把货箱抬上跳板，脚步随着号子一下一下落在湿木板上。"
+        "药圃的园丁蹲在畦边拔草，把拔下的杂草丢进竹筐，偶尔抬头看看天色，估摸着还要不要浇一遍水。"
+        "街角的灯笼一盏接一盏亮起来，光晕在湿漉漉的石板上连成一片，行人的影子被拉长又缩短。"
+        "关卡的兵丁核对了入城文书的编号，在名册上添了一行，把盖好印的那页翻过去压在镇纸下。"
+        "屋檐下的燕子已经归巢，偶尔传出几声轻啼，混在远处更鼓的余音里，几乎听不分明。"
+        "布庄的掌柜拨着算盘，把白日的流水从头核了一遍，确认无误才合上账簿吹熄了灯。"
+        "石桥下的水声比白日里更清楚，几片落叶打着旋往下游漂，碰到桥墩便停一停，再慢慢绕开。"
+        "巡夜的队伍沿着长街走过，甲片相碰发出细碎的响声，领队压低声音交代了换岗的时辰。"
+        "打铁的炉膛里还留着暗红的余烬，伙计用铁钳夹出一块通红的坯料，放在砧上等师傅过来。"
+        "城外的官道上扬起一片尘土，几辆运炭的牛车慢慢驶近，车辕上挂着的铃铛一路叮当作响。"
+        "收摊的鱼贩把木盆里的水泼在路边，顺手把剩下的几尾小鱼包进荷叶，递给还在等的熟客。"
+        "仓房的账目与实存对不上，管事把两本册子并排摊开，逐条比对到深夜，才发现是一笔抄错了行。"
+        "檐角的铜铃被雨打得发闷，守夜的人把它取下来擦干，重新挂回去时顺手紧了紧绳结。"
     ),
 ])
 
 RESONATOR_TARGET = "\n\n".join([
     (
-        "The morning patrol starts at the northern gate, where the Resonators verify the newly recovered Echoes in the courtyard and then enter the result in that day's watch roster. "
-        + "Quartermasters lay out rations and spare compasses on the wooden table while scouts tighten the straps on their packs and confirm every piece of kit can march with the column. " * 2
-        + "Observers on the gallery compare yesterday's records against the border charts so the vanguard can avoid the unstable valleys and scree slopes along the ridge. " * 2
-        + "Once the gate slowly lifts, the column sets out in two files along the winding cliff road as the morning light breaks through the clouds onto the stone steps." * 2
+        "The morning patrol starts at the northern gate, where the Resonators verify the newly recovered Echoes in the courtyard and then enter every result in that day's watch roster. "
+        "Quartermasters set out rations, signal flares and spare compasses along the wooden table while the scouts kneel in the corridor tightening pack straps and counting every piece of kit. "
+        "Observers on the upper gallery compare yesterday's readings with the border charts so the vanguard can steer clear of the unstable valleys and scree slopes along the ridge. "
+        "Once the bronze gate lifts, the column files out in two ranks along the winding cliff road as the morning light breaks through the clouds onto the wet stone steps."
     ),
     (
-        "In the afternoon workshop the Resonators recheck the stability of the newly absorbed Echoes, entering the serial of every coil and lens in the register. "
-        + "Artisans clean the copper contacts under a magnifying lamp while apprentices carry crates of parts up to the attic, careful not to jar the gauges packed in dry straw. " * 2
-        + "Outside on the lantern street, merchants count cloth and herbs before dusk and copy the tallies into the book they carry. " * 2
-        + "By the time the inner citadel sounds the evening horn, every bench has been swept clean and the heavy iron latch is drawn across the workshop door." * 2
+        "In the afternoon workshop the Resonators recheck the stability of the newly absorbed Echoes and write the serial of every coil and lens into the register. "
+        "Artisans clean the copper contacts under a magnifying lamp while apprentices carry crates of parts up to the attic, careful not to jar the gauges packed in dry straw. "
+        "Outside on the lantern street, merchants count cloth and herbs before dusk and copy the tallies into the small book each of them carries. "
+        "By the time the inner citadel sounds the evening horn, every bench has been swept clean and the heavy iron latch is drawn across the workshop door."
     ),
 ])
 
