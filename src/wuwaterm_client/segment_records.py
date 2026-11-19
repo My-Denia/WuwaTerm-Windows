@@ -1,7 +1,9 @@
-"""Resumable long-manuscript term review: the v3 segment records at runtime.
+"""Resumable long-manuscript term review: the v3/v4 segment records at runtime.
 
-The contract is the public Web ``contracts/manuscript-v3/SPEC.md``; quoted
-section names refer to it. Pure Python: no Qt, no HTTP.
+The contract is the public Web ``contracts/manuscript-v3/SPEC.md``; v4 raises the
+same records' caps without changing their shape
+(``contracts/manuscript-v4/SPEC.md``), and quoted section names refer to v3.
+Pure Python: no Qt, no HTTP.
 
 State. The manuscript payload carries the v3 parts ``segments``,
 ``segment_choice_history`` and ``progress`` in their file shapes: record

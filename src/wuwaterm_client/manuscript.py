@@ -7,10 +7,11 @@ trust, and a presentation layer must request a new review.
 v3/v4 segment records are the one exception.  A saved segment result is reused only
 when the content hashes, the request inputs and the live basis all match (public
 Web ``contracts/manuscript-v3/SPEC.md``, "Design note").  v4 extends v3 with dense
-per-segment/report caps (up to 128 findings and choices) and structured
-``not_evaluated`` ``reason`` codes while keeping v1, v2 and v3 byte-identical when
-their tighter caps suffice.  This module only parses and writes: it computes no
-hashes or digests, so whether a record is current is decided by the caller.
+caps (128 findings, choices and submitted decisions, document-mode choices
+included) and structured ``not_evaluated`` ``reason`` codes while keeping v1, v2
+and v3 byte-identical when their tighter caps suffice.  This module only parses
+and writes: it computes no hashes or digests, so whether a record is current is
+decided by the caller.
 """
 
 from __future__ import annotations
@@ -939,7 +940,7 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
 
 
 def semantic_payload_fits(payload: Mapping[str, Any]) -> bool:
-    """Whether the payload can be saved: valid and within the file limit (44 MiB in v3)."""
+    """Whether the payload can be saved: valid and within the file limit (44 MiB in v3 and v4)."""
     try:
         serialize_workfile(payload)
     except WorkfileError:

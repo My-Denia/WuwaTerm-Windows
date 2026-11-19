@@ -654,7 +654,7 @@ RECENT_CLEAR = "清除最近文件"
 RECENT_FILE_MISSING = "文件已不存在，无法打开：{name}"
 
 
-# -- Long manuscripts: resumable segment term review (manuscript v3) -----
+# -- Long manuscripts: resumable segment term review (manuscript v3/v4) -----
 MANUSCRIPT_SAVED_REPORT = "已保存的逐段术语结果：{count} 条发现。尚未与当前服务核对，开始审校时会先核对一次。"
 MANUSCRIPT_REPORT_RECHECK = "其中 {count} 条所在的段落待重新核对。"
 MANUSCRIPT_SEGMENTS_SAVED = "{count} 段有已保存的术语结果；开始审校时先核对一次，未变的段落不再重复审校。"
