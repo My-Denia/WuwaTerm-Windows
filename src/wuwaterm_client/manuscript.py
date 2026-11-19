@@ -834,32 +834,9 @@ def _v1_v2_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
 
 
 def _order_document_history(history: list[Any]) -> list[Any]:
-    """Ensure document-mode v4 findings keep canonical 7/8-key order ending with ``reason``."""
-    base_order = ("id", "rule_id", "verdict", "source_span", "target_span", "candidates", "candidates_truncated")
-    ordered = []
-    for snapshot in history:
-        if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("report"), Mapping):
-            ordered.append(snapshot)
-            continue
-        report = snapshot["report"]
-        findings = report.get("findings")
-        if not isinstance(findings, list):
-            ordered.append(snapshot)
-            continue
-        rebuilt_findings = []
-        for finding in findings:
-            if isinstance(finding, Mapping) and all(k in finding for k in base_order):
-                item = {k: finding[k] for k in base_order}
-                for extra_k, extra_v in finding.items():
-                    if extra_k not in item and extra_k != "reason":
-                        item[extra_k] = extra_v
-                if "reason" in finding:
-                    item["reason"] = finding["reason"]
-                rebuilt_findings.append(item)
-            else:
-                rebuilt_findings.append(finding)
-        ordered.append({**snapshot, "report": {**report, "findings": rebuilt_findings}})
-    return ordered
+    """Preserve the input key order of document-mode v4 findings (SPEC.md: the
+    writer keeps the order it was given); no reordering is performed."""
+    return list(history)
 
 
 def _v1v2_legacy_fits(value: Mapping[str, Any]) -> bool:

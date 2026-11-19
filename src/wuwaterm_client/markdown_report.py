@@ -133,11 +133,11 @@ SEMANTIC_STATUSES = {
 VERDICTS = {"verified_constraint": "术语约束已核", "confirmed_conflict": "与所选词对冲突",
             "needs_review": "需要核对", "not_evaluated": "未评估"}
 NOT_EVALUATED_REASONS = {
-    "not_a_term": "已按“不是术语”记录，不按专有术语核对",
-    "ordinary_word": "上下文判定为普通词义，不按专有术语核对",
-    "no_target_region": "未找到与该处对应的译文句段",
-    "found_outside_region": "官方译名出现在配对句段之外",
-    "ambiguous_repeat": "同一区域内多次出现，无法唯一对应",
+    "not_a_term": "判定此处不是术语",
+    "ordinary_word": "按普通词语处理",
+    "no_target_region": "没有对应的译文区域",
+    "found_outside_region": "在对应区域之外找到",
+    "ambiguous_repeat": "重复出现，无法一一对应",
 }
 CATEGORIES = {"core_term": "核心术语", "resonator": "共鸣者", "weapon": "武器", "echo": "声骸", "skill": "技能",
               "sonata_effect": "合鸣效果", "location": "地区", "item": "物品", "speaker": "角色"}
@@ -543,7 +543,6 @@ def render(data: Mapping[str, Any]) -> str:
                 _span_label(source_span) + " · " + MD["ruleLabelShort"] + COLON + inline(finding["rule_id"]),
                 (_span_label(target_span, "targetSpanLabel") + COLON + inline(target_span["text"])
                  if target_span else MD["noTargetSpan"]),
-                _not_evaluated_reason_line(finding),
             ]), ""])
             context = compact_context(latest["source"], source_span)
             if context:
@@ -564,6 +563,8 @@ def render(data: Mapping[str, Any]) -> str:
                     if sources else MD["notProvided"]))
             if finding["candidates_truncated"]:
                 paragraph(MD["candidatesTruncatedLine"])
+            if finding.get("reason"):
+                paragraph(_not_evaluated_reason_line(finding))
             out.append("")
 
         heading(2, MD["decisionsHeading"])

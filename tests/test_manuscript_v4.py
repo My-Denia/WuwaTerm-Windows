@@ -224,8 +224,8 @@ def test_v4_constants_and_top_level_key_order() -> None:
     )
     assert decoded["format"] == "wuwaterm-manuscript-v4"
     assert tuple(decoded["history"][0]["report"]["findings"][0].keys()) == (
-        "id", "rule_id", "verdict", "source_span", "target_span",
-        "candidates", "candidates_truncated", "reason",
+        "reason", "candidates_truncated", "candidates", "target_span", "source_span",
+        "verdict", "rule_id", "id",
     )
 
 

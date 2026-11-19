@@ -998,7 +998,7 @@ def _unchecked_holding(
     forms = [name for name in (surface.strip() for surface in surfaces) if name]
     if not forms or not unchecked:
         return []
-    english = any(_english_surface_tokens(name) is not None for name in forms)
+    english = direction == "zh"
     if english:
         pattern = re.compile(
             r"(?<![^\W\d_])(?:" + "|".join(re.escape(name) for name in forms) + r")(?:es|s)?(?![^\W\d_])",
@@ -1020,7 +1020,7 @@ def group_matches_filter(group: Mapping[str, Any], key: str) -> bool:
     if key == "all":
         return True
     if key == "inconsistent":
-        return group["status"] == "inconsistent"
+        return bool(group.get("inconsistent", group["status"] == "inconsistent"))
     if key == "pending":
         return group["pending_count"] > 0 or bool(group["unverified_segments"])
     if key == "not_evaluated":
@@ -1321,48 +1321,34 @@ def group_term_occurrences(
         )
 
         eval_occs = [o for o in occurrences if o["verdict"] != "not_evaluated"]
-        rendering_keys = {o["_rendering_key"] for o in eval_occs}
-        all_eval_verified = bool(eval_occs) and all(
-            o["verdict"] == "verified_constraint"
-            and o["freshness"] == "current"
-            and o["choice_state"] != "unconfirmed"
-            for o in eval_occs
+        # Derive status from the same _attention-based counts Web uses, so
+        # status and group_matches_filter can never disagree or drop a group
+        # under any filter.
+        has_conflict = any(o["attention"] == "conflict" for o in occurrences)
+        distinct_renderings = len({o["actual_translation"] for o in eval_occs})
+        undecided_evaluated = any(
+            not (o.get("choice") or {}).get("confirmed") for o in eval_occs
         )
-        if len(rendering_keys) >= 2 and not all_eval_verified:
+        inconsistent = has_conflict or (distinct_renderings >= 2 and undecided_evaluated)
+
+        pending_count = sum(1 for o in occurrences if _needs_action(o))
+        not_evaluated_count = sum(1 for o in occurrences if o["attention"] == "not_evaluated")
+        unverified = _unchecked_holding(grp["surfaces"], unchecked, direction)
+
+        if inconsistent:
             status = "inconsistent"
-        elif not eval_occs and all(
-            o["choice_state"] != "unconfirmed" and o["freshness"] != "stale" for o in occurrences
-        ):
-            status = "not_evaluated"
-        elif all(
-            (
-                o["verdict"] == "verified_constraint"
-                or (o["verdict"] == "not_evaluated" and o["choice_state"] == "confirmed")
-            )
-            and o["freshness"] == "current"
-            and o["choice_state"] != "unconfirmed"
-            for o in occurrences
-        ):
-            status = "confirmed"
-        else:
+        elif pending_count > 0 or bool(unverified):
             status = "pending"
+        elif not_evaluated_count > 0:
+            status = "not_evaluated"
+        else:
+            status = "confirmed"
 
         clean_occurrences = []
         for occ in occurrences:
             item = {k: v for k, v in occ.items() if k != "_rendering_key"}
             item["group_status"] = status
             clean_occurrences.append(item)
-
-        pending_count = sum(1 for o in occurrences if _needs_action(o))
-        not_evaluated_count = sum(1 for o in occurrences if o["attention"] == "not_evaluated")
-        unverified = _unchecked_holding(grp["surfaces"], unchecked, direction)
-        if status in ("confirmed", "not_evaluated") and unverified:
-            # Nothing in this group needs work, but a segment that holds one of
-            # its spellings still owes a check: the term is not settled there.
-            # `inconsistent` stays, it is the more urgent word.
-            status = "pending"
-            for item in clean_occurrences:
-                item["group_status"] = status
 
         seg_indices = sorted({o["segment_index"] for o in clean_occurrences})
         groups.append({
@@ -1374,8 +1360,10 @@ def group_term_occurrences(
             "distribution": distribution,
             "distribution_text": distribution_text,
             "status": status,
+            "inconsistent": inconsistent,
             "pending_count": pending_count,
             "not_evaluated_count": not_evaluated_count,
+            "confirmed_count": len(occurrences) - pending_count - not_evaluated_count,
             "unverified_segments": unverified,
             "candidates": grp["candidates"],
             "occurrences": clean_occurrences,
