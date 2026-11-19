@@ -677,9 +677,15 @@ MANUSCRIPT_TERM_CHOICE_FAILED = "当前结果里已没有这一处或这个候�
 MANUSCRIPT_CHOICE_OFFICIAL_SHORT = "官方术语 {candidate}"
 MANUSCRIPT_SEGMENT_FINISHED_MARK = "，已标记完成"
 MANUSCRIPT_SEGMENT_TRUNCATED_MARK = "，发现多于显示的 {count} 条"
-# The Web's wording (semantic-messages ``longTermsTruncated``, markdown ``candidatesTruncatedLine``).
-MANUSCRIPT_SEGMENT_TERMS_TRUNCATED = ("第 {number} 段的发现多于显示的 {count} 条，其余没有返回；可以对显示的发现做选择，"
-                                      "要看到其余发现请把这一段拆小后再核对。")
+# Mention both the 128-finding count cap and the 64 KiB response cap, with split guidance.
+MANUSCRIPT_SEGMENT_TERMS_TRUNCATED = (
+    "第 {number} 段的术语发现已达单段上限（最多 128 条或响应 64 KiB），当前仅显示前 {count} 条；"
+    "可以对已显示的发现记录选择，要核对其余发现请把这一段拆小后再审校。"
+)
+MANUSCRIPT_DOCUMENT_TERMS_TRUNCATED = (
+    "本次报告已达单次上限（最多 128 条或响应 64 KiB），当前仅显示前 {count} 条；"
+    "要核对其余发现，请插入空行拆小段落后再审校。"
+)
 MANUSCRIPT_CANDIDATES_TRUNCATED = "候选词对已截断：可能仍有未显示的官方候选。"
 MANUSCRIPT_SEGMENT_CHOICES_MARK = "，选择 {count} 条"
 MANUSCRIPT_SEGMENT_RECONFIRM_MARK = "（{count} 条待重新确认）"
@@ -706,3 +712,51 @@ MANUSCRIPT_HISTORY_FULL = "无法保存：选择历史有 {count} 条，超过�
 MANUSCRIPT_HISTORY_ITEM = "历史选择 {number}：{text} · {choice}"
 MANUSCRIPT_REMOVE_HISTORY_CHOICE = "移除选中的历史选择"
 MANUSCRIPT_HISTORY_CHOICE_REMOVED = "已移除选中的历史选择；可以撤销。"
+
+# -- Manuscript v4: not_evaluated reasons, mismatch prompt & term groups ---
+MANUSCRIPT_VERDICT_NOT_EVALUATED_REASON = "未评估（{reason}）"
+MANUSCRIPT_NOT_EVALUATED_REASON = {
+    "not_a_term": "已标记为非术语",
+    "ordinary_word": "普通词义",
+    "no_target_region": "无对应译文区域",
+    "found_outside_region": "译名在对应区域外",
+    "ambiguous_repeat": "同段重复出现",
+}
+MANUSCRIPT_NOT_EVALUATED_DETAIL = {
+    "not_a_term": "未评估原因：此处已按“不是术语”记录，不按专有术语核对。",
+    "ordinary_word": "未评估原因：上下文判定为普通词义，不按专有术语核对。",
+    "no_target_region": "未评估原因：未找到与该处对应的译文句段，无法核对。",
+    "found_outside_region": "未评估原因：官方译名出现在配对句段之外，两侧可能存在拆并句偏差。",
+    "ambiguous_repeat": "未评估原因：同一区域内多次出现，无法唯一对应到具体译文位置。",
+}
+MANUSCRIPT_NOT_EVALUATED_UNKNOWN = "未评估原因：{reason}"
+
+MANUSCRIPT_TRANSLATED_MISMATCH = (
+    "已写入机器翻译；有 {count} 段因两侧段落或句数不一致需手动切分（已原样保留段落，未强行合并错位）。"
+)
+MANUSCRIPT_JUMP_MISMATCH = "定位首处待切分段"
+MANUSCRIPT_MISMATCH_JUMPED = "已定位到第 {number} 段（需要手动切分）。请在原文和译文对应位置插入空行后再审校。"
+
+MANUSCRIPT_TERM_VIEW_LABEL = "术语视图"
+MANUSCRIPT_TERM_VIEW_GROUPED = "按术语分组"
+MANUSCRIPT_TERM_VIEW_ORDER = "按出现顺序"
+MANUSCRIPT_TERM_FILTER_LABEL = "状态筛选"
+MANUSCRIPT_TERM_FILTER_ALL = "全部"
+MANUSCRIPT_TERM_FILTER_INCONSISTENT = "不一致"
+MANUSCRIPT_TERM_FILTER_PENDING = "待处理"
+MANUSCRIPT_TERM_FILTER_NOT_EVALUATED = "未评估"
+MANUSCRIPT_TERM_FILTER_CONFIRMED = "已核"
+MANUSCRIPT_TERM_GROUP_STATUS = {
+    "inconsistent": "不一致",
+    "pending": "待处理",
+    "not_evaluated": "未评估",
+    "confirmed": "已核",
+}
+MANUSCRIPT_TERM_GROUP_HEADER = "▸ {surface}（{count} 处） · {status}\n   {distribution}"
+MANUSCRIPT_TERM_GROUP_UNVERIFIED = "另有 {count} 段待复核：{segments}"
+MANUSCRIPT_TERM_OCCURRENCE_ROW = "  #{segment} · {summary}\n  原文：{source_context}\n  译文：{target_context}"
+MANUSCRIPT_TERM_OCCURRENCE_TOOLTIP = "第 {segment} 段 · {summary}\n原文上下文：{source_context}\n译文上下文：{target_context}"
+MANUSCRIPT_TERM_TARGET_MISS = "未命中"
+MANUSCRIPT_TERM_DISTRIBUTION_ITEM = "{label} ×{count}"
+MANUSCRIPT_TERM_FILTER_EMPTY = "当前筛选条件下没有匹配的术语条目。"
+

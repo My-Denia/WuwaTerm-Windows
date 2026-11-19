@@ -62,7 +62,7 @@ from wuwaterm_client.api import ApiClient
 from wuwaterm_client.config import ClientConfig
 from wuwaterm_client.manuscript import empty_workfile
 from wuwaterm_client.ui import main_window as main_window_module
-from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC
+from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC, TRACK_TERMS
 
 
 class _MemoryKeyring(KeyringBackend):
@@ -142,29 +142,241 @@ def _candidate(zh: str, en: str, category: str) -> dict:
             "sources": [{"source_file": "TextMap/zh/MultiText.json", "source_id": "capture"}]}
 
 
-def _finding(source: str, target: str, sq: str, tq: str | None, verdict: str, candidate: dict) -> dict:
+def _finding(
+    source: str,
+    target: str,
+    sq: str,
+    tq: str | None,
+    verdict: str,
+    candidates: list[dict],
+    *,
+    reason: str | None = None,
+) -> dict:
     source_span = _span(source, sq)
-    return {"id": f'{source_span["start"]}:{source_span["end"]}:{sq}', "rule_id": "review.term_pair",
-            "verdict": verdict, "source_span": source_span,
-            "target_span": _span(target, tq) if tq and tq in target else None,
-            "candidates": [candidate], "candidates_truncated": False}
+    item: dict = {
+        "id": f'{source_span["start"]}:{source_span["end"]}:{sq}',
+        "rule_id": "review.term_pair",
+        "verdict": verdict,
+        "source_span": source_span,
+        "target_span": _span(target, tq) if tq and tq in target else None,
+        "candidates": candidates,
+        "candidates_truncated": False,
+    }
+    if reason is not None:
+        item["reason"] = reason
+    return item
+
+
+def _isolated_camellya_span(source: str) -> dict | None:
+    pos = 0
+    while (idx := source.find("椿", pos)) != -1:
+        pos = idx + 1
+        before = source[idx - 1] if idx > 0 else ""
+        after = source[idx + 1] if idx + 1 < len(source) else ""
+        if before in ("红", "香") or after == "蕊":
+            continue
+        return {"start": idx, "end": idx + 1, "text": "椿"}
+    return None
 
 
 def _term_report(source: str, target: str) -> dict:
     findings = []
     if "共鸣者" in source:
         findings.append(_finding(source, target, "共鸣者", "Resonators", "verified_constraint",
-                                 _candidate("共鸣者", "Resonator", "core_term")))
+                                 [_candidate("共鸣者", "Resonator", "core_term")]))
     if "鸣钟之龟" in source:
         findings.append(_finding(source, target, "鸣钟之龟", "Bell-Borne Geochelone", "needs_review",
-                                 _candidate("鸣钟之龟", "Bell-Borne Geochelone", "echo")))
+                                 [_candidate("鸣钟之龟", "Bell-Borne Geochelone", "echo")]))
+    cam_span = _isolated_camellya_span(source)
+    if cam_span is not None:
+        c_cam = [_candidate("椿", "Camellya", "resonator")]
+        if "Camellya" in target:
+            t_span = _span(target, "Camellya")
+            verdict = "verified_constraint"
+        elif "Camelia" in target:
+            t_span = _span(target, "Camelia")
+            verdict = "confirmed_conflict"
+        else:
+            t_span, verdict = None, "confirmed_conflict"
+        findings.append({
+            "id": f'{cam_span["start"]}:{cam_span["end"]}:椿',
+            "rule_id": "review.term_pair",
+            "verdict": verdict,
+            "source_span": cam_span,
+            "target_span": t_span,
+            "candidates": c_cam,
+            "candidates_truncated": False,
+        })
+    if "红椿蕊" in source:
+        tq = "Red Petal" if "Red Petal" in target else ("Red Camellia" if "Red Camellia" in target else None)
+        verdict = "confirmed_conflict" if tq == "Red Petal" else "needs_review"
+        findings.append(_finding(source, target, "红椿蕊", tq, verdict,
+                                 [_candidate("红椿蕊", "Red Camellia", "item")]))
+    if "香椿" in source:
+        findings.append(_finding(source, target, "香椿", None, "not_evaluated", [], reason="ordinary_word"))
+    if "今汐" in source and "Jinhsi" in target:
+        findings.append(_finding(source, target, "今汐", "Jinhsi", "verified_constraint",
+                                 [_candidate("今汐", "Jinhsi", "resonator")]))
+    if "心大人" in source and "Lady Hsin" in target:
+        findings.append(_finding(source, target, "心大人", "Lady Hsin", "verified_constraint",
+                                 [_candidate("心大人", "Lady Hsin", "speaker")]))
+    c_tuner = [_candidate("调谐器", "Tuner", "item"), _candidate("调音师", "Tuner", "speaker")]
+    for surface in ("Tuners", "Tuner"):
+        start = 0
+        while (idx := source.find(surface, start)) != -1:
+            start = idx + len(surface)
+            if surface == "Tuner" and source[idx:idx + 6] == "Tuners":
+                continue
+            s_span = {"start": idx, "end": idx + len(surface), "text": surface}
+            tq = "调音师" if "elderly Tuner" in source[max(0, idx - 16):idx + 16] and "调音师" in target else (
+                "调谐器" if "调谐器" in target else ("调音师" if "调音师" in target else None)
+            )
+            findings.append({
+                "id": f'{idx}:{idx + len(surface)}:{surface}',
+                "rule_id": "review.term_pair",
+                "verdict": "needs_review",
+                "source_span": s_span,
+                "target_span": _span(target, tq) if tq and tq in target else None,
+                "candidates": c_tuner,
+                "candidates_truncated": False,
+            })
+    if "Echoes" in source and "声骸" in target:
+        findings.append(_finding(source, target, "Echoes", "声骸", "verified_constraint",
+                                 [_candidate("声骸", "Echo", "core_term")]))
+    elif "Echo" in source and "声骸" in target:
+        findings.append(_finding(source, target, "Echo", "声骸", "verified_constraint",
+                                 [_candidate("声骸", "Echo", "core_term")]))
+    if "Lady Hsin" in source and "心大人" in target:
+        findings.append(_finding(source, target, "Lady Hsin", "心大人", "verified_constraint",
+                                 [_candidate("心大人", "Lady Hsin", "speaker")]))
+    if "spring" in source and "山泉" in target:
+        findings.append(_finding(source, target, "spring", None, "not_evaluated", [], reason="ordinary_word"))
+    findings.sort(key=lambda f: f["source_span"]["start"])
+    not_eval = sum(1 for f in findings if f["verdict"] == "not_evaluated")
     return {
         "request_id": "req-term-0001", "source_revision": _digest(source), "target_revision": _digest(target),
         "rule_version": "review-v2", "matcher_revision": "a" * 64,
-        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "a" * 64},
-        "coverage": {"evaluated": len(findings), "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 12, "revision": "a" * 64},
+        "coverage": {"evaluated": len(findings) - not_eval, "not_evaluated": not_eval,
+                     "rules": ["review.term_pair", "review.sentence_meaning"]},
         "findings": findings, "truncated": False,
     }
+
+
+HOMOGRAPH_SOURCE = "\n\n".join([
+    (
+        "清晨的薄雾还未从今州城墙散去，庭院深处的古树已经落下露水。"
+        "椿静静注视着枝头新开的红椿蕊，指尖轻轻拂过微凉的石栏。"
+        "不远处的城楼上，今汐与心大人正在核对昨夜从边庭送达的急报，纸页间夹着北落野最新的巡查记录。"
+        "守卫们沿着长阶往返传令，将各处哨塔观测到的声骸频率逐一登记入册，以防雨季前再度出现异常波动。"
+        "待晨钟敲响三声，街市上的灯火次第熄灭，远行商队牵着驮兽缓缓驶出东门，车辙在青石路面上留下清晰的浅痕。"
+    ),
+    (
+        "午后细雨初歇，石板街两侧的茶铺重新支起竹帘。"
+        "椿再次穿过幽静的花径，在廊下停步望向远山，而客栈厨下刚备好一碟时令清炒香椿，香气顺着木窗飘向后院。"
+        "议事厅内，今汐翻阅着历年修筑防线的旧卷宗，把需要补强的渡口与栈道逐条圈出。"
+        "来自黑海岸的信使在偏厅等候回音，斗篷边角还带着海风与潮气，随身携带的观测匣每隔片刻便发出一声低缓的蜂鸣。"
+        "书吏将誊清的文书封入蜡印木筒，交由快马送往乘霄山脚下的前哨驿站。"
+    ),
+    (
+        "夜幕降临时，河谷吹来的晚风掠过空旷的演武场。"
+        "椿只留下一枚染露的花瓣便转身隐入夜色，未曾惊动廊下值守的巡夜人。"
+        "心大人随即命众人守住南侧渡口，在浅滩与芦苇荡之间布下警戒信标，同时清点库房备用的补给箱。"
+        "远处山脊偶有微弱的共鸣光斑闪烁，观测员凭栏记录方位与持续时长，直到子夜更鼓响起、水面重归平静。"
+    ),
+])
+
+HOMOGRAPH_TARGET = "\n\n".join([
+    (
+        "Morning mist still lingered along the walls of Jinzhou while dew gathered beneath the old courtyard trees. "
+        "Deep inside the garden, Camellya quietly watched the newly bloomed Red Petal on the bough, her fingertips brushing the cool stone railing. "
+        "High on the watchtower nearby, Jinhsi and Lady Hsin reviewed the urgent dispatches brought in from the border overnight, their pages interleaved with fresh patrol logs from the northern frontier. "
+        "Sentries hurried up and down the long steps to relay orders, entering every Echoes frequency reading from the outer beacons into the ledger before the seasonal rains could unsettle the terrain again. "
+        "When the morning bell tolled three times, street lanterns went out one after another and merchant caravans led their pack beasts through the eastern gate, leaving crisp tracks across the wet flagstones. "
+        "Clerks at the gatehouse tallied the outgoing permits while scouts checked the ridge roads toward the outer pass, ensuring every relay post remained clear for the afternoon couriers."
+    ),
+    (
+        "Once the afternoon drizzle eased, teahouses along the stone avenue raised their bamboo blinds again. "
+        "Camellya crossed the quiet flower path a second time and paused beneath the eaves to look toward the distant peaks, while in the inn kitchen a plate of stir-fried Chinese toon had just been prepared, its aroma drifting through the wooden lattice into the rear court. "
+        "Inside the council hall, Jinhsi leafed through archival scrolls on the old defensive works, circling each ferry crossing and cliffside walkway that needed reinforcement before autumn. "
+        "A courier from the Black Shores waited in the side chamber for a reply, sea air still clinging to the hem of his cloak as the brass instrument case at his belt emitted a soft periodic chime. "
+        "Scribes sealed the fair copies into wax-stamped cylinders so mounted riders could carry them straight to the foothill relay station below Mt. Firmament before sundown. "
+        "Along the canal wharf, boatmen coiled their hemp ropes and checked the water gauge carved into the granite pier, noting how the mountain runoff had risen slightly since dawn."
+    ),
+    (
+        "When night finally settled over the valley, a cool breeze swept across the empty training grounds. "
+        "Camelia left only a single dew-stained petal on the balustrade before slipping away into the darkness without alerting the watchmen under the corridor lanterns. "
+        "Lady Hsin immediately ordered the garrison to hold the southern crossing, setting warning beacons between the shallows and the reed beds while quartermasters counted the reserve supply crates in the storehouse. "
+        "Faint resonance glimmers flickered from time to time along the far ridgeline, and the observers on the parapet logged every bearing and duration until the midnight drum sounded and the river surface grew still again. "
+        "Down by the moored skiffs, relief guards exchanged wooden tallies in low voices, sheltering their oil lamps from the gusts that rolled down from the canyon walls."
+    ),
+])
+
+TUNER_SOURCE = "\n\n".join([
+    (
+        "Before the dawn patrol leaves the northern gate, bring one calibrated Tuner to inspect the newly recovered Echo beside Lady Hsin in the courtyard. "
+        "Clear water from the mountain spring flowed past the arched stone bridge all morning, carrying fallen pine needles toward the lower sluice. "
+        "Quartermasters arranged field rations, signal flares, and spare compasses along the wooden trestle tables while scouts tightened the straps on their travel packs. "
+        "From the upper gallery, observers compared yesterday's atmospheric readings against the border charts so the vanguard could avoid unstable valleys along the ridge. "
+        "Once the bronze gate slowly lifted, the column set out in two orderly files along the winding cliff road as pale sunlight broke through the clouds above Jinzhou. "
+        "Signal flags atop the corner bastion answered in sequence, marking the patrol's departure in the garrison watch log before the morning market opened below."
+    ),
+    (
+        "Two spare Tuners were stored inside the Jinzhou workshop cabinet to stabilise newly absorbed Echoes brought back from the outer ruins. "
+        "Artisans checked every copper coil and crystal lens under a magnifying lamp, recording serial marks in a leather-bound register beside the workbench. "
+        "Outside on the lantern street, merchants counted bolts of cloth, medicinal herbs, and porcelain jars before dusk settled over the market square. "
+        "Apprentices carried crates of replacement parts up the narrow stairs to the attic storehouse, careful not to jar the delicate gauges packed in dry straw. "
+        "By the time the evening horn echoed from the inner citadel, every bench had been swept clean and the heavy iron latch was drawn across the workshop door. "
+        "A single oil lamp remained lit beside the night clerk's desk so urgent repair requests from the border garrison could still be logged before midnight. "
+        "Before locking the courtyard gate, the foreman checked the dry-stone drainage channel behind the smithy to make sure rainwater would not seep beneath the timber floorboards overnight."
+    ),
+    (
+        "In the quiet canal-side tea house, the elderly Tuner adjusted the silk strings of a seven-string zither while speaking softly of Lady Hsin and old Jinzhou customs. "
+        "Guests gathered near the window listened attentively as rain tapped steadily against the tiled eaves and ripples spread across the dark water below. "
+        "A young chronicler seated in the corner wrote down the melody's modal shifts, pausing now and then to warm his hands around a porcelain cup of roasted tea. "
+        "Across the lane, bookbinders shuttered their shopfronts for the night and hung oiled paper lanterns beneath the awning to light the slick cobblestones. "
+        "Only when the watch bell rang twice from the distant drum tower did the gathering disperse along the covered walkway toward the residential ward. "
+        "Under the arched bridge, the last ferryman poled his empty punt toward the mooring post, leaving a long silver wake beneath the mist."
+    ),
+])
+
+TUNER_TARGET = "\n\n".join([
+    (
+        "拂晓巡逻队离开北门之前，先带一枚校准好的调谐器到庭院里，在心大人身旁核验刚回收的声骸。"
+        "清晨的山泉水沿着石拱桥静静流淌了一整上午，把飘落的松针带向下游水闸。"
+        "军需官在木制长案上摆好行军干粮、信号焰火与备用罗盘，斥候们则逐一收紧行囊绑带。"
+        "高处回廊上的观测员将昨日的气象记录与边庭舆图互相核对，以便前锋避开山脊间不稳定的河谷。"
+        "待青铜城门缓缓升起，队伍便排成两列整齐的纵队踏上蜿蜒的栈道，淡金色的晨光恰好穿过今州上空的云层。"
+    ),
+    (
+        "今州工坊的木柜里另外存放着两枚备用调谐器，专门用来稳定从外围遗迹带回的新吸收声骸。"
+        "匠人们在放大灯下检查每一组铜制线圈与水晶镜片，把编号逐笔登记在工作台旁的皮面册子里。"
+        "门外的灯街上，商贩们赶在暮色笼罩集市广场之前清点布匹、药材与瓷罐。"
+        "学徒们抱着装满替换零件的木箱走上狭窄的阁楼木梯，小心避开填塞干草的精密仪表。"
+        "等到内城吹响傍晚的号角时，每张长台都已清扫干净，工坊大门也落下了沉重的铁插销。"
+    ),
+    (
+        "运河畔幽静的茶馆里，年迈的调音师一边轻拨七弦琴的丝弦，一边低声说起心大人与今州的旧日风俗。"
+        "围坐在窗边的茶客静静倾听，细雨稳定地敲打着瓦檐，深色的河面上漾开一圈圈涟漪。"
+        "坐在角落里的年轻史官记下曲调的转音变化，不时停笔捧起青瓷茶盏暖一暖手。"
+        "街对面的装帧铺陆续关上木板门，在廊檐下挂起油纸灯笼照亮湿滑的卵石路面。"
+        "直到远处鼓楼连响两声更钟，席间众人才沿着避雨长廊散往城南的坊巷。"
+    ),
+])
+
+MISMATCH_SOURCE = (
+    (
+        "清晨议事开始前，今汐在今州城楼偏厅先行审阅北落野与乘霄山两路驿站呈送的边防简报，心大人在一旁核对粮秣与观测仪器的调拨清册。"
+        "阶下值守的传令官按时呈上夜间各座烽燧的巡检回报，确认沿途桥梁、索道与避雨哨棚均完好可用。"
+        "待朝阳越过东侧山脊，各营校尉依次入席领受当日巡查路线，随后率队分赴外围关隘。"
+    )
+    + "\n\n"
+    + (
+        "庭院深处，椿静静站在红椿蕊树下拆阅密函，确认黑海岸信使留下的坐标与潮汐时刻完全吻合，随即示意廊下候命的斥候先行启程前往南侧渡口接应船只；"
+        "与此同时，工坊技师在偏院架起便携观测台，记录周边声骸频率在雨后初晴时的细微起伏，并将每一组波形誊入随行日志，准备在日落前送交内城归档。"
+        "暮色四合之际，河谷深处忽有低沉回响掠过浅滩与芦苇丛，守夜人立刻点亮高塔信标并放下内城吊桥，直到整座城池在夜风中恢复井然秩序。"
+    )
+)
 
 
 class _Server:
@@ -205,6 +417,26 @@ class _Server:
                 "checked": list(semantic.CATEGORIES), "issues": _issues(source, target),
                 "truncated": False, "truncated_reason": None, "omitted_issues": 0,
             })
+        if path == "/v1/translations":
+            text_in = body["text"]
+            first_en = (
+                "Before the morning council opened, Jinhsi reviewed the frontier dispatches sent in from both the northern outposts and the Mt. Firmament relay stations inside the Jinzhou tower chamber, while Lady Hsin verified the allocation ledgers for grain reserves and observation instruments. "
+                "At the foot of the stairs, duty couriers presented the overnight inspection returns from every beacon tower along the high road, confirming that bridges, cableways, and storm shelters remained intact and passable. "
+                "Once the rising sun cleared the eastern ridge, garrison captains stepped forward in turn to receive the day's patrol routes before leading their detachments toward the outer passes."
+            )
+            second_en = (
+                "Deep within the inner courtyard, Camellya stood quietly beneath the Red Camellia tree to unseal the coded letter, confirming that the coordinates left behind by the Black Shores courier matched the tide tables to the minute before gesturing for the waiting scouts under the veranda to set out ahead toward the southern ferry landing and meet the incoming vessel before moonrise; "
+                "meanwhile, workshop technicians erected a portable observation stand in the side court to record subtle fluctuations in surrounding Echoes frequencies as the skies cleared after the rain, transcribing every waveform series into the waterproof field logbook so that the complete dossier could be delivered to the inner citadel archives before sunset, while senior scribes cross-checked the timestamps against the water-clock bells from the central plaza, compared the compass bearings with last month's ridge survey, and filed duplicate copies inside the stone vault behind the council chamber. "
+                "The model inserted an extra standalone summary sentence here instead of preserving the source paragraph's two-sentence boundary, pushing this single unsplit translation paragraph well past the eighteen-hundred-character segment ceiling so deterministic sentence pairing refuses to guess or silently misalign adjacent clauses across the paragraph. "
+                "As twilight gathered across the wide river valley, a low resonance rolled over the gravel shallows and dense reed beds, prompting the night watchmen stationed along the high parapet to kindle the warning beacons, secure the heavy iron sluice chains along the canal embankment, inspect the western postern locks twice, and lower the inner drawbridge until the entire city returned to quiet order beneath the cool evening wind, with relief sentries pacing the lantern-lit ramparts through the first watch while harbourmasters logged the final mooring lines below the stone quay, extinguished the signal braziers on the outer mole, stowed the signal flags inside the dry locker, and sealed the night register before handing the bronze keys back to the citadel steward on duty."
+            )
+            out_text = f"{first_en}\n\n{second_en}" if "\n\n" in text_in else (
+                first_en if "清晨议事开始前" in text_in else second_en
+            )
+            return httpx.Response(200, json={
+                "kind": "llm", "text": out_text, "direction": body.get("to") or "en",
+                "dictionary_miss": False, "request_id": "req-tr-0001",
+            })
         raise AssertionError(path)
 
 
@@ -221,10 +453,10 @@ def _window(server: _Server, configured: bool = True):
     return window
 
 
-def _load(window, source: str, target: str) -> None:
+def _load(window, source: str, target: str, direction: str = "en") -> None:
     view = window.manuscript_view
     value = empty_workfile()
-    value.update(source=source, target=target, direction="en")
+    value.update(source=source, target=target, direction=direction)
     view._set_payload(value)
     view._saved_payload = dict(view._payload)
     view._update_controls()
@@ -292,13 +524,93 @@ def _states(semantic: bool):
         window.manuscript_view.segment_list.setCurrentRow(1)
         return window
 
+    def short_unreviewed():
+        window = _window(_Server(semantic))
+        short_s = (
+            "今汐与心大人在今州城楼核对边庭来信。\n\n"
+            "椿站在红椿蕊树下，倾听远处声骸的回响。"
+        )
+        short_t = (
+            "Jinhsi and Lady Hsin reviewed the border dispatches on the Jinzhou tower.\n\n"
+            "Camellya stood beneath the Red Camellia tree, listening to the distant Echoes."
+        )
+        _load(window, short_s, short_t)
+        view = window.manuscript_view
+        view._refresh_derived()
+        view._show_track(TRACK_SEGMENTS)
+        return window
+
+    def homograph_groups():
+        window = _window(_Server(semantic))
+        _load(window, HOMOGRAPH_SOURCE, HOMOGRAPH_TARGET, direction="en")
+        _review(window)
+        view = window.manuscript_view
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        for r in range(view.term_groups.count()):
+            text = view.term_groups.item(r).text()
+            if "#3" in text and "Camelia" in text:
+                view.term_groups.setCurrentRow(r)
+                break
+        QApplication.processEvents()
+        view.term_groups.doItemsLayout()
+        view.term_groups.verticalScrollBar().setValue(0)
+        return window
+
+    def homograph_replace():
+        window = homograph_groups()
+        view = window.manuscript_view
+        if view.replace_toggle.isVisible():
+            view.replace_toggle.setChecked(True)
+        QApplication.processEvents()
+        from PySide6.QtWidgets import QScrollArea
+        scroll = view.inspector.findChild(QScrollArea)
+        if scroll is not None:
+            scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+        return window
+
+    def tuner_and_reason_groups():
+        window = _window(_Server(semantic))
+        _load(window, TUNER_SOURCE, TUNER_TARGET, direction="zh")
+        _review(window)
+        view = window.manuscript_view
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        for r in range(view.term_groups.count()):
+            text = view.term_groups.item(r).text()
+            if "普通词义" in text and text.startswith("  #"):
+                view.term_groups.setCurrentRow(r)
+                break
+        # Scroll to top of term_groups so Tuner (调谐器 ×2 · 调音师 ×1) header AND spring (普通词义) are visible together.
+        view.term_groups.verticalScrollBar().setValue(0)
+        return window
+
+    def translation_mismatch():
+        window = _window(_Server(semantic))
+        _load(window, MISMATCH_SOURCE, "", direction="en")
+        view = window.manuscript_view
+
+        async def run_tr() -> None:
+            view._translate()
+            await _settle(view)
+        asyncio.run(run_tr())
+        view.jump_mismatch_button.click()
+        return window
+
     if not semantic:
         return [("01-empty", lambda: _window(_Server(False))),
                 ("02-unconfigured", lambda: _window(_Server(False), configured=False)),
                 ("03-draft", drafted), ("04-terms", terms), ("05-long-reviewed", long_reviewed),
-                ("06-quota-paused", quota), ("07-segments", segments)]
+                ("06-quota-paused", quota), ("07-segments", segments),
+                ("08-short-unreviewed", short_unreviewed),
+                ("09-term-groups-homographs", homograph_groups),
+                ("09b-term-groups-replace", homograph_replace),
+                ("10-term-groups-tuner-reason", tuner_and_reason_groups),
+                ("11-translation-mismatch", translation_mismatch)]
     return [("04-terms", terms), ("05-semantic-issue", semantic_issue),
-            ("06-quota-paused", quota), ("07-segments", segments)]
+            ("06-quota-paused", quota), ("07-segments", segments),
+            ("08-short-unreviewed", short_unreviewed),
+            ("09-term-groups-homographs", homograph_groups)]
 
 
 def _capture(app, build, path: Path) -> bool:

@@ -57,17 +57,18 @@ pair, in order.
 from __future__ import annotations
 
 import bisect
-import hashlib
-import json
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
+import json
+import re
 from typing import Any, NamedTuple
 
-from . import manuscript
-from .manuscript import (ALIGNMENT_AUTOMATIC, MAX_CORE_SCALARS, MAX_SEGMENT_CHOICE_HISTORY, MAX_SEGMENT_CHOICES,
-                         MAX_SEGMENTS, SEGMENTATION_VERSION, WorkfileError)
-from .segmentation import STATUS_READY, pair_is_sendable
+from . import manuscript, strings
+from .manuscript import (ALIGNMENT_AUTOMATIC, MAX_CORE_SCALARS, MAX_SEGMENT_CHOICE_HISTORY, MAX_SEGMENTS,
+                         MAX_V4_CHOICES, SEGMENTATION_VERSION, WorkfileError)
+from .segmentation import STATUS_READY, _sentence_pieces, pair_is_sendable
 from .semantic_session import _shift
 
 LONG_MODE_SCALARS = 2000  # long mode: either side has more scalars than this
@@ -199,8 +200,8 @@ def compact_result(report: Mapping, source_core: str, target_core: str) -> dict 
     """The compact result of a review-v2 response for exactly these cores, or ``None``
     when it cannot be stored: no v3 basis, a finding whose rule id is not
     ``review.term_pair``, coverage rules other than the review-v2 constant, a
-    count over its cap, a core outside 1 to 2,000 scalars, or anything else the
-    reader would reject."""
+    count over its cap (128), a core outside 1 to 2,000 scalars, or anything
+    else the v4 reader would reject."""
     if (basis_of(report) is None or not 1 <= len(source_core) <= MAX_CORE_SCALARS
             or not 1 <= len(target_core) <= MAX_CORE_SCALARS):
         return None
@@ -212,15 +213,19 @@ def compact_result(report: Mapping, source_core: str, target_core: str) -> dict 
             source_span, target_span = finding["source_span"], finding["target_span"]
             if finding["rule_id"] != TERM_PAIR_RULE or source_span is None:
                 return None
-            findings.append({
+            item: dict[str, Any] = {
                 "verdict": finding["verdict"], "source": [source_span["start"], source_span["end"]],
                 "target": None if target_span is None else [target_span["start"], target_span["end"]],
                 "candidates": [{"candidate_id": c["candidate_id"], "zh": c["zh"], "en": c["en"],
                                 "category": c["category"]} for c in finding["candidates"]],
-                "candidates_truncated": finding["candidates_truncated"]})
+                "candidates_truncated": finding["candidates_truncated"],
+            }
+            if "reason" in finding:
+                item["reason"] = finding["reason"]
+            findings.append(item)
         result = {"truncated": report["truncated"], "evaluated": report["coverage"]["evaluated"],
                   "not_evaluated": report["coverage"]["not_evaluated"], "findings": findings}
-        manuscript._check_result_shape(result)
+        manuscript._check_result_shape(result, v4=True)
     except (KeyError, TypeError, WorkfileError):
         return None
     seen: set[tuple[int, int]] = set()
@@ -247,12 +252,16 @@ def expand_result(record: Mapping, source: str, target: str) -> dict:
     findings = []
     for finding in result["findings"]:
         source_span = span(finding["source"], source_core)
-        findings.append({
+        item: dict[str, Any] = {
             "id": mention_id(source_span), "verdict": finding["verdict"], "rule_id": TERM_PAIR_RULE,
             "source_span": source_span, "target_span": span(finding["target"], target_core),
             "candidates": [{"zh": x["zh"], "en": x["en"], "category": x["category"], "sources": [],
                             "candidate_id": x["candidate_id"]} for x in finding["candidates"]],
-            "candidates_truncated": finding["candidates_truncated"]})
+            "candidates_truncated": finding["candidates_truncated"],
+        }
+        if "reason" in finding:
+            item["reason"] = finding["reason"]
+        findings.append(item)
     return {"request_id": None, "source_revision": record["source_hash"], "target_revision": record["target_hash"],
             "rule_version": basis["rule_version"], "matcher_revision": basis["matcher_revision"],
             "dictionary": dict(basis["dictionary"]),
@@ -358,7 +367,7 @@ def _set_choice(parts: Parts, index: int, place: tuple[int, int], new: dict | No
         choices = [c for c in record["choices"] if c is not old]
     else:
         choices = [new if c is old else c for c in record["choices"]]
-    if len(choices) > MAX_SEGMENT_CHOICES:
+    if len(choices) > MAX_V4_CHOICES:
         raise manuscript._too_many()
     changed = (old is not None and old["confirmed"]) or (new is not None and new["confirmed"])
     status = "stale" if record["status"] == "done" and changed else record["status"]
@@ -764,7 +773,7 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
             if j >= 0 and cores[j][0][0] <= begin and end <= cores[j][0][1] and source[begin:end] == span["text"]:
                 into = records[j]
                 place = (begin - cores[j][0][0], end - cores[j][0][0])
-                if len(into["choices"]) < MAX_SEGMENT_CHOICES and all(_place(c) != place for c in into["choices"]):
+                if len(into["choices"]) < MAX_V4_CHOICES and all(_place(c) != place for c in into["choices"]):
                     relocated = {**choice, "source_span": {"start": place[0], "end": place[1], "text": span["text"]},
                                  "confirmed": False}
                     records[j] = {**into, "choices": [*into["choices"], relocated]}
@@ -855,7 +864,7 @@ def restore(payload: Mapping[str, Any], position: int, index: int) -> Parts:
         raise ValueError("this history entry cannot be restored into this record")
     parts = parts_of(payload)
     entry, record = parts.history[position], parts.segments[index]
-    if len(record["choices"]) >= MAX_SEGMENT_CHOICES:
+    if len(record["choices"]) >= MAX_V4_CHOICES:
         raise manuscript._too_many()
     choice = {"source_span": entry["source_span"], "choice": entry["choice"], "candidate": entry["candidate"],
               "offered": entry["offered"], "confirmed": False}
@@ -880,3 +889,500 @@ def set_finished(parts: Parts, index: int, finished: bool) -> Parts:
         return parts
     completed.symmetric_difference_update({index})
     return parts._replace(progress={"current": parts.progress["current"], "completed": sorted(completed)})
+
+
+# ---- term occurrence grouping & per-occurrence context --------------------
+
+_FLAT_WS = re.compile(r"[\r\n\t]+")
+_CONTEXT_WINDOW = 34
+_GROUP_STATUS_PRIORITY = {
+    "inconsistent": 0,
+    "pending": 1,
+    "not_evaluated": 2,
+    "confirmed": 3,
+}
+_VERDICT_LABELS = {
+    "verified_constraint": strings.MANUSCRIPT_VERDICT_VERIFIED,
+    "confirmed_conflict": strings.MANUSCRIPT_VERDICT_CONFLICT,
+    "needs_review": strings.MANUSCRIPT_VERDICT_NEEDS_REVIEW,
+    "not_evaluated": strings.MANUSCRIPT_VERDICT_NOT_EVALUATED,
+}
+
+
+def localized_not_evaluated_reason(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    return strings.MANUSCRIPT_NOT_EVALUATED_REASON.get(reason, reason)
+
+
+def localized_not_evaluated_detail(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    if reason in strings.MANUSCRIPT_NOT_EVALUATED_DETAIL:
+        return strings.MANUSCRIPT_NOT_EVALUATED_DETAIL[reason]
+    return strings.MANUSCRIPT_NOT_EVALUATED_UNKNOWN.format(reason=reason)
+
+
+def localized_verdict_label(verdict: str, reason: str | None = None) -> str:
+    if verdict == "not_evaluated" and reason:
+        return strings.MANUSCRIPT_VERDICT_NOT_EVALUATED_REASON.format(
+            reason=localized_not_evaluated_reason(reason)
+        )
+    return _VERDICT_LABELS.get(verdict, verdict)
+
+
+def _en_singular_forms(word: str) -> set[str]:
+    w = word.lower()
+    forms = {w}
+    if len(w) > 3 and w.endswith("ies"):
+        forms.add(w[:-3] + "y")
+    if len(w) > 3 and w.endswith("ves"):
+        forms.add(w[:-3] + "f")
+        forms.add(w[:-3] + "fe")
+    if len(w) > 2 and w.endswith("es"):
+        forms.add(w[:-2])
+    if len(w) > 1 and w.endswith("s") and not w.endswith("ss"):
+        forms.add(w[:-1])
+    return forms
+
+
+def _english_surface_tokens(surface: str) -> tuple[tuple[str, ...], frozenset[str]] | None:
+    if (not surface
+            or not any(ch.isascii() and ch.isalpha() for ch in surface)
+            or any(ord(ch) >= 0x3000 for ch in surface)):
+        return None
+    words = surface.strip().split()
+    if not words:
+        return None
+    prefix = tuple(w.lower() for w in words[:-1])
+    return prefix, frozenset(_en_singular_forms(words[-1]))
+
+
+def _attention(choice: Mapping[str, Any] | None, freshness: str, verdict: str) -> str:
+    """What one place still needs, as Web's ``attention`` (``lib/long-review.js``):
+    ``settled``, ``pending``, ``conflict``, ``not_evaluated`` or ``ok``.
+
+    A place is decided when it has a confirmed choice and its segment is not
+    stale; a place whose choice waits for the next check, or that sits in a
+    stale segment, needs a check; a conflict needs a decision. ``ok`` is a
+    verified place with nothing to do.
+    """
+    if choice is not None and choice.get("confirmed") and freshness != "stale":
+        return "settled"
+    if choice is not None and not choice.get("confirmed"):
+        return "pending"
+    if freshness == "stale":
+        return "pending"
+    if verdict == "confirmed_conflict":
+        return "conflict"
+    if verdict == "needs_review":
+        return "pending"
+    if verdict == "not_evaluated":
+        return "not_evaluated"
+    return "ok"
+
+
+def _needs_action(occurrence: Mapping[str, Any]) -> bool:
+    return occurrence["attention"] in ("pending", "conflict")
+
+
+def _unchecked_holding(
+    surfaces: Sequence[str],
+    unchecked: Sequence[tuple[int, str]],
+    direction: str,
+) -> list[int]:
+    """The 1-based numbers of the unchecked segments whose source core holds one
+    of these spellings: a substring for a non-English source, a whole word
+    (case-insensitive, plural included) for an English one. Web
+    ``uncheckedHolding``."""
+    forms = [name for name in (surface.strip() for surface in surfaces) if name]
+    if not forms or not unchecked:
+        return []
+    english = any(_english_surface_tokens(name) is not None for name in forms)
+    if english:
+        pattern = re.compile(
+            r"(?<![^\W\d_])(?:" + "|".join(re.escape(name) for name in forms) + r")(?:es|s)?(?![^\W\d_])",
+            re.IGNORECASE,
+        )
+        return sorted(index + 1 for index, core in unchecked if pattern.search(core))
+    return sorted(index + 1 for index, core in unchecked if any(name in core for name in forms))
+
+
+def group_matches_filter(group: Mapping[str, Any], key: str) -> bool:
+    """Whether a status filter shows this group (Web ``groupMatch``).
+
+    A filter shows a group that *holds a place in that state*, whatever the
+    group's own status is: an ``inconsistent`` group with a ``needs_review``
+    place is also pending work, so the ``pending`` filter must not hide it. A
+    group that waits for a check of a segment without a result is pending even
+    though none of its known places is.
+    """
+    if key == "all":
+        return True
+    if key == "inconsistent":
+        return group["status"] == "inconsistent"
+    if key == "pending":
+        return group["pending_count"] > 0 or bool(group["unverified_segments"])
+    if key == "not_evaluated":
+        return group["not_evaluated_count"] > 0
+    if key == "confirmed":
+        return group["status"] == "confirmed"
+    return True
+
+
+def _rendering_key(actual_translation: str | None, verdict: str) -> tuple:
+    if actual_translation is None:
+        return ("not_evaluated", None) if verdict == "not_evaluated" else ("miss", None)
+    en_tokens = _english_surface_tokens(actual_translation)
+    if en_tokens is not None:
+        prefix, forms = en_tokens
+        return ("en", prefix, min(forms, key=len))
+    return ("raw", actual_translation.strip())
+
+
+def _context_snippet(
+    core_text: str,
+    hit: tuple[int, int] | None,
+    *,
+    source_core: str = "",
+    source_hit: tuple[int, int] | None = None,
+    window: int = _CONTEXT_WINDOW,
+) -> str:
+    """Compact ~28–40 scalar snippet around ``hit``, or paired sentence excerpt when ``hit`` is None."""
+    if not core_text:
+        return ""
+    if hit is not None:
+        a, b = hit
+        a = max(0, min(a, len(core_text)))
+        b = max(a, min(b, len(core_text)))
+        hit_len = b - a
+        pad = max(6, (window - hit_len) // 2)
+        left = max(0, a - pad)
+        right = min(len(core_text), b + pad)
+        if left == 0:
+            right = min(len(core_text), max(right, window))
+        elif right == len(core_text):
+            left = max(0, min(left, len(core_text) - window))
+        # Avoid slicing ASCII words in half at the outer edges while keeping the hit intact.
+        if left > 0 and core_text[left - 1].isascii() and core_text[left - 1].isalnum():
+            while left < a and core_text[left].isascii() and core_text[left].isalnum():
+                left += 1
+        if right < len(core_text) and core_text[right].isascii() and core_text[right].isalnum():
+            while right > b and core_text[right - 1].isascii() and core_text[right - 1].isalnum():
+                right -= 1
+        body = _FLAT_WS.sub(" ", core_text[left:right]).strip()
+        return ("…" if left > 0 else "") + body + ("…" if right < len(core_text) else "")
+
+    stripped = core_text.strip()
+    if not stripped:
+        return ""
+    seg_start, seg_end = 0, len(core_text)
+    if source_core and source_hit is not None:
+        s_sents = _sentence_pieces(source_core, 0, len(source_core))
+        t_sents = _sentence_pieces(core_text, 0, len(core_text))
+        if s_sents and t_sents:
+            if len(s_sents) == len(t_sents):
+                s_idx = next(
+                    (k for k, (sa, sb) in enumerate(s_sents) if sa <= source_hit[0] < sb),
+                    len(s_sents) - 1,
+                )
+                seg_start, seg_end = t_sents[s_idx]
+            else:
+                target_pos = min(
+                    len(core_text) - 1,
+                    int((source_hit[0] / max(1, len(source_core))) * len(core_text)),
+                )
+                seg_start, seg_end = next(
+                    ((ta, tb) for ta, tb in t_sents if ta <= target_pos < tb),
+                    t_sents[-1],
+                )
+    excerpt_raw = _FLAT_WS.sub(" ", core_text[seg_start:seg_end]).strip()
+    if not excerpt_raw:
+        excerpt_raw = _FLAT_WS.sub(" ", stripped).strip()
+        seg_start, seg_end = 0, len(core_text)
+    clipped_left = seg_start > 0
+    clipped_right = seg_end < len(core_text)
+    if len(excerpt_raw) > window:
+        cut = excerpt_raw[:window]
+        if excerpt_raw[window].isascii() and excerpt_raw[window].isalnum() and " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        excerpt_raw = cut.rstrip()
+        clipped_right = True
+    return ("…" if clipped_left else "") + excerpt_raw + ("…" if clipped_right else "")
+
+
+def _record_freshness(
+    record: Mapping,
+    source: str,
+    target: str,
+    direction: str,
+    alignments: Sequence[Mapping] | None,
+    basis: Mapping | None,
+) -> str | None:
+    """``current``, ``saved`` or ``stale`` when the record's content hashes and
+    direction match the current cores; ``None`` when pending or content-diverged."""
+    if record["status"] == "pending" or record["result"] is None or record["direction"] != direction:
+        return None
+    (a, b), (c, d) = _cores(record)
+    if not (0 <= a <= b <= len(source) and 0 <= c <= d <= len(target)):
+        return None
+    if (content_hash(source[a:b]) != record["source_hash"]
+            or content_hash(target[c:d]) != record["target_hash"]):
+        return None
+    if record["status"] != "done":
+        return "stale"
+    if alignment_input(alignments, source, target, (a, b), (c, d)) != record["alignment_input"]:
+        return "stale"
+    if basis is None:
+        return "saved"
+    return "current" if same_basis(record["basis"], basis) else "stale"
+
+
+def _canonical_group_surface(surfaces: Sequence[str], candidates: Sequence[Mapping]) -> str:
+    if len(surfaces) == 1 or not _english_surface_tokens(surfaces[0]):
+        return surfaces[0]
+    candidate_en = [c["en"] for c in candidates if isinstance(c.get("en"), str) and c["en"]]
+    for wanted in candidate_en:
+        if wanted in surfaces:
+            return wanted
+    lower_map = {s.lower(): s for s in surfaces}
+    for wanted in candidate_en:
+        if wanted.lower() in lower_map:
+            return wanted
+    return min(surfaces, key=lambda s: (len(s), surfaces.index(s)))
+
+
+def group_term_occurrences(
+    records: Sequence[Mapping],
+    pairs: Sequence,
+    source: str,
+    target: str,
+    direction: str,
+    *,
+    alignments: Sequence[Mapping] | None = None,
+    basis: Mapping | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate findings across non-pending content-current (current/saved/stale)
+    segment records by source surface (merging English singular/plural surfaces
+    sharing candidate sets), with per-occurrence spans, ~28–40 scalar context
+    snippets, rendering distribution and group status.
+
+    A ready segment with no usable record yet is not a place in any group, but
+    its source core may hold one of a group's spellings: ``unverified_segments``
+    lists it, and the group is never ``confirmed`` while one stands, so a header
+    cannot claim the term is settled across a manuscript that still owes a check.
+    """
+    raw_groups: list[dict[str, Any]] = []
+    finding_index = 0
+    checked: set[int] = set()
+
+    for fallback_idx, record in enumerate(records or ()):
+        seg_index = record.get("index", fallback_idx)
+        if pairs and 0 <= seg_index < len(pairs) and getattr(pairs[seg_index], "status", STATUS_READY) != STATUS_READY:
+            continue
+        freshness = _record_freshness(record, source, target, direction, alignments, basis)
+        if freshness is None:
+            continue
+        checked.add(seg_index)
+        (s_core_start, s_core_end), (t_core_start, t_core_end) = _cores(record)
+        source_core = source[s_core_start:s_core_end]
+        target_core = target[t_core_start:t_core_end]
+        expanded = expand_result(record, source, target)
+        choices_by_place = {_place(c): c for c in record.get("choices") or ()}
+
+        for finding in expanded["findings"]:
+            core_s = finding["source_span"]
+            core_t = finding["target_span"]
+            doc_s = {
+                "start": s_core_start + core_s["start"],
+                "end": s_core_start + core_s["end"],
+                "text": core_s["text"],
+            }
+            doc_t = None if core_t is None else {
+                "start": t_core_start + core_t["start"],
+                "end": t_core_start + core_t["end"],
+                "text": core_t["text"],
+            }
+            verdict = finding["verdict"]
+            reason = finding.get("reason") if verdict == "not_evaluated" else None
+            reason_label = localized_not_evaluated_reason(reason)
+            verdict_label = localized_verdict_label(verdict, reason)
+            actual_translation = doc_t["text"] if doc_t is not None else None
+            choice = choices_by_place.get((core_s["start"], core_s["end"]))
+            choice_state = (
+                "none" if choice is None else "confirmed" if choice.get("confirmed") else "unconfirmed"
+            )
+            source_ctx = _context_snippet(source_core, (core_s["start"], core_s["end"]))
+            target_ctx = _context_snippet(
+                target_core,
+                None if core_t is None else (core_t["start"], core_t["end"]),
+                source_core=source_core,
+                source_hit=(core_s["start"], core_s["end"]),
+            )
+            candidates = finding["candidates"]
+            cand_ids = frozenset(c["candidate_id"] for c in candidates if "candidate_id" in c)
+            surface = core_s["text"]
+            en_tokens = _english_surface_tokens(surface)
+
+            occ = {
+                "finding_index": finding_index,
+                "segment_index": seg_index,
+                "segment_number": seg_index + 1,
+                "surface": surface,
+                "core_source_span": core_s,
+                "core_target_span": core_t,
+                "source_span": doc_s,
+                "target_span": doc_t,
+                "source_context": source_ctx,
+                "target_context": target_ctx,
+                "actual_translation": actual_translation,
+                "verdict": verdict,
+                "reason": reason,
+                "reason_label": reason_label,
+                "verdict_label": verdict_label,
+                "freshness": freshness,
+                "choice": choice,
+                "choice_state": choice_state,
+                "candidates": candidates,
+                "candidates_truncated": finding["candidates_truncated"],
+                "attention": _attention(choice, freshness, verdict),
+                "_rendering_key": _rendering_key(actual_translation, verdict),
+            }
+            finding_index += 1
+
+            matched_group = None
+            for grp in raw_groups:
+                if surface in grp["surfaces_set"]:
+                    matched_group = grp
+                    break
+                if (en_tokens is not None
+                        and grp["en_prefix"] is not None
+                        and cand_ids
+                        and cand_ids == grp["cand_ids"]
+                        and en_tokens[0] == grp["en_prefix"]
+                        and bool(en_tokens[1] & grp["en_forms"])):
+                    matched_group = grp
+                    break
+
+            if matched_group is None:
+                raw_groups.append({
+                    "surfaces": [surface],
+                    "surfaces_set": {surface},
+                    "cand_ids": cand_ids,
+                    "en_prefix": None if en_tokens is None else en_tokens[0],
+                    "en_forms": set() if en_tokens is None else set(en_tokens[1]),
+                    "candidates": candidates,
+                    "occurrences": [occ],
+                })
+            else:
+                if surface not in matched_group["surfaces_set"]:
+                    matched_group["surfaces"].append(surface)
+                    matched_group["surfaces_set"].add(surface)
+                if en_tokens is not None:
+                    matched_group["en_forms"].update(en_tokens[1])
+                if not matched_group["candidates"] and candidates:
+                    matched_group["candidates"] = candidates
+                matched_group["occurrences"].append(occ)
+
+    # A ready segment whose record is missing, pending or content-diverged has no
+    # place in a group yet; Web's `unchecked`, narrowed to these spellings per group.
+    unchecked: list[tuple[int, str]] = []
+    for pair in pairs or ():
+        index = getattr(pair, "index", None)
+        if index is None or index in checked:
+            continue
+        if getattr(pair, "status", STATUS_READY) != STATUS_READY:
+            continue
+        region = getattr(pair, "source", None)
+        start, end = getattr(region, "core_start", None), getattr(region, "core_end", None)
+        if start is None or end is None or not 0 <= start <= end <= len(source):
+            continue
+        unchecked.append((index, source[start:end]))
+
+    groups: list[dict[str, Any]] = []
+    for order_idx, grp in enumerate(raw_groups):
+        occurrences = grp["occurrences"]
+        counts: Counter[str] = Counter()
+        first_seen: dict[str, int] = {}
+        for pos, occ in enumerate(occurrences):
+            if occ["actual_translation"] is not None:
+                label = occ["actual_translation"]
+            elif occ["verdict"] == "not_evaluated":
+                label = occ["verdict_label"]
+            else:
+                label = strings.MANUSCRIPT_TERM_TARGET_MISS
+            counts[label] += 1
+            first_seen.setdefault(label, pos)
+
+        distribution = sorted(counts.items(), key=lambda item: (-item[1], first_seen[item[0]]))
+        distribution_text = " · ".join(
+            strings.MANUSCRIPT_TERM_DISTRIBUTION_ITEM.format(label=lbl, count=cnt)
+            for lbl, cnt in distribution
+        )
+
+        eval_occs = [o for o in occurrences if o["verdict"] != "not_evaluated"]
+        rendering_keys = {o["_rendering_key"] for o in eval_occs}
+        all_eval_verified = bool(eval_occs) and all(
+            o["verdict"] == "verified_constraint"
+            and o["freshness"] == "current"
+            and o["choice_state"] != "unconfirmed"
+            for o in eval_occs
+        )
+        if len(rendering_keys) >= 2 and not all_eval_verified:
+            status = "inconsistent"
+        elif not eval_occs and all(
+            o["choice_state"] != "unconfirmed" and o["freshness"] != "stale" for o in occurrences
+        ):
+            status = "not_evaluated"
+        elif all(
+            (
+                o["verdict"] == "verified_constraint"
+                or (o["verdict"] == "not_evaluated" and o["choice_state"] == "confirmed")
+            )
+            and o["freshness"] == "current"
+            and o["choice_state"] != "unconfirmed"
+            for o in occurrences
+        ):
+            status = "confirmed"
+        else:
+            status = "pending"
+
+        clean_occurrences = []
+        for occ in occurrences:
+            item = {k: v for k, v in occ.items() if k != "_rendering_key"}
+            item["group_status"] = status
+            clean_occurrences.append(item)
+
+        pending_count = sum(1 for o in occurrences if _needs_action(o))
+        not_evaluated_count = sum(1 for o in occurrences if o["attention"] == "not_evaluated")
+        unverified = _unchecked_holding(grp["surfaces"], unchecked, direction)
+        if status in ("confirmed", "not_evaluated") and unverified:
+            # Nothing in this group needs work, but a segment that holds one of
+            # its spellings still owes a check: the term is not settled there.
+            # `inconsistent` stays, it is the more urgent word.
+            status = "pending"
+            for item in clean_occurrences:
+                item["group_status"] = status
+
+        seg_indices = sorted({o["segment_index"] for o in clean_occurrences})
+        groups.append({
+            "surface": _canonical_group_surface(grp["surfaces"], grp["candidates"]),
+            "surfaces": list(grp["surfaces"]),
+            "count": len(clean_occurrences),
+            "segment_indices": seg_indices,
+            "segments": [idx + 1 for idx in seg_indices],
+            "distribution": distribution,
+            "distribution_text": distribution_text,
+            "status": status,
+            "pending_count": pending_count,
+            "not_evaluated_count": not_evaluated_count,
+            "unverified_segments": unverified,
+            "candidates": grp["candidates"],
+            "occurrences": clean_occurrences,
+            "_order": order_idx,
+        })
+
+    groups.sort(key=lambda g: (_GROUP_STATUS_PRIORITY.get(g["status"], 99), g["_order"]))
+    for g in groups:
+        g.pop("_order", None)
+    return groups

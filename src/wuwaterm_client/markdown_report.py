@@ -57,6 +57,7 @@ MD = {
     "coverageHeading": "覆盖范围",
     "evaluatedLabel": "已评估",
     "notEvaluatedLabel": "未评估",
+    "notEvaluatedReasonLabel": "未评估原因",
     "rulesLabel": "适用规则",
     "zeroCoverageLine": "零覆盖：没有任何内容被评估。零发现不等于翻译通过。",
     "truncatedLine": "报告已截断：以下不是一次完整核对。",
@@ -131,6 +132,13 @@ SEMANTIC_STATUSES = {
 }
 VERDICTS = {"verified_constraint": "术语约束已核", "confirmed_conflict": "与所选词对冲突",
             "needs_review": "需要核对", "not_evaluated": "未评估"}
+NOT_EVALUATED_REASONS = {
+    "not_a_term": "已按“不是术语”记录，不按专有术语核对",
+    "ordinary_word": "上下文判定为普通词义，不按专有术语核对",
+    "no_target_region": "未找到与该处对应的译文句段",
+    "found_outside_region": "官方译名出现在配对句段之外",
+    "ambiguous_repeat": "同一区域内多次出现，无法唯一对应",
+}
 CATEGORIES = {"core_term": "核心术语", "resonator": "共鸣者", "weapon": "武器", "echo": "声骸", "skill": "技能",
               "sonata_effect": "合鸣效果", "location": "地区", "item": "物品", "speaker": "角色"}
 NOT_TERM = "这里不是术语"
@@ -453,6 +461,13 @@ def _pair(candidate: Mapping | None) -> str:
     return inline(candidate["zh"]) + " / " + inline(candidate["en"]) if candidate else NOT_TERM
 
 
+def _not_evaluated_reason_line(finding: Mapping) -> str:
+    if finding.get("verdict") != "not_evaluated" or not finding.get("reason"):
+        return ""
+    reason = str(finding["reason"])
+    return MD["notEvaluatedReasonLabel"] + COLON + NOT_EVALUATED_REASONS.get(reason, inline(reason))
+
+
 def render(data: Mapping[str, Any]) -> str:
     """The Markdown report. ``data`` holds ``draft``, ``latest``, ``previous``,
     ``currency``, ``choices``, ``reconciled``, ``comparison``, ``semantic``
@@ -528,6 +543,7 @@ def render(data: Mapping[str, Any]) -> str:
                 _span_label(source_span) + " · " + MD["ruleLabelShort"] + COLON + inline(finding["rule_id"]),
                 (_span_label(target_span, "targetSpanLabel") + COLON + inline(target_span["text"])
                  if target_span else MD["noTargetSpan"]),
+                _not_evaluated_reason_line(finding),
             ]), ""])
             context = compact_context(latest["source"], source_span)
             if context:
@@ -628,6 +644,7 @@ def render(data: Mapping[str, Any]) -> str:
                     + _span_label(f["source_span"])
                     + (" · " + _span_label(f["target_span"], "targetSpanLabel") + COLON + inline(f["target_span"]["text"])
                        if f["target_span"] else " · " + MD["noTargetSpan"])
+                    + (" · " + _not_evaluated_reason_line(f) if _not_evaluated_reason_line(f) else "")
                     + (" · " + SEMICOLON.join(inline(c["zh"]) + " / " + inline(c["en"]) for c in f["candidates"])
                        if f["candidates"] else "")
                     + (" · " + MD["candidatesTruncatedLine"] if f.get("candidates_truncated") else "")
