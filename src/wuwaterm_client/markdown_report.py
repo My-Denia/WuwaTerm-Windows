@@ -645,10 +645,12 @@ def render(data: Mapping[str, Any]) -> str:
                     + _span_label(f["source_span"])
                     + (" · " + _span_label(f["target_span"], "targetSpanLabel") + COLON + inline(f["target_span"]["text"])
                        if f["target_span"] else " · " + MD["noTargetSpan"])
-                    + (" · " + _not_evaluated_reason_line(f) if _not_evaluated_reason_line(f) else "")
                     + (" · " + SEMICOLON.join(inline(c["zh"]) + " / " + inline(c["en"]) for c in f["candidates"])
                        if f["candidates"] else "")
                     + (" · " + MD["candidatesTruncatedLine"] if f.get("candidates_truncated") else "")
+                    # Same order as the Web report: candidates, then the
+                    # truncation line, then the not-evaluated reason.
+                    + (" · " + _not_evaluated_reason_line(f) if _not_evaluated_reason_line(f) else "")
                     for f in segment["findings"]]), ""])
             if segment.get("choices"):
                 out.extend([*_bullets([

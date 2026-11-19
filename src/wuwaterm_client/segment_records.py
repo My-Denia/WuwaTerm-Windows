@@ -1030,16 +1030,6 @@ def group_matches_filter(group: Mapping[str, Any], key: str) -> bool:
     return True
 
 
-def _rendering_key(actual_translation: str | None, verdict: str) -> tuple:
-    if actual_translation is None:
-        return ("not_evaluated", None) if verdict == "not_evaluated" else ("miss", None)
-    en_tokens = _english_surface_tokens(actual_translation)
-    if en_tokens is not None:
-        prefix, forms = en_tokens
-        return ("en", prefix, min(forms, key=len))
-    return ("raw", actual_translation.strip())
-
-
 def _context_snippet(
     core_text: str,
     hit: tuple[int, int] | None,
@@ -1246,7 +1236,6 @@ def group_term_occurrences(
                 "candidates": candidates,
                 "candidates_truncated": finding["candidates_truncated"],
                 "attention": _attention(choice, freshness, verdict),
-                "_rendering_key": _rendering_key(actual_translation, verdict),
             }
             finding_index += 1
 
@@ -1346,7 +1335,7 @@ def group_term_occurrences(
 
         clean_occurrences = []
         for occ in occurrences:
-            item = {k: v for k, v in occ.items() if k != "_rendering_key"}
+            item = dict(occ)
             item["group_status"] = status
             clean_occurrences.append(item)
 
