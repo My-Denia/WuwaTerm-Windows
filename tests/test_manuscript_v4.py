@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -645,3 +646,211 @@ def test_group_term_occurrences_homographs_plural_merge_and_snippets() -> None:
     assert tuner_grp["count"] == 3
     assert tuner_grp["distribution_text"] == "调谐器 ×2 · 调音师 ×1"
     assert tuner_grp["status"] == "inconsistent"
+
+
+# ---- Web's shared v4 fixture index -----------------------------------------
+# ``contracts/sources.json`` pins a Web revision that predates manuscript-v4, so
+# the fixtures are read from the checkout ``WUWATERM_WEB_ROOT`` names instead of
+# through ``contract_source`` (whose pin check the v4 contract is not part of
+# yet). Without that checkout the case list is empty and the test skips: the
+# standalone tests above still cover the same rules.
+
+def _v4_contract_root() -> Path | None:
+    root = os.environ.get("WUWATERM_WEB_ROOT")
+    if not root:
+        return None
+    candidate = Path(root) / "contracts" / "manuscript-v4"
+    return candidate if (candidate / "cases.json").is_file() else None
+
+
+def _v4_cases() -> list[dict]:
+    root = _v4_contract_root()
+    if root is None:
+        return []
+    data = json.loads((root / "cases.json").read_text(encoding="utf-8"))
+    return ([{**case, "valid": True} for case in data["valid"]]
+            + [{**case, "valid": False} for case in data["invalid"]])
+
+
+def _v4_case_id(case: dict | None) -> str:
+    if case is None:
+        return "<unconfigured>"
+    pad = f"+pad{case['pad_to_bytes']}" if case.get("pad_to_bytes") else ""
+    return f'{case["file"]}{pad}'
+
+
+def pytest_generate_tests(metafunc):
+    # The case names are needed at collection time, so read the index directly.
+    if "v4_case" in metafunc.fixturenames:
+        cases = _v4_cases()
+        metafunc.parametrize("v4_case", cases or [None], ids=[_v4_case_id(c) for c in cases] or ["<unconfigured>"])
+
+
+def _fixture_bytes(root: Path, case: dict) -> str:
+    raw = (root / case["file"]).read_text(encoding="utf-8")
+    pad = case.get("pad_to_bytes")
+    if pad:
+        # Web pads with spaces; the pad only ever pushes a case over a size cap.
+        raw += " " * (pad - len(raw.encode("utf-8")))
+    return raw
+
+
+def test_web_v4_fixture_is_canonical_bytes_or_exact_error_code(v4_case) -> None:
+    root = _v4_contract_root()
+    if root is None:
+        pytest.skip("set WUWATERM_WEB_ROOT to a WuwaTerm-Web checkout that has contracts/manuscript-v4")
+    raw = _fixture_bytes(root, v4_case)
+    if v4_case["valid"]:
+        document = manuscript.parse_workfile(raw)
+        canonical = (root / v4_case["canonical"]).read_text(encoding="utf-8")
+        assert manuscript.serialize_workfile(document) == canonical, v4_case["note"]
+    else:
+        assert _err(raw) == v4_case["error"], v4_case["note"]
+
+
+def test_web_v4_fixture_index_is_complete() -> None:
+    """The index lists every file in the directory, so a new fixture cannot sit
+    unread: 9 valid cases (one padded) and 18 invalid ones today."""
+    root = _v4_contract_root()
+    if root is None:
+        pytest.skip("set WUWATERM_WEB_ROOT to a WuwaTerm-Web checkout that has contracts/manuscript-v4")
+    cases = _v4_cases()
+    listed = {case["file"] for case in cases}
+    on_disk = {path.name for path in root.glob("*.json")} - {"cases.json"}
+    assert on_disk <= listed, sorted(on_disk - listed)
+    assert len([c for c in cases if c["valid"]]) == 9
+    assert len([c for c in cases if not c["valid"]]) == 18
+
+
+def test_writer_counts_only_the_two_written_history_snapshots() -> None:
+    """SPEC "Writing": only the last two document reports are written, so only
+    they count when the writer picks the lowest format. A dense third-from-last
+    snapshot is dropped, never a reason to write v4."""
+    source, target = _dense_source_and_target(41)
+    dense = [*_dense_findings(source, target, 40), _doc_finding(
+        source, target, 200, 201, verdict="not_evaluated", candidates=[], reason="ordinary_word")]
+    assert len(dense) == 41
+
+    def snapshot(findings: list[dict]) -> dict:
+        return {
+            "source": source, "target": target, "direction": "en", "alignments": None,
+            "report": _doc_report(source, target, findings), "resolutions": [],
+        }
+
+    clean = manuscript.empty_workfile()
+    clean.update(source=source, target=target)
+    clean["history"] = [snapshot([_doc_finding(source, target, 0, 1)])]
+
+    # The dropped snapshot is the dense one: v1 is still the lowest format.
+    dropped = copy.deepcopy(clean)
+    dropped["history"] = [snapshot(dense)] + copy.deepcopy(clean["history"]) * 2
+    written = json.loads(manuscript.serialize_workfile(dropped))
+    assert written["format"] == manuscript.WORKFILE_FORMAT
+    assert len(written["history"]) == 2
+    assert '"reason"' not in manuscript.serialize_workfile(dropped)
+
+    # The same snapshot kept (it is one of the last two): v4.
+    kept = copy.deepcopy(clean)
+    kept["history"] = [copy.deepcopy(clean["history"][0]), snapshot(dense)]
+    assert json.loads(manuscript.serialize_workfile(kept))["format"] == manuscript.WORKFILE_FORMAT_V4
+
+    # With segment state the same rule lands on v3 instead of v1.
+    segmented = copy.deepcopy(clean)
+    segmented["segments"] = [_segment_record(
+        0, source, target, (0, len(source)), (0, len(target)),
+        [{"verdict": "needs_review", "source": [0, 1], "target": None,
+          "candidates": [_cand("椿", "Camellya")], "candidates_truncated": False}],
+    )]
+    segmented["history"] = [snapshot(dense)] + copy.deepcopy(clean["history"]) * 2
+    assert json.loads(manuscript.serialize_workfile(segmented))["format"] == manuscript.WORKFILE_FORMAT_V3
+
+
+def _dense_findings(source: str, target: str, count: int) -> list[dict]:
+    return [_doc_finding(source, target, i * 5, i * 5 + 1) for i in range(count)]
+
+
+def test_group_filter_matches_a_place_whatever_the_group_status_is() -> None:
+    """``group_matches_filter`` (Web ``groupMatch``): the 待处理 filter shows a
+    group that holds a pending place, even when the group's own status is the
+    more urgent ``inconsistent``."""
+    source = ("庭院深处，椿静静注视着枝头。" + "今汐在城楼远望。" * 130
+              + "\n\n" + "雨后清晨，椿穿过回廊。" + "声骸在远处低鸣。" * 130)
+    target = ("Deep in the courtyard, Camellya watched the branch. " + "Jinhsi looked afar. " * 130
+              + "\n\n" + "After the rain, Camelia crossed the corridor. " + "Echoes hummed. " * 130)
+    # Only the first two pairs matter; a long paragraph may split further.
+    pairs = pair_segments(source, target)[:2]
+    assert len(pairs) == 2
+
+    def span_in(text: str, sub: str) -> list[int]:
+        at = text.index(sub)
+        return [at, at + len(sub)]
+
+    def rec(index: int, verdict: str, rendering: str) -> dict:
+        pair = pairs[index]
+        s_core = source[pair.source.core_start:pair.source.core_end]
+        t_core = target[pair.target.core_start:pair.target.core_end]
+        return _segment_record(
+            index, source, target,
+            (pair.source.core_start, pair.source.core_end),
+            (pair.target.core_start, pair.target.core_end),
+            [{"verdict": verdict, "source": span_in(s_core, "椿"), "target": span_in(t_core, rendering),
+              "candidates": [_cand("椿", "Camellya")], "candidates_truncated": False}],
+        )
+
+    groups = sr.group_term_occurrences(
+        [rec(0, "verified_constraint", "Camellya"), rec(1, "needs_review", "Camelia")],
+        pairs, source, target, "en", basis=BASIS,
+    )
+    assert len(groups) == 1
+    group = groups[0]
+    assert group["status"] == "inconsistent"
+    assert group["pending_count"] == 1
+    # The invariant: pending work is never hidden behind the group's status word.
+    assert sr.group_matches_filter(group, "pending")
+    assert sr.group_matches_filter(group, "inconsistent")
+    assert not sr.group_matches_filter(group, "confirmed")
+    assert group["unverified_segments"] == []
+
+
+def test_a_group_is_never_confirmed_while_a_ready_segment_owes_a_check() -> None:
+    """Web ``unverifiedSegments``: a ready segment whose record is pending holds
+    one of the group's spellings but no place in it yet, so the group is not
+    settled — the header must not claim 已核 across the manuscript."""
+    source = ("庭院深处，调谐器静静注视着枝头。" + "今汐在城楼远望。" * 130
+              + "\n\n" + "雨后清晨，调谐器穿过回廊。" + "声骸在远处低鸣。" * 130)
+    target = ("Deep in the courtyard, the Tuner watched the branch. " + "Jinhsi looked afar. " * 130
+              + "\n\n" + "After the rain, the Tuner crossed the corridor. " + "Echoes hummed. " * 130)
+    # Only the first two pairs matter; a long paragraph may split further.
+    pairs = pair_segments(source, target)[:2]
+    assert len(pairs) == 2
+    s_core = source[pairs[0].source.core_start:pairs[0].source.core_end]
+    t_core = target[pairs[0].target.core_start:pairs[0].target.core_end]
+    tuner = _cand("调谐器", "Tuner", "item")
+    finding = {"verdict": "verified_constraint", "source": [s_core.index("调谐器"), s_core.index("调谐器") + 3],
+               "target": [t_core.index("Tuner"), t_core.index("Tuner") + 5],
+               "candidates": [tuner], "candidates_truncated": False}
+    done = _segment_record(0, source, target,
+                           (pairs[0].source.core_start, pairs[0].source.core_end),
+                           (pairs[0].target.core_start, pairs[0].target.core_end), [finding])
+
+    # Only segment 1 has a record: segment 2 is ready but unchecked.
+    groups = sr.group_term_occurrences([done], pairs, source, target, "en", basis=BASIS)
+    group = groups[0]
+    assert group["status"] == "pending", group
+    assert group["unverified_segments"] == [2]
+    assert sr.group_matches_filter(group, "pending")
+    assert not sr.group_matches_filter(group, "confirmed")
+
+    # With both records the group is settled, and says so.
+    second = _segment_record(1, source, target,
+                             (pairs[1].source.core_start, pairs[1].source.core_end),
+                             (pairs[1].target.core_start, pairs[1].target.core_end),
+                             [{**finding,
+                               "source": [source[pairs[1].source.core_start:pairs[1].source.core_end].index("调谐器"),
+                                          source[pairs[1].source.core_start:pairs[1].source.core_end].index("调谐器") + 3],
+                               "target": [target[pairs[1].target.core_start:pairs[1].target.core_end].index("Tuner"),
+                                          target[pairs[1].target.core_start:pairs[1].target.core_end].index("Tuner") + 5]}])
+    settled = sr.group_term_occurrences([done, second], pairs, source, target, "en", basis=BASIS)[0]
+    assert settled["status"] == "confirmed", settled
+    assert settled["unverified_segments"] == []
+    assert sr.group_matches_filter(settled, "confirmed")

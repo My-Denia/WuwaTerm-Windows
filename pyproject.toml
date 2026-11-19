@@ -40,7 +40,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# `.` lets tests/test_pyinstaller_version_info.py import `scripts.`, which only
+# resolves when the repository root is on sys.path: `python -m pytest` puts it
+# there itself, a console-script `pytest` does not.
+pythonpath = ["src", "."]
 addopts = "-q --strict-config --strict-markers"
 
 [tool.setuptools.package-data]

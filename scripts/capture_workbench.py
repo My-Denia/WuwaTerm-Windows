@@ -312,6 +312,40 @@ HOMOGRAPH_TARGET = "\n\n".join([
     ),
 ])
 
+# Two settled segments of one term: the group reads 已核 until a single-place
+# replacement invalidates the segment that holds the second place. Each
+# paragraph stays under the 1,800-scalar segment limit while the whole
+# manuscript is over the 2,000-scalar document limit, so this is long mode.
+RESONATOR_SOURCE = "\n\n".join([
+    (
+        "清晨的巡查从北门开始，共鸣者在庭院里核验刚回收的声骸，随后把结果记入当日的值守名册。"
+        + "军需官在木案上摆好干粮与备用罗盘，斥候逐一收紧行囊绑带，确认每一件装备都能随队出发。" * 9
+        + "高处的观测员把昨日的记录与边庭舆图互相核对，好让前锋避开山脊间不稳定的河谷与碎石坡。" * 9
+        + "待城门缓缓升起，队伍排成两列纵队踏上蜿蜒的栈道，晨光正好穿过云层落在石阶上。" * 9
+    ),
+    (
+        "午后工坊里，共鸣者复核新吸收声骸的稳定性，把每一组线圈与镜片的编号逐笔登记在册。"
+        + "匠人们在放大灯下清理铜制接点，学徒抱着装满零件的木箱走上阁楼，小心避开填塞干草的仪表。" * 9
+        + "门外的灯街上，商贩赶在暮色之前清点布匹与药材，把账目抄进随身的薄册里。" * 9
+        + "等到内城吹响傍晚的号角，长台都已清扫干净，工坊的大门也落下了沉重的铁插销。" * 9
+    ),
+])
+
+RESONATOR_TARGET = "\n\n".join([
+    (
+        "The morning patrol starts at the northern gate, where the Resonators verify the newly recovered Echoes in the courtyard and then enter the result in that day's watch roster. "
+        + "Quartermasters lay out rations and spare compasses on the wooden table while scouts tighten the straps on their packs and confirm every piece of kit can march with the column. " * 2
+        + "Observers on the gallery compare yesterday's records against the border charts so the vanguard can avoid the unstable valleys and scree slopes along the ridge. " * 2
+        + "Once the gate slowly lifts, the column sets out in two files along the winding cliff road as the morning light breaks through the clouds onto the stone steps." * 2
+    ),
+    (
+        "In the afternoon workshop the Resonators recheck the stability of the newly absorbed Echoes, entering the serial of every coil and lens in the register. "
+        + "Artisans clean the copper contacts under a magnifying lamp while apprentices carry crates of parts up to the attic, careful not to jar the gauges packed in dry straw. " * 2
+        + "Outside on the lantern street, merchants count cloth and herbs before dusk and copy the tallies into the book they carry. " * 2
+        + "By the time the inner citadel sounds the evening horn, every bench has been swept clean and the heavy iron latch is drawn across the workshop door." * 2
+    ),
+])
+
 TUNER_SOURCE = "\n\n".join([
     (
         "Before the dawn patrol leaves the northern gate, bring one calibrated Tuner to inspect the newly recovered Echo beside Lady Hsin in the courtyard. "
@@ -585,6 +619,44 @@ def _states(semantic: bool):
         view.term_groups.verticalScrollBar().setValue(0)
         return window
 
+    def term_group_pending_filter():
+        window = homograph_groups()
+        view = window.manuscript_view
+        # 椿 is 不一致 (Camellya ×1 · Camelia ×1) and one of its places is a
+        # conflict: the 待处理 filter must still list it.
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("pending"))
+        QApplication.processEvents()
+        view.term_groups.verticalScrollBar().setValue(0)
+        return window
+
+    def term_group_after_replace():
+        window = _window(_Server(semantic))
+        _load(window, RESONATOR_SOURCE, RESONATOR_TARGET, direction="en")
+        _review(window)
+        view = window.manuscript_view
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        # Both segments settled and marked finished: the bar says 已标记完成 2 段.
+        from wuwaterm_client import segment_records as _sr
+        parts = _sr.parts_of(view._payload)
+        for index in (0, 1):
+            parts = _sr.set_finished(parts, index, True)
+        view._put_parts(parts)
+        view._refresh_derived()
+        QApplication.processEvents()
+        # Replace the second place only: that segment goes back to pending, so the
+        # group header may no longer call the term settled.
+        for r in range(view.term_groups.count()):
+            if view.term_groups.item(r).text().startswith("  #2"):
+                view.term_groups.setCurrentRow(r)
+                break
+        view.replacement_edit.setText("attuned Resonators")
+        view._replace_one()
+        QApplication.processEvents()
+        view._refresh_derived()
+        view.term_groups.verticalScrollBar().setValue(0)
+        return window
+
     def translation_mismatch():
         window = _window(_Server(semantic))
         _load(window, MISMATCH_SOURCE, "", direction="en")
@@ -605,6 +677,8 @@ def _states(semantic: bool):
                 ("08-short-unreviewed", short_unreviewed),
                 ("09-term-groups-homographs", homograph_groups),
                 ("09b-term-groups-replace", homograph_replace),
+                ("09c-term-groups-after-replace", term_group_after_replace),
+                ("09d-term-groups-pending-filter", term_group_pending_filter),
                 ("10-term-groups-tuner-reason", tuner_and_reason_groups),
                 ("11-translation-mismatch", translation_mismatch)]
     return [("04-terms", terms), ("05-semantic-issue", semantic_issue),

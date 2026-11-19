@@ -1540,3 +1540,169 @@ def test_long_manuscript_term_groups_filters_reasons_choice_and_single_occurrenc
 
     asyncio.run(scenario())
 
+
+
+def _long_term_workbench(qapp, source: str, target: str, handler):
+    """A reviewed long manuscript on the term track, plus its client for closing."""
+    from wuwaterm_client.ui.manuscript_view import TRACK_TERMS
+
+    async def run():
+        client = client_with(handler)
+        view = ManuscriptView(client)
+        view.resize(1440, 900)
+        view.show()
+        value = empty_workfile()
+        value.update(source=source, target=target, direction="en")
+        view._set_payload(value)
+        view._update_controls()
+        view._start_review()
+        for _ in range(400):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                await asyncio.sleep(0)
+                break
+            await asyncio.wait(tasks)
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        qapp.processEvents()
+        return client, view
+
+    return asyncio.run(run())
+
+
+def _segment_report(s_core: str, t_core: str, findings: list[dict]) -> dict:
+    not_eval = sum(1 for f in findings if f["verdict"] == "not_evaluated")
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()  # noqa: E731
+    return {
+        "request_id": "seg",
+        "source_revision": digest(s_core),
+        "target_revision": digest(t_core),
+        "rule_version": "review-v2",
+        "matcher_revision": "a" * 64,
+        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "c" * 64},
+        "coverage": {"evaluated": len(findings) - not_eval, "not_evaluated": not_eval,
+                     "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "findings": findings,
+        "truncated": False,
+    }
+
+
+def _two_paragraph_term_case(term: str, first: str, second: str, verdicts: tuple[str, str]) -> tuple[str, str]:
+    source = (f"庭院深处，{term}静静注视着枝头。" + "今汐在城楼远望。" * 130
+              + "\n\n" + f"雨后清晨，{term}穿过回廊。" + "声骸在远处低鸣。" * 130)
+    target = (f"Deep in the courtyard, {first} quietly watched the branch. " + "Jinhsi looked afar. " * 130
+              + "\n\n" + f"After the morning rain, {second} crossed the corridor. " + "Echoes hummed. " * 130)
+    return source, target
+
+
+def test_pending_filter_shows_an_inconsistent_group_that_holds_a_place_to_check(qapp) -> None:
+    """Invariant 1 (filter clarity): a group whose status word is 不一致 because two
+    renderings disagree is still unresolved work. Filtering by 待处理 must show it —
+    an actionable 需要核对 place inside it may never disappear behind the status."""
+    from wuwaterm_client import strings
+
+    candidate = {"candidate_id": "1" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}
+    source, target = _two_paragraph_term_case("椿", "Camellya", "Camelia", ("verified_constraint", "needs_review"))
+
+    def handler(request):
+        body = json.loads(request.content)
+        s_core, t_core = body["source"], body["target"]
+        if "椿" not in s_core or ("Camellya" not in t_core and "Camelia" not in t_core):
+            return httpx.Response(200, json=_segment_report(s_core, t_core, []))
+        start = s_core.index("椿")
+        if "Camellya" in t_core:
+            at, verdict = t_core.index("Camellya"), "verified_constraint"
+            end = at + len("Camellya")
+        else:
+            at, verdict = t_core.index("Camelia"), "needs_review"
+            end = at + len("Camelia")
+        findings = [{"id": f"{start}:{start + 1}:椿", "rule_id": "review.term_pair", "verdict": verdict,
+                     "source_span": {"start": start, "end": start + 1, "text": "椿"},
+                     "target_span": {"start": at, "end": end, "text": t_core[at:end]},
+                     "candidates": [candidate], "candidates_truncated": False}]
+        return httpx.Response(200, json=_segment_report(s_core, t_core, findings))
+
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        assert [g["status"] for g in view._term_groups_data] == ["inconsistent"]
+        assert view._term_groups_data[0]["pending_count"] == 1
+
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("pending"))
+        qapp.processEvents()
+        rows = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+        assert rows, "the 待处理 filter must not be empty while a 需要核对 place exists"
+        assert strings.MANUSCRIPT_TERM_FILTER_EMPTY not in view.finding_title.text()
+        assert any("椿（2 处）" in row for row in rows)
+        assert any("需要核对" in row and "#2" in row for row in rows)
+    finally:
+        view.close()
+        asyncio.run(client.aclose())
+
+
+def test_replacing_one_occurrence_never_leaves_a_header_claiming_the_term_is_settled(qapp) -> None:
+    """Invariant 2 (post-edit honesty): a single-occurrence replace invalidates its
+    segment, so the group header and the review bar may not go on saying 已核 /
+    已完成 across a manuscript whose ready segment still owes a check."""
+    from wuwaterm_client import segment_records as sr
+    from wuwaterm_client import strings
+
+    candidate = {"candidate_id": "1" * 64, "zh": "调谐器", "en": "Tuner", "category": "item", "sources": []}
+    source, target = _two_paragraph_term_case("调谐器", "the Tuner", "the Tuner",
+                                              ("verified_constraint", "verified_constraint"))
+
+    def handler(request):
+        body = json.loads(request.content)
+        s_core, t_core = body["source"], body["target"]
+        if "调谐器" not in s_core or "Tuner" not in t_core:
+            return httpx.Response(200, json=_segment_report(s_core, t_core, []))
+        start = s_core.index("调谐器")
+        at = t_core.index("Tuner")
+        findings = [{"id": f"{start}:{start + 3}:调谐器", "rule_id": "review.term_pair",
+                     "verdict": "verified_constraint",
+                     "source_span": {"start": start, "end": start + 3, "text": "调谐器"},
+                     "target_span": {"start": at, "end": at + 5, "text": "Tuner"},
+                     "candidates": [candidate], "candidates_truncated": False}]
+        return httpx.Response(200, json=_segment_report(s_core, t_core, findings))
+
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        assert [g["status"] for g in view._term_groups_data] == ["confirmed"]
+        assert [g["count"] for g in view._term_groups_data] == [2]
+
+        parts = sr.parts_of(view._payload)
+        for index in (0, 1):
+            parts = sr.set_finished(parts, index, True)
+        view._put_parts(parts)
+        view._refresh_derived()
+        qapp.processEvents()
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=2) in view.semantic_progress.text()
+
+        target_row = next(r for r in range(view.term_groups.count())
+                          if "#2" in view.term_groups.item(r).text())
+        view.term_groups.setCurrentRow(target_row)
+        qapp.processEvents()
+        view.replacement_edit.setText("Calibrator")
+        view._replace_one()
+        qapp.processEvents()
+        view._refresh_derived()
+        qapp.processEvents()
+
+        parts = sr.parts_of(view._payload)
+        # The replaced occurrence is in segment #2; that record alone is pending.
+        assert parts.segments[1]["status"] == "pending"
+        assert all(record["status"] == "done" for i, record in enumerate(parts.segments) if i != 1)
+
+        rows = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+        headers = [row for row in rows if row.startswith("▸")]
+        assert len(headers) == 1, rows
+        # The header may not call the term settled while segment #2 owes a check.
+        assert "已核" not in headers[0], headers[0]
+        assert "待处理" in headers[0], headers[0]
+        assert "另有 1 段待复核：#2" in headers[0], headers[0]
+
+        status = view.semantic_progress.text()
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=2) not in status
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=1) in status
+    finally:
+        view.close()
+        asyncio.run(client.aclose())
