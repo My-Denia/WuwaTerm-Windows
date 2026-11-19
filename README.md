@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.5.1**(发布日期与资产见下文「发布」一节的发布记录;下载步骤以它为例)。这次维护版修复中文输入法组合态时空白稿件占位文字与预编辑串重叠,并在稿件级撤销、重做后保存并恢复两侧编辑器的光标、选区、焦点与滚动位置(其余能力与 0.5.0 相同)。它有自己的版本号,与服务端的版本号分开走。
+当前版本 **0.6.0**(待发布,发布日期与资产见下文「发布」一节的发布记录;下载步骤以它为例)。这一版让长稿的逐段审校放得下密集结果:每段的发现与选择、整篇的选择、历史报告里的发现与已提交决定,上限都从 32 条提到 128 条(单条发现附带的候选仍是 8 个),「未评估」的发现可以写明原因,超过上限或有原因时按新的 `wuwaterm-manuscript-v4` 保存;审校面板把同一个词的各次出现按词形与候选归组,给出渲染分布和上下文,并按状态筛选。同一版修掉了编辑器处理回车、CRLF 与裸 CR 的拼接,被拒绝的编辑不再丢光标与滚动位置。它有自己的版本号,与服务端的版本号分开走。
 
 这个客户端说的是 HTTP 接口的 **`v1`** 版本 —— 也就是 `/v1/*` 这组路径,以及
 `GET /v1/meta` 回复里的 `api_version` 字段。稿件审校还需要服务端支持 `review-v2`;语义审校和翻译
@@ -17,6 +17,9 @@
 数据时使用 `wuwaterm-manuscript-v2`;v2 稿件需要包含语义审校的 Web 版本才能打开。长稿件(任一侧
 超过 2,000 字符)带有逐段术语记录、选择或进度时使用 `wuwaterm-manuscript-v3`(格式由公共 Web 的
 `contracts/manuscript-v3/SPEC.md` 定义);旧客户端(Windows 0.4.2、Web 0.2.0 及更早版本)会明确拒绝 v3 文件。
+整篇或某一段的发现、选择或历史报告的已提交决定超过 32 条,或有「未评估」发现带原因时改用
+`wuwaterm-manuscript-v4`(格式同样由公共 Web 的 `contracts/manuscript-v4/SPEC.md` 定义,单文件上限同为
+44 MiB),Windows 0.5.1 及更早版本打不开。
 
 两边对不对得上,由「服务状态」区那一次「刷新」顺带查出来:那次请求本来就要发,客户端
 读回其中的 `api_version`,发现不是自己支持的版本时,就在同一块界面上给出提示,并写明
@@ -32,11 +35,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载 `WuwaTerm-0.5.1-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
+1. 下载 `WuwaTerm-0.6.0-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.5.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.6.0-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
@@ -65,7 +68,7 @@ Get-FileHash .\WuwaTerm-0.5.1-windows-x64.zip -Algorithm SHA256
 
 ## 它能做什么
 
-以下为 0.5.1 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
+以下为 0.6.0 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
 
 - 通过共享的「词典优先」流水线翻译文本(`POST /v1/translations`),方向可自动判定,
   也可强制指定。
@@ -521,6 +524,7 @@ gh release view vX.Y.Z --repo My-Denia/WuwaTerm-Windows --json isDraft,targetCom
 
 ### 发布记录
 
+- v0.6.0（待发布）：长稿逐段审校容纳密集结果——每段的发现与选择、整篇的选择、历史报告里的发现与已提交决定，上限从 32 条提到 128 条（单条发现附带的候选仍为 8 个），「未评估」的发现可带结构化原因，超过上限或有原因时按新的 `wuwaterm-manuscript-v4` 保存（复核请求声明 `X-WuwaTerm-Review-Features: dense-128,reason-v1`，Markdown 报告输出本地化的未评估原因行）；审校面板把同一个词的各次出现按词形与候选归集，给出渲染分布与词边界上下文，并按状态筛选；修复编辑器对回车、CRLF 与裸 CR 的拼接，被拒绝的编辑保留光标与滚动位置；未审校的短稿段落显示为「待审」，翻译后无法可靠分段时给出提示与跳转入口。发布资产与 SHA-256 在发布后补登。
 - v0.5.1（2026-11-17）：修复中文输入法组合态时空白稿件占位文字与预编辑串重叠，并在稿件级撤销、重做后保存并恢复两侧编辑器的光标、选区、焦点与滚动位置（#27）；原生 150% DPI（`AppliedDPI=144`）实时中文 IME 复验已在 owner 设备上完成（候选 ZIP `fecb470e…` / EXE `82dafc61…`：双侧空框预编辑隐藏占位文字无重叠、Escape 恢复；1,911 字长段 `cell16` 处 Undo/Redo 保持视口与光标，重做后紧接物理拼音准确落入下标 694），混合 DPI 多屏拖窗没有验收；[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.5.1)，源码提交 `62a6ae5a3e39ff13d6affad41830f6c17b8527ee`，发布 CI 校验的 main push 运行 44020553485，发布构建运行 44021524321。`WuwaTerm-0.5.1-windows-x64.zip` 的 SHA-256 为 `51b91dd8957535284fe8c60a066a4ff9ca45986a31cba3be73f9e315108788f5`。未做 Windows 代码签名。
 - v0.5.0（2026-11-16）：长稿件逐段术语记录、选择与进度随稿件保存（`wuwaterm-manuscript-v3`，重开后只发一次核对请求即可接着做）；只改译文时保留未确认的选择；导出 Markdown 审校报告，保留截断提示与围栏中的空行，拒绝写入当前稿件文件；审校显示正在处理的段落；跳到某一段后显示它的第一行；尚未核对的段落里的选择在工作台和 Markdown 报告里标为「等待此段核对后生效」，不再显示成待重新确认；打开另一份长稿件后，段落列表只列出它自己的段落；编辑后立刻点击的段落行会成为选中并保存的位置。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.5.0)，源码提交 `277551c8f43f5c95f9183c618779c21445587f09`，发布 CI 校验的 main push 运行 43842606090，发布构建运行 43843812553。`WuwaTerm-0.5.0-windows-x64.zip` 的 SHA-256 为 `9a15d4a6d35b4d0d40b7801ffb227a6961d391d96c279a3c33508dc5f60e22b5`。未做 Windows 代码签名。150% DPI 单屏原生交互验收已在 owner 设备上完成（MY-201），混合 DPI 多屏拖窗没有验收。
 - v0.4.2（2026-11-12）：修复空状态卡片内部行高被拉伸、动作行多出的底色带，并让查词区 Tab 顺序按查询→分类→搜索。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.4.2)，源码提交 `14f0c36ce1767333a8c7bde0085594d61676ca12`，发布 CI 校验的 main push 运行 43224935120。`WuwaTerm-0.4.2-windows-x64.zip` 的 SHA-256 为 `824b694c9b157a121e04ddd4bebb77f8cac2e7eb371fd610e94b39edf05d8d47`。未做 Windows 代码签名；多 DPI、混合 DPI 多屏、输入法和视觉收尾仍待 owner 设备验收。
