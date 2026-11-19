@@ -649,11 +649,11 @@ def test_group_term_occurrences_homographs_plural_merge_and_snippets() -> None:
 
 
 # ---- Web's shared v4 fixture index -----------------------------------------
-# ``contracts/sources.json`` pins a Web revision that predates manuscript-v4, so
-# the fixtures are read from the checkout ``WUWATERM_WEB_ROOT`` names instead of
-# through ``contract_source`` (whose pin check the v4 contract is not part of
-# yet). Without that checkout the case list is empty and the test skips: the
-# standalone tests above still cover the same rules.
+# ``contracts/sources.json`` pins these fixtures, but the case list is needed at
+# collection time and ``contract_source`` is a test fixture, so the index is read
+# straight from the checkout ``WUWATERM_WEB_ROOT`` names. Without that checkout
+# the case list is empty and the test skips: the standalone tests above still
+# cover the same rules.
 
 def _v4_contract_root() -> Path | None:
     root = os.environ.get("WUWATERM_WEB_ROOT")
