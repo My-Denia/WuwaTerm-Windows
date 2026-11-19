@@ -360,3 +360,73 @@ def test_a_two_piece_segment_keeps_its_first_piece_across_a_failed_second_one(qa
         assert f"[{first}]\n\n[{second}]" in view._payload["target"]
         assert view._translate_state == "idle" and len(view._undo_history) == 1, "one write, once complete"
     asyncio.run(scenario())
+
+
+def test_my359_post_translation_mismatch_warns_and_jumps_to_first_needs_manual_split(qapp) -> None:
+    """When translated output produces a paragraph/sentence mismatch over the
+    segment limit, warn explicitly with count and jump to the first mismatch."""
+    p1 = "今汐在今州城主持议事。" * 100
+    # Paragraph 2 has <= 1,800 Chinese scalars (1 piece, 2 sentences), while its
+    # English translation exceeds 1,800 scalars and splits into 3 sentences ->
+    # paragraph 1 stays ready (index 0) and paragraph 2 becomes needs_manual_split (index 1).
+    p2 = ("椿静静站在红椿蕊树下，" * 60) + "等候今州来信。" + ("声骸的频率仍在回响，" * 60) + "夜色渐深。"
+    source = f"{p1}\n\n{p2}"
+
+    class MismatchTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            self.calls += 1
+            body = json.loads(request.content)
+            if "今汐" in body["text"]:
+                text = "Jinhsi presided over the council in Jinzhou. " * 15
+            else:
+                text = (
+                    ("Camellya stood quietly beneath the Red Camellia tree, " * 22) + "waiting for word. "
+                    + "A second sentence was added here by the model. "
+                    + ("The Echoes resonated across the courtyard, " * 22) + "as night deepened."
+                )
+            return httpx.Response(200, json={
+                "kind": "llm", "text": text, "direction": "en",
+                "dictionary_miss": False, "request_id": f"tr-{self.calls}",
+            })
+
+    async def scenario():
+        client = ApiClient("https://example.invalid", token_provider=lambda: "test-token",
+                           _test_transport=httpx.MockTransport(MismatchTransport()))
+        view = ManuscriptView(client)
+        view.resize(1280, 800)
+        view.show()
+        try:
+            value = empty_workfile()
+            value.update(source=source, target="", direction="en")
+            view._set_payload(value)
+            view._update_controls()
+            view._translate()
+            await settle(view)
+            qapp.processEvents()
+
+            pairs = view._current_pairs()
+            mismatch_indices = [p.index for p in pairs if p.status == "needs_manual_split"]
+            assert mismatch_indices == [1]
+            expected_msg = strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=1)
+            assert view.status_label.text() == expected_msg
+            assert view.mismatch_banner.isVisible()
+            assert view.mismatch_label.text() == expected_msg
+            assert view.jump_mismatch_button.isVisible() and view.jump_mismatch_button.isEnabled()
+
+            view.jump_mismatch_button.click()
+            qapp.processEvents()
+            assert view.track_stack.currentIndex() == TRACK_SEGMENTS
+            assert view.segment_list.currentRow() == 1
+            assert view.status_label.text() == strings.MANUSCRIPT_MISMATCH_JUMPED.format(number=2)
+            assert view.source_edit.textCursor().selectionStart() == pairs[1].source.core_start
+        finally:
+            view.close()
+            await client.aclose()
+
+    asyncio.run(scenario())
+

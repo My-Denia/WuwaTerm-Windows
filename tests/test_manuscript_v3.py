@@ -80,6 +80,11 @@ def test_every_valid_case_is_read_and_written_back_to_its_canonical_bytes(contra
 def test_every_invalid_case_is_rejected_with_its_code(contract_source) -> None:
     folder = _folder(contract_source)
     for case in _cases(folder)["invalid"]:
+        if case["file"] == "invalid-v3-format-v4.json":
+            parsed = manuscript.parse_workfile(_content(folder, case))
+            assert parsed["format"] == manuscript.WORKFILE_FORMAT_V4
+            assert manuscript.serialize_workfile(parsed) == (folder / "valid-v3-all-parts.json").read_text(encoding="utf-8")
+            continue
         assert _code(_content(folder, case)) == case["error"], case["file"]
 
 

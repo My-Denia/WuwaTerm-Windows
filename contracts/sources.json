@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "d5c35d299dc8c6d467b8e3a2f8c6b03cf2720a45",
+    "commit": "9a4f680f3ec3909e23afc2394f2c7eccf00af6e3",
     "files": {
       "src/wuwaterm_api/__init__.py": "e0372e6495d03878ee3c76ac87c5e0cb334d31403c776c90bac1e80687222502",
-      "docs/api/openapi.json": "5c66f103693b291dec72778af5a132cea9867ea56afddf317e43d37822a751f5",
+      "docs/api/openapi.json": "85a50ec7a2585c7e2b35267408e8cd1d04e2c1b42cf0a4789a48078e1c310008",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
@@ -30,10 +30,10 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "bcd0b67faf4ed7be4521103f19c4fd041080cb83",
+    "commit": "7837d0f43e096577061d0256533c5e08e4f0bef1",
     "files": {
-      "package.json": "28e114f54b75c4299c72b2c5797aac51a93a07d5915a23a12694c6617e37ded9",
-      "lib/manuscript.js": "ede1fa15b8e1671a144b8ee66ef22989cc06d1e13fb9a251fa9b16d3cb478e5a",
+      "package.json": "92bbca0fa6e49bd261aebe37d51debd5259a7c2108ed3b010750d0483ec81c8f",
+      "lib/manuscript.js": "8ea2a3550a60248076d246b3d9e1c961d5054635efe87ed65f9012594f3ed663",
       "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
       "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
       "docs/manuscript-v2.md": "adc03eaa25a93d6d9398d9c56ee0198e41c38d73ddb49f4bee848a78487354f4",
@@ -105,11 +105,38 @@
       "contracts/manuscript-v3/valid-v3-over-1mib.json": "42cf30cec812388a19504c78502a38f96fefaa3c15aebc8eace98ec37e041cd6",
       "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
       "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
-      "lib/markdown-report.ts": "b404f2046d0f8d96aa1d06ad4adf4e510f711de5d487a2574c665de3c21a22ef",
-      "lib/messages.ts": "0fd88f378cc3f290b2641bfbd44816557ff8c5d55721bdb27645883c4a22c5fa",
+      "lib/markdown-report.ts": "f60628edbe97e89ac39306d842b84b2889cb1c0164321637e7df5c64882e1bbb",
+      "lib/messages.ts": "fd86e1b1865372f192305df6d8f33c8165aeebf5770882d7c4dde0e3c4afced0",
       "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
       "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
-      "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c"
+      "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c",
+      "contracts/manuscript-v4/SPEC.md": "718bc48e3a52ee0bc1280990271b5b338c51e1757979132892a468b9f77b9e10",
+      "contracts/manuscript-v4/cases.json": "3a9f6c5f2e0b93995f2dabaf2b732a7871aee82cf45b40eaf6b3c70f70369455",
+      "contracts/manuscript-v4/invalid-v4-129-choices.json": "4d7c3f24fcdc2b1d09433aaa4e80c9192bba488c171918b4abc74ba0fce863c0",
+      "contracts/manuscript-v4/invalid-v4-129-findings-document.json": "07d8aada74d201033666781bfd241e491f0862c74f99435c26e551d243639fa2",
+      "contracts/manuscript-v4/invalid-v4-129-findings-segment.json": "2d5c322682774f5ba268e21186865fd3a0b4d419ab31f69f06ecd76b6d255ac8",
+      "contracts/manuscript-v4/invalid-v4-129-resolutions.json": "da8699efbe3d66d1e6b3849ca2d018db54a0d596d4b5cd785714942837316a86",
+      "contracts/manuscript-v4/invalid-v4-129-segment-choices.json": "0e19433a0a5b76f0fc3c53d08db8acaf174741f3ee4ba51117b7e30054e62dbc",
+      "contracts/manuscript-v4/invalid-v4-format-v5.json": "2e44b17b77f35d35e480c2f46d819877b77e7a96b40a11a3028b92bfd69ade82",
+      "contracts/manuscript-v4/invalid-v4-reason-null.json": "9b2ee4d30ee8cd6ff1faaa0104b03adaa83332dbc545eae09c0e1142ebf4f14b",
+      "contracts/manuscript-v4/invalid-v4-reason-on-verified.json": "b41583be12e81499b865bfd28a880d065eb55a518ca3986c018253bbdbde7f56",
+      "contracts/manuscript-v4/invalid-v4-reason-unknown.json": "b8d53a30ea0b9952e17efe4db4e40e7debd1d8c2a773956d275454c3b33e09b3",
+      "contracts/manuscript-v4/invalid-v4-segment-reason-null.json": "34f181cd4f04482c00d1d8b80e7fe1ad53eb9178e8d1b265cb1759d9248ca428",
+      "contracts/manuscript-v4/invalid-v4-segment-reason-on-verified.json": "0761f1644b79ea2926785b35e8fb4e86856ce6d33d8f600d2a6f8dda97c95b3a",
+      "contracts/manuscript-v4/invalid-v4-segment-reason-unknown.json": "47d1bbc8da671ab830a87516ebd8c44804d7b156c5ba03b43bdb48f5ac5f4d58",
+      "contracts/manuscript-v4/invalid-v4-v2-format-33-choices.json": "a23c999e2d783d950d8174f3bcb0911f6352a632d3914f5311ef7d7688ab3f11",
+      "contracts/manuscript-v4/invalid-v4-v2-format-reason.json": "6332e74e755c1f8e61c8571a253ee1be2facd531c82f95df3a44c6be5ed78059",
+      "contracts/manuscript-v4/invalid-v4-v3-format-33-choices.json": "f16123133f052a3ab1384de3a476dfe668fd8b61fd0bfd49bd98e3f6cc3f4af6",
+      "contracts/manuscript-v4/invalid-v4-v3-format-33-findings.json": "52f19b6bfc25c0a3777d7eaccd13e653a6e47c60ed2fcb7ae6892c430d0ae57c",
+      "contracts/manuscript-v4/invalid-v4-v3-format-reason.json": "72f870963ddbc83fc684368a07825b7acde3b0f7cf0866234c04530914b6aee9",
+      "contracts/manuscript-v4/valid-v1-from-v4.json": "a19cb38bb745093435243c6c9f63455d52c409f46d39a4c3260e4467f4953fe4",
+      "contracts/manuscript-v4/valid-v3-from-v4.json": "30e9bd6cf2d14e673b228350463ed9d6e1ef5ab054aaaf540853628464ea2bda",
+      "contracts/manuscript-v4/valid-v4-document-dense.json": "8ee9bdca6b56cbc4371ac0c1ef07310cd10382a0336f07f8250b133ace8f3037",
+      "contracts/manuscript-v4/valid-v4-document-reason-only.json": "ee46e0a8b1f0dcf7b740c76e9460f4252c57c00ef0f9fa8f9b2fe2a094cbcf46",
+      "contracts/manuscript-v4/valid-v4-fits-v1.json": "aadcfa950b9333425d42c30b59d1d8e2813cae2e5a4d30bb71affd27287d4990",
+      "contracts/manuscript-v4/valid-v4-fits-v3.json": "797c2e9dbeb048313a1538285969cbf6dd7ef8bebc1466b02ed352720e4f0c52",
+      "contracts/manuscript-v4/valid-v4-segment-reason-only.json": "0fe0bc9269d6419631edaa1f74eb582c8bb242a120eb6d1c617dcb9a842907e6",
+      "contracts/manuscript-v4/valid-v4-segments-dense.json": "8d27a7bc4833c21a313d7108897637dd7404dc16780dc6c5b3b288f020f08b85"
     }
   }
 }

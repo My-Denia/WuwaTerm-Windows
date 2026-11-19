@@ -1209,3 +1209,500 @@ def test_delayed_review_cannot_leave_busy_state_or_overwrite_new_state(qapp, ope
         assert not view.cancel_button.isEnabled()
         await client.aclose()
     asyncio.run(scenario())
+
+
+def test_my377_double_enter_normalises_to_lf_and_creates_segmentation_paragraph_split(qapp) -> None:
+    from wuwaterm_client.segmentation import pair_segments, segment_text
+
+    editor = LosslessEditor()
+    rejected = []
+    editor.editRejected.connect(lambda: rejected.append(True))
+    editor.set_raw_text("今汐在今州。")
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.End)
+    editor.setTextCursor(cursor)
+
+    QTest.keyClicks(editor, "AB")
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+
+    assert rejected == []
+    assert editor.raw_text() == "今汐在今州。AB\n\n"
+    assert editor.textCursor().position() == len("今汐在今州。AB\n\n")
+
+    QTest.keyClicks(editor, "CD")
+    assert rejected == []
+    assert editor.raw_text() == "今汐在今州。AB\n\nCD"
+    segs = segment_text(editor.raw_text(), limit=8)
+    assert len(segs) == 2
+    pairs = pair_segments(editor.raw_text(), "Jinhsi in Jinzhou.\n\nCamellya in courtyard.")
+    assert len(pairs) == 1 and pairs[0].status == "ready"
+
+
+def test_my377_typing_after_imported_crlf_and_bare_cr_and_rejected_edit_preserves_cursor(qapp) -> None:
+    # 1) Imported CRLF text stays lossless on typing and double Enter.
+    editor = LosslessEditor()
+    rejected = []
+    editor.editRejected.connect(lambda: rejected.append(True))
+    editor.set_raw_text("第一行\r\n第二行\r\n")
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.End)
+    editor.setTextCursor(cursor)
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    QTest.keyClicks(editor, "Echo")
+    assert rejected == []
+    assert editor.raw_text() == "第一行\r\n第二行\r\n\nEcho"
+
+    # 2) Imported bare CR text: typing normal text keeps bare CR; pressing Enter
+    #    after bare CR does not collapse CR+LF into one newline or reject.
+    editor.set_raw_text("今汐\r椿\r")
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.End)
+    editor.setTextCursor(cursor)
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    commit = QInputMethodEvent()
+    commit.setCommitString("红椿蕊")
+    QCoreApplication.sendEvent(editor, commit)
+    assert rejected == []
+    assert editor.raw_text().startswith("今汐\r椿\r")
+    assert editor.toPlainText() == "今汐\n椿\n\n红椿蕊"
+
+    # 3) Genuine ambiguous duplicate-char edit (NBSP + ASCII space -> single space
+    #    via QTextCursor) emits editRejected and keeps cursor near the edit, NOT at 0.
+    raw = ("前文段落内容\n" * 40) + "心大人\xa0 调谐器"
+    editor.resize(420, 180)
+    editor.show()
+    editor.set_raw_text(raw)
+    qapp.processEvents()
+    shown = editor.toPlainText()
+    nbsp_pos = shown.rindex("心大人") + len("心大人")
+    cursor = editor.textCursor()
+    cursor.setPosition(nbsp_pos)
+    cursor.setPosition(nbsp_pos + 2, QTextCursor.MoveMode.KeepAnchor)
+    editor.setTextCursor(cursor)
+    editor.verticalScrollBar().setValue(editor.verticalScrollBar().maximum())
+    scroll_before = editor.verticalScrollBar().value()
+    assert scroll_before > 0
+
+    cursor.insertText(" ")
+    assert len(rejected) == 1
+    assert editor.raw_text() == raw
+    assert editor.textCursor().position() >= nbsp_pos
+    assert editor.textCursor().position() != 0
+    assert editor.verticalScrollBar().value() == scroll_before
+    editor.close()
+
+
+def test_my365_short_manuscript_segment_status_and_progress_across_review_states(qapp, tmp_path: Path) -> None:
+    from wuwaterm_client import strings
+    from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS
+
+    async def scenario():
+        source, target = "椿站在今州城外。", "Camellya stood outside Jinzhou."
+        fail_next = False
+
+        async def handler(_request):
+            if fail_next:
+                return httpx.Response(500, json={"error": {"code": "internal", "message": "err"}, "request_id": "r-err"})
+            term_start = source.index("椿")
+            t_start = target.index("Camellya")
+            return httpx.Response(200, json={
+                "request_id": "r-ok",
+                "source_revision": hashlib.sha256(source.encode()).hexdigest(),
+                "target_revision": hashlib.sha256(target.encode()).hexdigest(),
+                "rule_version": "review-v2",
+                "matcher_revision": "a" * 64,
+                "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "c" * 64},
+                "coverage": {"evaluated": 1, "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
+                "findings": [{
+                    "id": f"{term_start}:{term_start + 1}:椿",
+                    "rule_id": "review.term_pair",
+                    "verdict": "verified_constraint",
+                    "source_span": {"start": term_start, "end": term_start + 1, "text": "椿"},
+                    "target_span": {"start": t_start, "end": t_start + 8, "text": "Camellya"},
+                    "candidates": [{"candidate_id": "d" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}],
+                    "candidates_truncated": False,
+                }],
+                "truncated": False,
+            })
+
+        client = client_with(handler)
+        view = ManuscriptView(client)
+        try:
+            # 1) "none" (unreviewed draft): pending ("待审"), progress 0/1
+            value = empty_workfile()
+            value.update(source=source, target=target, direction="en")
+            view._set_payload(value)
+            view._update_controls()
+            view._show_track(TRACK_SEGMENTS)
+            assert view._review_state == "none"
+            assert view._progress() == (0, 1)
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["pending"] in view.segment_list.item(0).text()
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["reviewed"] not in view.segment_list.item(0).text()
+
+            # 2) "current": reviewed ("已审"), progress 1/1
+            view._start_review()
+            await view._task
+            await asyncio.sleep(0)
+            view._refresh_segments()
+            assert view._review_state == "current"
+            assert view._progress() == (1, 1)
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["reviewed"] in view.segment_list.item(0).text()
+
+            # Save with history so we can test "history" state on reopen
+            saved_file = tmp_path / "short_history.json"
+            view._path = saved_file
+            assert view.save_document()
+
+            # 3) "stale" (after editing target): stale ("待复核"), progress 0/1
+            cursor = view.target_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(" ")
+            view._refresh_derived()
+            view._refresh_segments()
+            assert view._review_state == "stale"
+            assert view._progress() == (0, 1)
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["stale"] in view.segment_list.item(0).text()
+
+            # 4) "history" (reopened file with saved history report, unverified in session): pending ("待审"), 0/1
+            view._saved_payload = copy.deepcopy(view._payload)
+            assert view.open_path(saved_file)
+            view._show_track(TRACK_SEGMENTS)
+            view._refresh_segments()
+            assert view._review_state == "history"
+            assert view._progress() == (0, 1)
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["pending"] in view.segment_list.item(0).text()
+
+            # 5) "error" (failed review request): failed ("未完成"), progress 0/1
+            fail_next = True
+            view._start_review()
+            await view._task
+            await asyncio.sleep(0)
+            view._refresh_segments()
+            assert view._review_state == "error"
+            assert view._progress() == (0, 1)
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["failed"] in view.segment_list.item(0).text()
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_long_manuscript_term_groups_filters_reasons_choice_and_single_occurrence_replace(qapp) -> None:
+    from wuwaterm_client import strings
+    from wuwaterm_client.ui.manuscript_view import TRACK_TERMS
+
+    p1_s = "庭院深处，椿静静注视着枝头的红椿蕊。" + "今汐在城楼远望。" * 130
+    p1_t = ("Deep in the courtyard, Camellya quietly watched the Red Petal on the branch. "
+            + "Jinhsi looked afar from the tower. " * 38)
+    p2_s = "雨后清晨，椿穿过回廊，厨下备着一碟香椿。" + "声骸在远处低鸣。" * 130
+    p2_t = ("After the morning rain, Camelia crossed the corridor while Chinese toon was prepared. "
+            + "Echoes hummed in the distance. " * 36)
+    source = f"{p1_s}\n\n{p2_s}"
+    target = f"{p1_t}\n\n{p2_t}"
+
+    c_cam = {
+        "candidate_id": "1" * 64, "zh": "椿", "en": "Camellya",
+        "category": "resonator", "sources": [],
+    }
+    c_red = {
+        "candidate_id": "2" * 64, "zh": "红椿蕊", "en": "Red Camellia",
+        "category": "item", "sources": [],
+    }
+
+    def seg_report(s_core: str, t_core: str) -> dict:
+        findings = []
+        if "红椿蕊" in s_core:
+            cs, ts = s_core.index("椿"), t_core.index("Camellya")
+            rs, rts = s_core.index("红椿蕊"), t_core.index("Red Petal")
+            findings.extend([
+                {
+                    "id": f"{cs}:{cs + 1}:椿", "rule_id": "review.term_pair",
+                    "verdict": "verified_constraint",
+                    "source_span": {"start": cs, "end": cs + 1, "text": "椿"},
+                    "target_span": {"start": ts, "end": ts + 8, "text": "Camellya"},
+                    "candidates": [c_cam], "candidates_truncated": False,
+                },
+                {
+                    "id": f"{rs}:{rs + 3}:红椿蕊", "rule_id": "review.term_pair",
+                    "verdict": "confirmed_conflict",
+                    "source_span": {"start": rs, "end": rs + 3, "text": "红椿蕊"},
+                    "target_span": {"start": rts, "end": rts + 9, "text": "Red Petal"},
+                    "candidates": [c_red], "candidates_truncated": False,
+                },
+            ])
+        else:
+            cs, cts = s_core.index("椿"), t_core.index("Camelia")
+            xs = s_core.index("香椿")
+            findings.extend([
+                {
+                    "id": f"{cs}:{cs + 1}:椿", "rule_id": "review.term_pair",
+                    "verdict": "confirmed_conflict",
+                    "source_span": {"start": cs, "end": cs + 1, "text": "椿"},
+                    "target_span": {"start": cts, "end": cts + 7, "text": "Camelia"},
+                    "candidates": [c_cam], "candidates_truncated": False,
+                },
+                {
+                    "id": f"{xs}:{xs + 2}:香椿", "rule_id": "review.term_pair",
+                    "verdict": "not_evaluated",
+                    "reason": "ordinary_word",
+                    "source_span": {"start": xs, "end": xs + 2, "text": "香椿"},
+                    "target_span": None,
+                    "candidates": [], "candidates_truncated": False,
+                },
+            ])
+        not_eval = sum(1 for f in findings if f["verdict"] == "not_evaluated")
+        return {
+            "request_id": "seg",
+            "source_revision": hashlib.sha256(s_core.encode()).hexdigest(),
+            "target_revision": hashlib.sha256(t_core.encode()).hexdigest(),
+            "rule_version": "review-v2",
+            "matcher_revision": "a" * 64,
+            "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 2, "revision": "c" * 64},
+            "coverage": {"evaluated": len(findings) - not_eval, "not_evaluated": not_eval,
+                         "rules": ["review.term_pair", "review.sentence_meaning"]},
+            "findings": findings,
+            "truncated": False,
+        }
+
+    async def scenario():
+        async def handler(request):
+            body = json.loads(request.content)
+            return httpx.Response(200, json=seg_report(body["source"], body["target"]))
+
+        client = client_with(handler)
+        view = ManuscriptView(client)
+        view.resize(1440, 900)
+        view.show()
+        try:
+            value = empty_workfile()
+            value.update(source=source, target=target, direction="en")
+            view._set_payload(value)
+            view._update_controls()
+            view._start_review()
+            for _ in range(200):
+                tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+                if not tasks:
+                    await asyncio.sleep(0)
+                    break
+                await asyncio.wait(tasks)
+            view._refresh_derived()
+            view._show_track(TRACK_TERMS)
+            qapp.processEvents()
+
+            # Grouped view is default in long mode!
+            assert view.term_view_combo.currentData() == "grouped"
+            assert view.term_groups.isVisible() and not view.findings.isVisible()
+            rows_text = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+            assert any("椿（2 处）" in t and "Camellya ×1 · Camelia ×1" in t for t in rows_text)
+            assert any("红椿蕊（1 处）" in t for t in rows_text)
+            assert any("香椿（1 处）" in t and "未评估" in t for t in rows_text)
+
+            # Filter by not_evaluated -> selects 香椿 and displays localized ordinary_word explanation
+            view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("not_evaluated"))
+            qapp.processEvents()
+            assert view.finding_title.text() == "香椿"
+            assert "普通词义" in view.finding_verdict.text()
+            assert view.finding_reason.isVisible()
+            assert strings.MANUSCRIPT_NOT_EVALUATED_DETAIL["ordinary_word"] == view.finding_reason.text()
+
+            # Reset filter to "all", select segment #2's "椿 -> Camelia" occurrence in term_groups
+            view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
+            qapp.processEvents()
+            camelia_row = next(
+                r for r in range(view.term_groups.count())
+                if "#2" in view.term_groups.item(r).text() and "Camelia" in view.term_groups.item(r).text()
+            )
+            view.term_groups.setCurrentRow(camelia_row)
+            qapp.processEvents()
+
+            # Highlights exact segment #2 source/target spans and binds choice + single-occurrence replace
+            assert view.source_edit.textCursor().selectedText() == "椿"
+            assert view.source_edit.raw_cursor_offset() == source.rindex("椿", 0, source.index("香椿"))
+            assert view.target_edit.textCursor().selectedText() == "Camelia"
+
+            # Record per-occurrence choice on segment #2's 椿 ONLY
+            assert view.choice_button.isEnabled()
+            view.choice_combo.setCurrentIndex(0)
+            view.choice_button.click()
+            assert len(view._payload["segments"][0]["choices"]) == 0
+            assert len(view._payload["segments"][1]["choices"]) == 1
+
+            # Replace single occurrence ("Camelia" -> "Camellya") in segment #2 ONLY
+            assert view.replacement_edit.text() == "Camellya"
+            view._replace_one()
+            assert "Camelia" not in view.target_edit.raw_text()
+            assert view.target_edit.raw_text().count("Camellya") == 2
+            assert "Red Petal" in view.target_edit.raw_text()
+        finally:
+            view.close()
+            await client.aclose()
+
+    asyncio.run(scenario())
+
+
+
+def _long_term_workbench(qapp, source: str, target: str, handler):
+    """A reviewed long manuscript on the term track, plus its client for closing."""
+    from wuwaterm_client.ui.manuscript_view import TRACK_TERMS
+
+    async def run():
+        client = client_with(handler)
+        view = ManuscriptView(client)
+        view.resize(1440, 900)
+        view.show()
+        value = empty_workfile()
+        value.update(source=source, target=target, direction="en")
+        view._set_payload(value)
+        view._update_controls()
+        view._start_review()
+        for _ in range(400):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                await asyncio.sleep(0)
+                break
+            await asyncio.wait(tasks)
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        qapp.processEvents()
+        return client, view
+
+    return asyncio.run(run())
+
+
+def _segment_report(s_core: str, t_core: str, findings: list[dict]) -> dict:
+    not_eval = sum(1 for f in findings if f["verdict"] == "not_evaluated")
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()  # noqa: E731
+    return {
+        "request_id": "seg",
+        "source_revision": digest(s_core),
+        "target_revision": digest(t_core),
+        "rule_version": "review-v2",
+        "matcher_revision": "a" * 64,
+        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "c" * 64},
+        "coverage": {"evaluated": len(findings) - not_eval, "not_evaluated": not_eval,
+                     "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "findings": findings,
+        "truncated": False,
+    }
+
+
+def _two_paragraph_term_case(term: str, first: str, second: str, verdicts: tuple[str, str]) -> tuple[str, str]:
+    source = (f"庭院深处，{term}静静注视着枝头。" + "今汐在城楼远望。" * 130
+              + "\n\n" + f"雨后清晨，{term}穿过回廊。" + "声骸在远处低鸣。" * 130)
+    target = (f"Deep in the courtyard, {first} quietly watched the branch. " + "Jinhsi looked afar. " * 130
+              + "\n\n" + f"After the morning rain, {second} crossed the corridor. " + "Echoes hummed. " * 130)
+    return source, target
+
+
+def test_pending_filter_shows_an_inconsistent_group_that_holds_a_place_to_check(qapp) -> None:
+    """Invariant 1 (filter clarity): a group whose status word is 不一致 because two
+    renderings disagree is still unresolved work. Filtering by 待处理 must show it —
+    an actionable 需要核对 place inside it may never disappear behind the status."""
+    from wuwaterm_client import strings
+
+    candidate = {"candidate_id": "1" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}
+    source, target = _two_paragraph_term_case("椿", "Camellya", "Camelia", ("verified_constraint", "needs_review"))
+
+    def handler(request):
+        body = json.loads(request.content)
+        s_core, t_core = body["source"], body["target"]
+        if "椿" not in s_core or ("Camellya" not in t_core and "Camelia" not in t_core):
+            return httpx.Response(200, json=_segment_report(s_core, t_core, []))
+        start = s_core.index("椿")
+        if "Camellya" in t_core:
+            at, verdict = t_core.index("Camellya"), "verified_constraint"
+            end = at + len("Camellya")
+        else:
+            at, verdict = t_core.index("Camelia"), "needs_review"
+            end = at + len("Camelia")
+        findings = [{"id": f"{start}:{start + 1}:椿", "rule_id": "review.term_pair", "verdict": verdict,
+                     "source_span": {"start": start, "end": start + 1, "text": "椿"},
+                     "target_span": {"start": at, "end": end, "text": t_core[at:end]},
+                     "candidates": [candidate], "candidates_truncated": False}]
+        return httpx.Response(200, json=_segment_report(s_core, t_core, findings))
+
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        assert [g["status"] for g in view._term_groups_data] == ["inconsistent"]
+        assert view._term_groups_data[0]["pending_count"] == 1
+
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("pending"))
+        qapp.processEvents()
+        rows = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+        assert rows, "the 待处理 filter must not be empty while a 需要核对 place exists"
+        assert strings.MANUSCRIPT_TERM_FILTER_EMPTY not in view.finding_title.text()
+        assert any("椿（2 处）" in row for row in rows)
+        assert any("需要核对" in row and "#2" in row for row in rows)
+    finally:
+        view.close()
+        asyncio.run(client.aclose())
+
+
+def test_replacing_one_occurrence_never_leaves_a_header_claiming_the_term_is_settled(qapp) -> None:
+    """Invariant 2 (post-edit honesty): a single-occurrence replace invalidates its
+    segment, so the group header and the review bar may not go on saying 已核 /
+    已完成 across a manuscript whose ready segment still owes a check."""
+    from wuwaterm_client import segment_records as sr
+    from wuwaterm_client import strings
+
+    candidate = {"candidate_id": "1" * 64, "zh": "调谐器", "en": "Tuner", "category": "item", "sources": []}
+    source, target = _two_paragraph_term_case("调谐器", "the Tuner", "the Tuner",
+                                              ("verified_constraint", "verified_constraint"))
+
+    def handler(request):
+        body = json.loads(request.content)
+        s_core, t_core = body["source"], body["target"]
+        if "调谐器" not in s_core or "Tuner" not in t_core:
+            return httpx.Response(200, json=_segment_report(s_core, t_core, []))
+        start = s_core.index("调谐器")
+        at = t_core.index("Tuner")
+        findings = [{"id": f"{start}:{start + 3}:调谐器", "rule_id": "review.term_pair",
+                     "verdict": "verified_constraint",
+                     "source_span": {"start": start, "end": start + 3, "text": "调谐器"},
+                     "target_span": {"start": at, "end": at + 5, "text": "Tuner"},
+                     "candidates": [candidate], "candidates_truncated": False}]
+        return httpx.Response(200, json=_segment_report(s_core, t_core, findings))
+
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        assert [g["status"] for g in view._term_groups_data] == ["confirmed"]
+        assert [g["count"] for g in view._term_groups_data] == [2]
+
+        parts = sr.parts_of(view._payload)
+        for index in (0, 1):
+            parts = sr.set_finished(parts, index, True)
+        view._put_parts(parts)
+        view._refresh_derived()
+        qapp.processEvents()
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=2) in view.semantic_progress.text()
+
+        target_row = next(r for r in range(view.term_groups.count())
+                          if "#2" in view.term_groups.item(r).text())
+        view.term_groups.setCurrentRow(target_row)
+        qapp.processEvents()
+        view.replacement_edit.setText("Calibrator")
+        view._replace_one()
+        qapp.processEvents()
+        view._refresh_derived()
+        qapp.processEvents()
+
+        parts = sr.parts_of(view._payload)
+        # The replaced occurrence is in segment #2; that record alone is pending.
+        assert parts.segments[1]["status"] == "pending"
+        assert all(record["status"] == "done" for i, record in enumerate(parts.segments) if i != 1)
+
+        rows = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+        headers = [row for row in rows if row.startswith("▸")]
+        assert len(headers) == 1, rows
+        # The header may not call the term settled while segment #2 owes a check.
+        assert "已核" not in headers[0], headers[0]
+        assert "待处理" in headers[0], headers[0]
+        assert "另有 1 段待复核：#2" in headers[0], headers[0]
+
+        status = view.semantic_progress.text()
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=2) not in status
+        assert strings.MANUSCRIPT_SEGMENTS_FINISHED.format(count=1) in status
+    finally:
+        view.close()
+        asyncio.run(client.aclose())

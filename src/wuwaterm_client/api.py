@@ -53,6 +53,7 @@ _BEARER_PREFIX = "Bearer "
 # A mismatch is a WARNING, never a refusal: see
 # StatusView._apply_api_version, reached from _show_meta.
 SUPPORTED_API_VERSIONS: tuple[str, ...] = ("v1",)
+REVIEW_FEATURES_V2 = "dense-128,reason-v1"
 
 
 def default_token_provider() -> str | None:
@@ -194,23 +195,26 @@ class MetaResult:
         )
 
 
-def _review_report(data: Any, source: str, target: str) -> dict[str, Any]:
+def _review_report(
+    data: Any, source: str, target: str, *, review_version: str = "review-v2"
+) -> dict[str, Any]:
     """Accept a report only for the exact text and locations submitted.
 
     A successful HTTP response alone does not prove that a report belongs to
     the current draft. Offsets are Unicode scalar indices, not Qt positions.
     """
-    if not valid_report(data, source, target):
+    v2 = review_version == "review-v2"
+    if not valid_report(data, source, target, v4=v2):
         raise ValueError("review is not a supported report")
     for side, text in (("source", source), ("target", target)):
         revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if data[f"{side}_revision"] != revision:
             raise ValueError(f"{side} revision does not match")
-    if data["rule_version"] != "review-v2":
+    if data["rule_version"] != review_version:
         raise ValueError("unexpected review version")
     # The v2 matcher basis is essential to bind a report to the algorithm
     # that produced it, and the requested capability guarantees this field.
-    if "matcher_revision" not in data:
+    if v2 and "matcher_revision" not in data:
         raise ValueError("missing matcher revision")
     return data
 
@@ -567,26 +571,30 @@ class ApiClient:
         alignments: list[dict[str, Any]] | None = None,
         resolutions: list[dict[str, Any]] | None = None,
         resolution_context: dict[str, str] | None = None,
+        review_version: str = "review-v2",
     ) -> dict[str, Any]:
-        """One review-v2 term check. ``resolutions`` and ``resolution_context``
-        go out only when there are resolutions: review-v2 rejects a null
-        field, and non-empty resolutions need their context."""
+        """One term check. ``resolutions`` and ``resolution_context`` go out
+        only when there are resolutions: review-v2 rejects a null field, and
+        non-empty resolutions need their context."""
         if resolutions and resolution_context is None:
             raise ValueError("resolutions need a resolution_context")
         body: dict[str, Any] = {
             "source": source, "target": target, "direction": direction,
-            "review_version": "review-v2",
+            "review_version": review_version,
         }
         if alignments is not None:
             body["alignments"] = alignments
         if resolutions:
             body["resolutions"] = list(resolutions)
             body["resolution_context"] = resolution_context
+        v2 = review_version == "review-v2"
+        extra_headers = {"X-WuwaTerm-Review-Features": REVIEW_FEATURES_V2} if v2 else None
         response = await self._request(
-            "POST", "/v1/reviews", json=body, matcher_basis=True,
+            "POST", "/v1/reviews", json=body, matcher_basis=v2, headers=extra_headers,
         )
         return self._parsed(
-            lambda data: _review_report(data, source, target), self._json(response)
+            lambda data: _review_report(data, source, target, review_version=review_version),
+            self._json(response),
         )
 
     async def get_meta(self) -> MetaResult:

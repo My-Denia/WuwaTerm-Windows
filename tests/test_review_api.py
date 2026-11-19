@@ -69,10 +69,81 @@ def test_review_sends_v2_basis_and_accepts_current_spans() -> None:
     assert str(seen[0].url) == "https://test/v1/reviews"
     assert seen[0].headers["authorization"] == "Bearer example-token"
     assert seen[0].headers["x-wuwaterm-matcher-basis"] == "1"
+    assert seen[0].headers["x-wuwaterm-review-features"] == "dense-128,reason-v1"
     assert json.loads(seen[0].content) == {
         "source": SOURCE, "target": TARGET, "direction": "en",
         "review_version": "review-v2", "alignments": [],
     }
+
+
+def test_review_v1_omits_v2_feature_and_matcher_headers() -> None:
+    seen = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        v1 = copy.deepcopy(report())
+        v1["rule_version"] = "review-v1"
+        del v1["matcher_revision"]
+        del v1["dictionary"]["revision"]
+        del v1["findings"][0]["candidates"][0]["candidate_id"]
+        return httpx.Response(200, json=v1)
+
+    async def scenario() -> None:
+        client = make_client(handler)
+        try:
+            await client.review_pair(SOURCE, TARGET, "en", review_version="review-v1")
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
+    assert "x-wuwaterm-matcher-basis" not in seen[0].headers
+    assert "x-wuwaterm-review-features" not in seen[0].headers
+
+
+def test_review_accepts_dense_128_findings_and_not_evaluated_reasons() -> None:
+    dense_source = " ".join(f"椿{i:03d}" for i in range(128))
+    dense_target = " ".join(f"Camellya{i:03d}" for i in range(128))
+    reasons = ("not_a_term", "ordinary_word", "no_target_region", "found_outside_region", "ambiguous_repeat")
+    findings = []
+    for i in range(128):
+        s_start = i * 5
+        item = {
+            "id": f"{s_start}:{s_start + 1}:椿",
+            "rule_id": "review.term_pair",
+            "verdict": "not_evaluated" if i < 5 else "verified_constraint",
+            "source_span": {"start": s_start, "end": s_start + 1, "text": "椿"},
+            "target_span": None,
+            "candidates": [],
+            "candidates_truncated": False,
+        }
+        if i < 5:
+            item["reason"] = reasons[i]
+        findings.append(item)
+    payload = {
+        "request_id": "dense",
+        "source_revision": hashlib.sha256(dense_source.encode()).hexdigest(),
+        "target_revision": hashlib.sha256(dense_target.encode()).hexdigest(),
+        "rule_version": "review-v2",
+        "matcher_revision": "a" * 64,
+        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "c" * 64},
+        "coverage": {"evaluated": 123, "not_evaluated": 5, "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "findings": findings,
+        "truncated": True,
+    }
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async def scenario() -> None:
+        client = make_client(handler)
+        try:
+            actual = await client.review_pair(dense_source, dense_target, "en")
+            assert len(actual["findings"]) == 128
+            assert [actual["findings"][i]["reason"] for i in range(5)] == list(reasons)
+        finally:
+            await client.aclose()
+
+    asyncio.run(scenario())
 
 
 CONTEXT = {"source_revision": hashlib.sha256(SOURCE.encode()).hexdigest(), "rule_version": "review-v2",

@@ -18,8 +18,8 @@ from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, 
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QStackedWidget, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import markdown_report as mdr
@@ -37,7 +37,7 @@ from ..manuscript import (
     empty_workfile, load_workfile, parse_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
 )
 from ..segmentation import (
-    SEGMENT_LIMIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
+    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
     pair_segments, segment_text,
 )
 from .components import ChevronComboBox
@@ -65,6 +65,8 @@ MAX_IMPORT_BYTES = 1_048_576
 _TEXT_SUFFIXES = (".txt", ".md")
 _DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 _REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
+# The term-view status filters, in the order the combo lists them.
+_TERM_FILTER_KEYS = ("all", "inconsistent", "pending", "not_evaluated", "confirmed")
 # The v3 long-mode parts (segment_records). Their values are never changed in
 # place, so copies of the payload share them instead of copying hundreds of
 # records on every keystroke.
@@ -168,6 +170,19 @@ def _scalar_boundary(text: str, position: int) -> int | None:
     return len(text) if units == position else None
 
 
+def _splice_raw(prefix: str, inserted: str, suffix: str) -> str:
+    """Join ``prefix + inserted + suffix`` without letting an adjacent bare CR
+    and LF collapse into a single CRLF display line break."""
+    if inserted:
+        if prefix.endswith("\r") and inserted.startswith("\n"):
+            inserted = "\n" + inserted
+        if inserted.endswith("\r") and suffix.startswith("\n"):
+            inserted = inserted + "\n"
+    elif prefix.endswith("\r") and suffix.startswith("\n"):
+        inserted = "\n"
+    return prefix + inserted + suffix
+
+
 class LosslessEditor(QPlainTextEdit):
     """Use document edits to preserve characters Qt cannot display distinctly."""
 
@@ -197,6 +212,7 @@ class LosslessEditor(QPlainTextEdit):
         self._placeholder_text = self.placeholderText()
         self._pending_view: dict | None = None
         self._ime_view: dict | None = None
+        self._rejected_view: dict | None = None
         self.last_edit_view: dict | None = None
         # The raw range the last accepted edit replaced: (start, old_end,
         # new_length) in scalar offsets. It comes from the edit itself, never
@@ -297,6 +313,17 @@ class LosslessEditor(QPlainTextEdit):
         cursor.setPosition(_utf16_position(self._shown, index))
         self.setTextCursor(cursor)
 
+    def _finalize_pending(self) -> None:
+        rejected = self._rejected_view
+        self._pending = None
+        self._pending_range = None
+        self._pending_view = None
+        self._rejected_view = None
+        if rejected is not None:
+            if self.toPlainText() != self._shown:
+                self.set_raw_text(self._raw)
+            self.restore_view_state(rejected)
+
     def insertFromMimeData(self, source) -> None:  # noqa: N802
         files = self.local_files(source)
         if files:
@@ -307,9 +334,7 @@ class LosslessEditor(QPlainTextEdit):
         try:
             super().insertFromMimeData(source)
         finally:
-            self._pending = None
-            self._pending_range = None
-            self._pending_view = None
+            self._finalize_pending()
 
     def createMimeDataFromSelection(self) -> QMimeData:  # noqa: N802
         cursor = self.textCursor()
@@ -335,14 +360,26 @@ class LosslessEditor(QPlainTextEdit):
         if event.matches(QKeySequence.StandardKey.Redo):
             self.redoRequested.emit()
             return
-        self._pending = event.text() or None
+        text = event.text()
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            no_cmd_mods = not (
+                event.modifiers()
+                & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier
+                )
+            )
+            if no_cmd_mods or text == "\r":
+                text = "\n"
+        elif text == "\r":
+            text = "\n"
+        self._pending = text or None
         self._remember_cursor()
         try:
             super().keyPressEvent(event)
         finally:
-            self._pending = None
-            self._pending_range = None
-            self._pending_view = None
+            self._finalize_pending()
 
     def inputMethodQuery(self, query):
         """Report caret rectangles in this widget's coordinates.
@@ -413,9 +450,7 @@ class LosslessEditor(QPlainTextEdit):
         try:
             super().inputMethodEvent(event)
         finally:
-            self._pending = None
-            self._pending_range = None
-            self._pending_view = None
+            self._finalize_pending()
         if preedit:
             self._remember_cursor()
             self._ime_origin = self._pending_range
@@ -432,23 +467,30 @@ class LosslessEditor(QPlainTextEdit):
         if self._setting or self._ignore_ime_changes:
             return
         old, new = self._shown, self.toPlainText()
-        # Qt reports IME preedit as a whole-document contents change even
-        # though committed text is unchanged. Resetting the document here
-        # destroys the active composition and moves its caret.
-        if old == new and self._pending is None:
-            return
         if self._pending is not None and self._pending_range is not None:
             left = _scalar_boundary(old, self._pending_range[0])
             right = _scalar_boundary(old, self._pending_range[1])
             inserted_shown, _ = _display_map(self._pending)
-            if left is not None and right is not None and old[:left] + inserted_shown + old[right:] == new:
-                raw = self._raw[:self._bounds[left]] + self._pending + self._raw[self._bounds[right]:]
+            preliminary = old == new and (
+                position > self._pending_range[1] or position + removed < self._pending_range[0]
+            )
+            if (not preliminary and left is not None and right is not None
+                    and old[:left] + inserted_shown + old[right:] == new):
+                raw_left, raw_right = self._bounds[left], self._bounds[right]
+                raw = _splice_raw(self._raw[:raw_left], self._pending, self._raw[raw_right:])
                 shown, bounds = _display_map(raw)
-                self.last_edit = (self._bounds[left], self._bounds[right], len(self._pending))
-                self.last_edit_view = self._pending_view
-                self._raw, self._shown, self._bounds = raw, shown, bounds
-                self.rawChanged.emit()
-                return
+                if shown == new:
+                    self.last_edit = (raw_left, raw_right, len(raw) - len(self._raw) + raw_right - raw_left)
+                    self.last_edit_view = self._pending_view
+                    self._raw, self._shown, self._bounds = raw, shown, bounds
+                    self._pending = None
+                    self._pending_range = None
+                    self.rawChanged.emit()
+                    return
+        # Qt reports IME preedit or block-property updates as a contentsChange
+        # before committed text changes; never roll back when shown text is unchanged.
+        if old == new:
+            return
         start = _scalar_boundary(old, position)
         end = _scalar_boundary(old, position + removed)
         new_start = _scalar_boundary(new, position)
@@ -468,10 +510,22 @@ class LosslessEditor(QPlainTextEdit):
                    and removed_part[-1 - suffix] == inserted[-1 - suffix]):
                 suffix += 1
             left, right = start + prefix, end - suffix
-            inserted = inserted[prefix:len(inserted) - suffix if suffix else None]
-            raw = self._raw[:self._bounds[left]] + inserted + self._raw[self._bounds[right]:]
+            ins_mid = inserted[prefix:len(inserted) - suffix if suffix else None]
+            raw = _splice_raw(self._raw[:self._bounds[left]], ins_mid, self._raw[self._bounds[right]:])
+
+            suffix2 = 0
+            while suffix2 < min(len(removed_part), len(inserted)) and removed_part[-1 - suffix2] == inserted[-1 - suffix2]:
+                suffix2 += 1
+            prefix2 = 0
+            while (prefix2 < len(removed_part) - suffix2 and prefix2 < len(inserted) - suffix2
+                   and removed_part[prefix2] == inserted[prefix2]):
+                prefix2 += 1
+            left2, right2 = start + prefix2, end - suffix2
+            ins_mid2 = inserted[prefix2:len(inserted) - suffix2 if suffix2 else None]
+            raw2 = _splice_raw(self._raw[:self._bounds[left2]], ins_mid2, self._raw[self._bounds[right2]:])
+
             shown, bounds = _display_map(raw)
-            if shown == new:
+            if raw == raw2 and shown == new:
                 # The whole range Qt reported, not the trimmed difference.
                 old_start, old_end = self._bounds[start], self._bounds[end]
                 self.last_edit = (old_start, old_end, len(raw) - len(self._raw) + old_end - old_start)
@@ -479,9 +533,27 @@ class LosslessEditor(QPlainTextEdit):
                 self._raw, self._shown, self._bounds = raw, shown, bounds
                 self.rawChanged.emit()
                 return
-        # Never guess which of two visually identical characters was edited.
+        # Never guess which of two visually identical characters was edited;
+        # restore pre-edit cursor and scroll state instead of jumping to 0.
+        saved_view = dict(self._pending_view) if self._pending_view is not None else None
+        if saved_view is None:
+            cur = self.textCursor()
+            doc_limit = _utf16_position(old, len(old))
+            cur_pos = cur.position()
+            if cur_pos >= position + added:
+                restored_pos = max(0, min(cur_pos - added + removed, doc_limit))
+            else:
+                restored_pos = max(0, min(position, doc_limit))
+            saved_view = {
+                "position": restored_pos,
+                "anchor": restored_pos,
+                "vertical": self.verticalScrollBar().value(),
+                "horizontal": self.horizontalScrollBar().value(),
+            }
+        self._rejected_view = saved_view
         raw = self._raw
         self.set_raw_text(raw)
+        self.restore_view_state(saved_view)
         self.editRejected.emit()
 
     def select_raw_span(self, span: dict | None, *, move_cursor: bool = True) -> bool:
@@ -514,6 +586,39 @@ class LosslessEditor(QPlainTextEdit):
         selection.format.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
         self.setExtraSelections([selection])
         return True
+
+
+class _WordWrapDelegate(QStyledItemDelegate):
+    """Measure multiline items against the live viewport width so wrapped lines never clip."""
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        view = self.parent()
+        width = view.viewport().width() if isinstance(view, QListWidget) else 0
+        if width <= 40:
+            return super().sizeHint(option, index)
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if not isinstance(text, str) or not text:
+            return super().sizeHint(option, index)
+        rect = option.fontMetrics.boundingRect(
+            0, 0, width - 20, 10_000, Qt.TextFlag.TextWordWrap, text
+        )
+        return QSize(width, rect.height() + 14)
+
+
+class _WrappedListWidget(QListWidget):
+    """Recompute wrapped item heights whenever the list is shown or resized."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setItemDelegate(_WordWrapDelegate(self))
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.scheduleDelayedItemsLayout()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.scheduleDelayedItemsLayout()
 
 
 class _ElidedDocumentLabel(QLabel):
@@ -644,6 +749,15 @@ class ManuscriptView(QWidget):
         self._finding_refs: list[tuple[int, int, int]] = []
         self._finding_recheck: list[bool] = []
         self._quiet_row = -1
+        self._quiet_ref: tuple[int, int, int] | None = None
+        # Term inspector view mode ("grouped" default in long mode, "order" in short)
+        # and status filter ("all" | "inconsistent" | "pending" | "not_evaluated" | "confirmed").
+        self._term_view_override: str | None = None
+        self._term_filter: str = "all"
+        self._term_groups_data: list[dict] = []
+        self._finding_group_status: list[set[str]] = []
+        self._syncing_term_selection = False
+        self._mismatch_prompt_active = False
         # The save-failure list shows history choices instead of conflicts.
         self._history_removal = False
 
@@ -681,10 +795,11 @@ class ManuscriptView(QWidget):
         # these can be current; any other history came from a file.
         self._session_snapshots: list[dict] = []
         self.auto_align_button.clicked.connect(self._use_auto_alignment)
-        self.findings = QListWidget(self)
+        self.findings = _WrappedListWidget(self)
         self.findings.setMinimumHeight(76)
-        self.findings.setMaximumHeight(150)
+        self.findings.setMaximumHeight(220)
         self.findings.setWordWrap(True)
+        self.findings.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.findings.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.findings.setAccessibleName(strings.MANUSCRIPT_INSPECTOR_TITLE)
         self.findings.currentRowChanged.connect(self._select_finding)
@@ -855,6 +970,24 @@ class ManuscriptView(QWidget):
         details = QVBoxLayout(inspector_body)
         details.setContentsMargins(16, 14, 16, 16)
         details.setSpacing(12)
+        self.mismatch_banner = QFrame(inspector_body)
+        self.mismatch_banner.setObjectName("reviewStatus")
+        self.mismatch_banner.setProperty("tone", "warn")
+        self.mismatch_banner.hide()
+        mismatch_layout = QVBoxLayout(self.mismatch_banner)
+        mismatch_layout.setContentsMargins(12, 8, 12, 10)
+        mismatch_layout.setSpacing(6)
+        self.mismatch_label = QLabel(self.mismatch_banner)
+        self.mismatch_label.setObjectName("statusText")
+        self.mismatch_label.setWordWrap(True)
+        self.jump_mismatch_button = QPushButton(strings.MANUSCRIPT_JUMP_MISMATCH, self.mismatch_banner)
+        self.jump_mismatch_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.jump_mismatch_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.jump_mismatch_button.setToolTip(f"{strings.MANUSCRIPT_JUMP_MISMATCH}（Ctrl+Shift+M）")
+        self.jump_mismatch_button.clicked.connect(self._jump_first_mismatch)
+        mismatch_layout.addWidget(self.mismatch_label)
+        mismatch_layout.addWidget(self.jump_mismatch_button, 0, Qt.AlignmentFlag.AlignLeft)
+        details.addWidget(self.mismatch_banner)
         self.review_status = QFrame(inspector_body)
         self.review_status.setObjectName("reviewStatus")
         self.review_status.setProperty("tone", "neutral")
@@ -881,11 +1014,56 @@ class ManuscriptView(QWidget):
         term_page.setObjectName("inspectorBody")
         term_details = QVBoxLayout(term_page)
         term_details.setContentsMargins(0, 0, 0, 0)
-        term_details.setSpacing(12)
+        term_details.setSpacing(8)
         self.terms_note = QLabel(strings.MANUSCRIPT_TERMS_NOTE, term_page)
         self.terms_note.setObjectName("secondaryText")
         self.terms_note.setWordWrap(True)
         term_details.addWidget(self.terms_note)
+        self.term_toolbar = QWidget(term_page)
+        self.term_toolbar.setObjectName("inspectorBody")
+        term_bar = QHBoxLayout(self.term_toolbar)
+        term_bar.setContentsMargins(0, 0, 0, 0)
+        term_bar.setSpacing(6)
+        self.term_view_combo = ChevronComboBox(self.term_toolbar)
+        self.term_view_combo.addItem(strings.MANUSCRIPT_TERM_VIEW_GROUPED, "grouped")
+        self.term_view_combo.addItem(strings.MANUSCRIPT_TERM_VIEW_ORDER, "order")
+        self.term_view_combo.setAccessibleName(strings.MANUSCRIPT_TERM_VIEW_LABEL)
+        self.term_view_combo.setToolTip(strings.MANUSCRIPT_TERM_VIEW_LABEL)
+        self.term_view_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.term_view_combo.setMinimumContentsLength(5)
+        self.term_view_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.term_view_combo.currentIndexChanged.connect(self._on_term_view_changed)
+        self.term_filter_combo = ChevronComboBox(self.term_toolbar)
+        for label_text, key in (
+            (strings.MANUSCRIPT_TERM_FILTER_ALL, "all"),
+            (strings.MANUSCRIPT_TERM_FILTER_INCONSISTENT, "inconsistent"),
+            (strings.MANUSCRIPT_TERM_FILTER_PENDING, "pending"),
+            (strings.MANUSCRIPT_TERM_FILTER_NOT_EVALUATED, "not_evaluated"),
+            (strings.MANUSCRIPT_TERM_FILTER_CONFIRMED, "confirmed"),
+        ):
+            self.term_filter_combo.addItem(label_text, key)
+        self.term_filter_combo.setAccessibleName(strings.MANUSCRIPT_TERM_FILTER_LABEL)
+        self.term_filter_combo.setToolTip(strings.MANUSCRIPT_TERM_FILTER_LABEL)
+        self.term_filter_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.term_filter_combo.setMinimumContentsLength(3)
+        self.term_filter_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.term_filter_combo.currentIndexChanged.connect(self._on_term_filter_changed)
+        term_bar.addWidget(self.term_view_combo, 3)
+        term_bar.addWidget(self.term_filter_combo, 2)
+        self.term_toolbar.hide()
+        term_details.addWidget(self.term_toolbar)
+        self.term_groups = _WrappedListWidget(term_page)
+        self.term_groups.setMinimumHeight(140)
+        self.term_groups.setMaximumHeight(175)
+        self.term_groups.setWordWrap(True)
+        self.term_groups.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.term_groups.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.term_groups.setAccessibleName(strings.MANUSCRIPT_INSPECTOR_TITLE)
+        self.term_groups.currentRowChanged.connect(self._on_group_row_changed)
+        self.term_groups.itemClicked.connect(self._on_group_item_clicked)
+        self.term_groups.hide()
+        term_details.addWidget(self.term_groups)
+        term_details.addWidget(self.findings)
         summary = QHBoxLayout()
         pair = QVBoxLayout()
         self.finding_title = QLabel(strings.MANUSCRIPT_FINDING_PROMPT, inspector_body)
@@ -908,6 +1086,12 @@ class ManuscriptView(QWidget):
         summary.addWidget(self.finding_verdict, 0, Qt.AlignmentFlag.AlignTop)
         term_details.addLayout(summary)
         term_details.addWidget(self.finding_pair)
+        self.finding_reason = QLabel(inspector_body)
+        self.finding_reason.setObjectName("secondaryText")
+        self.finding_reason.setTextFormat(Qt.TextFormat.PlainText)
+        self.finding_reason.setWordWrap(True)
+        self.finding_reason.hide()
+        term_details.addWidget(self.finding_reason)
         self.finding_rule = QLabel(inspector_body)
         self.finding_rule.setObjectName("secondaryText")
         self.finding_rule.setWordWrap(True)
@@ -981,7 +1165,6 @@ class ManuscriptView(QWidget):
         replacement.addWidget(self.replace_button)
         self.replace_toggle.toggled.connect(self.replacement_area.setVisible)
         term_details.addWidget(self.replacement_area)
-        term_details.addWidget(self.findings)
         term_details.addStretch(1)
         self.track_stack.addWidget(term_page)
         self.track_stack.addWidget(self.semantic_page)
@@ -1254,6 +1437,7 @@ class ManuscriptView(QWidget):
             ("Ctrl+Shift+I", self._ignore_current),
             ("Ctrl+Shift+R", self._start_review),
             ("Ctrl+Shift+T", self._translate),
+            ("Ctrl+Shift+M", self._jump_first_mismatch),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -1301,6 +1485,7 @@ class ManuscriptView(QWidget):
             self._show_segment_term_report()
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._refresh_segments()
+        self._render_mismatch_prompt()
         self._update_tracks()
         self._render_semantic_progress()
 
@@ -1389,14 +1574,24 @@ class ManuscriptView(QWidget):
         if pair.status != STATUS_READY:
             return pair.status
         records = self._records()
-        term = "current" if records is None else self._term_state(records[pair.index])
+        if records is None:
+            if self._review_state == "current" and self._report is not None:
+                term = "current"
+            elif self._review_state == "stale":
+                term = "stale"
+            elif self._review_state == "error":
+                term = "failed"
+            else:
+                term = "pending"
+        else:
+            term = self._term_state(records[pair.index])
         result = self._session.result_for(pair, self._payload["source"], self._payload["target"])
         if term == "current" and not self._basis().needs(result):
             return "reviewed"
         failure = self._segment_failures.get(self._segment_key(pair))
         if failure is not None:
             return failure
-        return term if term in ("saved", "stale") else "pending"
+        return term if term in ("saved", "stale", "failed") else "pending"
 
     def _progress(self) -> tuple[int, int] | None:
         pairs = self._cached_pairs()
@@ -2173,24 +2368,283 @@ class ManuscriptView(QWidget):
                 and 0 <= start < end <= len(raw) and raw[start:end] == value
                 and start in self.target_edit._bounds and end in self.target_edit._bounds)
 
+    def _effective_term_view(self) -> str:
+        if self._term_view_override is not None:
+            return self._term_view_override
+        return "grouped" if self._long_now() else "order"
+
+    def _update_term_list_visibility(self) -> None:
+        total = len(self._report["findings"]) if self._report is not None else 0
+        self.term_toolbar.setVisible(total > 0)
+        if total == 0:
+            self.findings.hide()
+            self.term_groups.hide()
+            return
+        mode = self._effective_term_view()
+        group_has = any(
+            self.term_groups.item(r).data(Qt.ItemDataRole.UserRole) is not None
+            for r in range(self.term_groups.count())
+        )
+        order_has = any(not self.findings.isRowHidden(r) for r in range(self.findings.count()))
+        self.term_groups.setVisible(mode == "grouped" and group_has)
+        self.findings.setVisible(mode == "order" and order_has)
+        if mode == "grouped" and group_has:
+            self.term_groups.scheduleDelayedItemsLayout()
+        elif mode == "order" and order_has:
+            self.findings.scheduleDelayedItemsLayout()
+
+    def _on_term_view_changed(self, _index: int = -1) -> None:
+        if self._syncing_term_selection:
+            return
+        data = self.term_view_combo.currentData()
+        if data in ("grouped", "order"):
+            self._term_view_override = data
+        self._refresh_term_lists(quiet=False, preferred_index=self.findings.currentRow())
+
+    def _on_term_filter_changed(self, _index: int = -1) -> None:
+        if self._syncing_term_selection:
+            return
+        data = self.term_filter_combo.currentData()
+        if isinstance(data, str):
+            self._term_filter = data
+        self._refresh_term_lists(quiet=False, preferred_index=self.findings.currentRow())
+
+    def _on_group_item_clicked(self, item: QListWidgetItem) -> None:
+        if self._syncing_term_selection or not self._input_ready():
+            return
+        if item.data(Qt.ItemDataRole.UserRole) is None:
+            first_row = item.data(Qt.ItemDataRole.UserRole + 1)
+            if isinstance(first_row, int) and 0 <= first_row < self.term_groups.count():
+                self.term_groups.setCurrentRow(first_row)
+
+    def _on_group_row_changed(self, group_row: int) -> None:
+        if self._syncing_term_selection:
+            return
+        item = self.term_groups.item(group_row) if 0 <= group_row < self.term_groups.count() else None
+        finding_index = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if finding_index is None:
+            return
+        self._syncing_term_selection = True
+        try:
+            if self.findings.currentRow() != finding_index:
+                self.findings.setCurrentRow(finding_index)
+            else:
+                self._select_finding(finding_index)
+        finally:
+            self._syncing_term_selection = False
+
+    def _sync_group_row_to_finding(self, finding_index: int) -> None:
+        target_row = -1
+        for r in range(self.term_groups.count()):
+            if self.term_groups.item(r).data(Qt.ItemDataRole.UserRole) == finding_index:
+                target_row = r
+                break
+        self.term_groups.blockSignals(True)
+        self.term_groups.setCurrentRow(target_row)
+        self.term_groups.blockSignals(False)
+
+    def _build_document_term_groups(self, report: dict) -> list[dict]:
+        """Group findings of a short/document-mode report with the same rules."""
+        source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
+        if not report["findings"]:
+            return []
+        synthetic_findings = [
+            {**f, "rule_id": sr.TERM_PAIR_RULE} for f in report["findings"]
+            if isinstance(f.get("source_span"), dict)
+        ]
+        synthetic_report = {
+            "request_id": report.get("request_id") or "doc",
+            "source_revision": sr.content_hash(source),
+            "target_revision": sr.content_hash(target),
+            "rule_version": sr.RULE_VERSION,
+            "matcher_revision": report.get("matcher_revision") or ("0" * 64),
+            "dictionary": {
+                "schema_version": (report.get("dictionary") or {}).get("schema_version") or "1",
+                "source_commit": (report.get("dictionary") or {}).get("source_commit") or "doc",
+                "term_count": int((report.get("dictionary") or {}).get("term_count") or 0),
+                "revision": (report.get("dictionary") or {}).get("revision") or ("0" * 64),
+            },
+            "coverage": {
+                "evaluated": int((report.get("coverage") or {}).get("evaluated") or 0),
+                "not_evaluated": int((report.get("coverage") or {}).get("not_evaluated") or 0),
+                "rules": list(sr.COVERAGE_RULES),
+            },
+            "findings": synthetic_findings,
+            "truncated": bool(report.get("truncated")),
+        }
+        compact = sr.compact_result(synthetic_report, source, target)
+        if compact is None:
+            return []
+        basis = sr.basis_of(synthetic_report)
+        record = {
+            "index": 0,
+            "segmentation_version": "segmentation-v1",
+            "source_start": 0,
+            "source_end": len(source),
+            "target_start": 0,
+            "target_end": len(target),
+            "source_hash": sr.content_hash(source),
+            "target_hash": sr.content_hash(target),
+            "status": "done" if self._review_state == "current" else "stale",
+            "direction": direction,
+            "alignment_input": sr.alignment_input(
+                self._payload["alignments"], source, target, (0, len(source)), (0, len(target))
+            ),
+            "basis": basis,
+            "result": compact,
+            "choices": [],
+        }
+        return sr.group_term_occurrences(
+            [record], [], source, target, direction,
+            alignments=self._payload["alignments"],
+            basis=basis if self._review_state == "current" else None,
+        )
+
+    def _refresh_term_lists(self, *, quiet: bool = False, preferred_index: int = -1) -> None:
+        report = self._report
+        total = len(report["findings"]) if report is not None else 0
+        mode = self._effective_term_view()
+        self._syncing_term_selection = True
+        try:
+            self.term_view_combo.blockSignals(True)
+            self.term_view_combo.setCurrentIndex(max(0, self.term_view_combo.findData(mode)))
+            self.term_view_combo.blockSignals(False)
+            self.term_filter_combo.blockSignals(True)
+            self.term_filter_combo.setCurrentIndex(max(0, self.term_filter_combo.findData(self._term_filter)))
+            self.term_filter_combo.blockSignals(False)
+
+            self.term_groups.blockSignals(True)
+            self.term_groups.clear()
+            if report is not None and total > 0:
+                for group in self._term_groups_data:
+                    # A filter shows a group that holds a place in that state,
+                    # whatever the group's own status is (``group_matches_filter``).
+                    if not sr.group_matches_filter(group, self._term_filter):
+                        continue
+                    header_text = strings.MANUSCRIPT_TERM_GROUP_HEADER.format(
+                        surface=group["surface"],
+                        count=group["count"],
+                        status=strings.MANUSCRIPT_TERM_GROUP_STATUS.get(group["status"], group["status"]),
+                        distribution=group["distribution_text"],
+                    )
+                    if group["unverified_segments"]:
+                        # Places the group does not hold yet: the header says so
+                        # rather than counting a manuscript as settled.
+                        header_text += "\n" + strings.MANUSCRIPT_TERM_GROUP_UNVERIFIED.format(
+                            count=len(group["unverified_segments"]),
+                            segments="、".join(f"#{n}" for n in group["unverified_segments"]),
+                        )
+                    header_item = QListWidgetItem(header_text)
+                    header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    header_item.setData(Qt.ItemDataRole.UserRole, None)
+                    first_occ_row = self.term_groups.count() + 1
+                    header_item.setData(Qt.ItemDataRole.UserRole + 1, first_occ_row)
+                    self.term_groups.addItem(header_item)
+
+                    for occ in group["occurrences"]:
+                        summary_parts = []
+                        if occ["actual_translation"] is not None:
+                            summary_parts.append(occ["actual_translation"])
+                        elif occ["verdict"] != "not_evaluated":
+                            summary_parts.append(strings.MANUSCRIPT_TERM_TARGET_MISS)
+                        summary_parts.append(occ["verdict_label"])
+                        if occ["choice"] is not None:
+                            summary_parts.append(
+                                strings.MANUSCRIPT_FINDING_CHOSEN
+                                if occ["choice"]["confirmed"]
+                                else strings.MANUSCRIPT_FINDING_RECONFIRM
+                            )
+                        if occ["freshness"] == "stale":
+                            summary_parts.append(strings.MANUSCRIPT_FINDING_RECHECK)
+                        summary_str = " · ".join(summary_parts)
+                        row_text = strings.MANUSCRIPT_TERM_OCCURRENCE_ROW.format(
+                            segment=occ["segment_number"],
+                            summary=summary_str,
+                            source_context=occ["source_context"],
+                            target_context=occ["target_context"],
+                        )
+                        occ_item = QListWidgetItem(row_text)
+                        occ_item.setData(Qt.ItemDataRole.UserRole, occ["finding_index"])
+                        occ_item.setToolTip(
+                            strings.MANUSCRIPT_TERM_OCCURRENCE_TOOLTIP.format(
+                                segment=occ["segment_number"],
+                                summary=summary_str,
+                                source_context=occ["source_context"],
+                                target_context=occ["target_context"],
+                            )
+                        )
+                        self.term_groups.addItem(occ_item)
+            self.term_groups.blockSignals(False)
+
+            for i in range(self.findings.count()):
+                status = self._finding_group_status[i] if i < len(self._finding_group_status) else {"all", "pending"}
+                matches = self._term_filter == "all" or self._term_filter in status
+                self.findings.setRowHidden(i, not matches)
+
+            self._update_term_list_visibility()
+            if total == 0:
+                self._render_finding(-1)
+                return
+
+            def allowed(idx: int) -> bool:
+                if not 0 <= idx < total:
+                    return False
+                if self._term_filter == "all":
+                    return True
+                st = self._finding_group_status[idx] if idx < len(self._finding_group_status) else {"all", "pending"}
+                return self._term_filter in st
+
+            selected = preferred_index if allowed(preferred_index) else -1
+            if selected < 0:
+                if mode == "grouped":
+                    for r in range(self.term_groups.count()):
+                        f_idx = self.term_groups.item(r).data(Qt.ItemDataRole.UserRole)
+                        if isinstance(f_idx, int) and allowed(f_idx):
+                            selected = f_idx
+                            break
+                else:
+                    selected = next((i for i in range(total) if allowed(i)), -1)
+
+            self.findings.blockSignals(True)
+            self.findings.setCurrentRow(selected)
+            self.findings.blockSignals(False)
+            self._sync_group_row_to_finding(selected)
+        finally:
+            self._syncing_term_selection = False
+
+        if quiet or selected < 0:
+            self._render_finding(selected)
+            self._update_controls()
+        else:
+            self._select_finding(selected)
+
     def _render_finding(self, index: int) -> None:
         report = self._report
         finding = report["findings"][index] if report is not None and 0 <= index < len(report["findings"]) else None
         total = len(report["findings"]) if report is not None else 0
         self.finding_count.setText(strings.MANUSCRIPT_FINDING_COUNT.format(
             current=index + 1 if finding is not None else 0, total=total))
-        self.findings.setVisible(total > 0)
+        self._update_term_list_visibility()
         self._render_inspector_hint()
         self._render_choice(index if finding is not None else -1)
         if finding is None:
-            self.finding_title.setText(
-                strings.MANUSCRIPT_FINDING_PROMPT if total else
-                strings.MANUSCRIPT_NO_FINDINGS if report is not None else self.report_label.text()
-            )
-            for label in (self.finding_verdict, self.finding_pair, self.finding_rule, self.finding_positions, self.candidates_label):
+            if total > 0 and self._term_filter != "all":
+                prompt = strings.MANUSCRIPT_TERM_FILTER_EMPTY
+            elif total > 0:
+                prompt = strings.MANUSCRIPT_FINDING_PROMPT
+            elif report is not None:
+                prompt = strings.MANUSCRIPT_NO_FINDINGS
+            else:
+                prompt = self.report_label.text()
+            self.finding_title.setText(prompt)
+            for label in (
+                self.finding_verdict, self.finding_pair, self.finding_reason,
+                self.finding_rule, self.finding_positions, self.candidates_label,
+            ):
                 label.clear()
             self.finding_verdict.hide()
             self.finding_pair.hide()
+            self.finding_reason.hide()
             self.lookup_button.hide()
             self.manual_edit_label.hide()
             self.replace_toggle.hide()
@@ -2199,19 +2653,23 @@ class ManuscriptView(QWidget):
             return
         source = finding.get("source_span") or {}
         target = finding.get("target_span")
+        verdict = finding["verdict"]
+        reason = finding.get("reason") if verdict == "not_evaluated" else None
         self.finding_verdict.show()
         self.finding_title.setTextFormat(Qt.TextFormat.PlainText)
         self.finding_title.setText(source.get("text", ""))
-        verdicts = {"verified_constraint": strings.MANUSCRIPT_VERDICT_VERIFIED,
-                    "confirmed_conflict": strings.MANUSCRIPT_VERDICT_CONFLICT,
-                    "needs_review": strings.MANUSCRIPT_VERDICT_NEEDS_REVIEW,
-                    "not_evaluated": strings.MANUSCRIPT_VERDICT_NOT_EVALUATED}
-        self.finding_verdict.setText(verdicts.get(finding["verdict"], finding["verdict"]))
-        self.finding_verdict.setProperty("verdict", finding["verdict"])
+        self.finding_verdict.setText(sr.localized_verdict_label(verdict, reason))
+        self.finding_verdict.setProperty("verdict", verdict)
         self.finding_verdict.style().unpolish(self.finding_verdict)
         self.finding_verdict.style().polish(self.finding_verdict)
         self.finding_pair.setText(target["text"] if isinstance(target, dict) and isinstance(target.get("text"), str) else "")
         self.finding_pair.setVisible(bool(self.finding_pair.text()))
+        if reason:
+            self.finding_reason.setText(sr.localized_not_evaluated_detail(reason) or "")
+            self.finding_reason.setVisible(bool(self.finding_reason.text()))
+        else:
+            self.finding_reason.clear()
+            self.finding_reason.hide()
         rule = strings.MANUSCRIPT_RULE_TERM_PAIR if finding["rule_id"] == "review.term_pair" else finding["rule_id"]
         self.finding_rule.setText(strings.MANUSCRIPT_RULE.format(rule=rule))
         positions = []
@@ -2227,13 +2685,22 @@ class ManuscriptView(QWidget):
         if record is not None and record["result"] is not None and record["result"]["truncated"]:
             notes.append(strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(
                 number=ref[0] + 1, count=len(record["result"]["findings"])))
+        elif ref is None and report is not None and report.get("truncated"):
+            notes.append(strings.MANUSCRIPT_DOCUMENT_TERMS_TRUNCATED.format(
+                count=len(report["findings"])))
         self.candidates_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.candidates_label.setText("\n".join([strings.MANUSCRIPT_CANDIDATES, *pairs, *notes]))
+        if pairs or notes:
+            self.candidates_label.setText("\n".join([strings.MANUSCRIPT_CANDIDATES, *pairs, *notes]))
+            self.candidates_label.show()
+        else:
+            self.candidates_label.clear()
+            self.candidates_label.hide()
         self.lookup_button.setVisible(bool(source.get("text")))
         reliable = self._target_span_reliable(target)
-        self.manual_edit_label.setVisible(not reliable)
+        skip_manual_notice = verdict == "not_evaluated" and reason in ("not_a_term", "ordinary_word")
+        self.manual_edit_label.setVisible(not reliable and not skip_manual_notice)
         self.replace_toggle.setChecked(False)
-        self.replace_toggle.setVisible(reliable and finding["verdict"] != "verified_constraint")
+        self.replace_toggle.setVisible(reliable and verdict not in ("verified_constraint", "not_evaluated"))
         self.replacement_area.hide()
 
     @staticmethod
@@ -2382,6 +2849,11 @@ class ManuscriptView(QWidget):
         self._render_translate_offer()
         self.auto_align_button.setEnabled(self._payload["alignments"] is not None)
         self.findings.setEnabled(not composing)
+        self.term_groups.setEnabled(not composing)
+        self.term_view_combo.setEnabled(not composing)
+        self.term_filter_combo.setEnabled(not composing)
+        self.jump_mismatch_button.setEnabled(not composing)
+        self._render_mismatch_prompt()
         self.lookup_button.setEnabled(not composing)
         self.replace_toggle.setEnabled(not composing)
         index = self.findings.currentRow()
@@ -2584,9 +3056,14 @@ class ManuscriptView(QWidget):
         previous = self._review_state
         self._cancel_pending()
         self._quiet_row = self.findings.currentRow()
+        self._quiet_ref = self._finding_record(self._quiet_row)
         self._report = None
         self._finding_refs, self._finding_recheck = [], []
+        self._term_groups_data, self._finding_group_status = [], []
         self.findings.clear()
+        self.term_groups.clear()
+        self.term_toolbar.hide()
+        self.term_groups.hide()
         if previous in ("current", "stale", "saved"):
             state = "stale"
         elif previous == "reviewing":
@@ -2746,27 +3223,29 @@ class ManuscriptView(QWidget):
         """List a report's findings. ``refs`` and ``recheck`` belong to a long
         manuscript's findings: their records, and whether each awaits a re-check."""
         row = self.findings.currentRow()
+        prev_ref = self._finding_record(row) if row >= 0 else self._quiet_ref
         # Rebuilt from the records (after an edit, an action or a segment of a
         # run): the list keeps its place without locating anything, so the
         # caret and the status line stay as they are.
         quiet = refs is not None
-        if quiet and row < 0:
+        if quiet and prev_ref is not None and refs and prev_ref in refs:
+            row = refs.index(prev_ref)
+        elif quiet and row < 0:
             row = self._quiet_row
         self._report = report
         self._finding_refs = list(refs or [])
         self._finding_recheck = list(recheck or [False] * len(report["findings"]))
         self._set_review_state(state, request_id=report["request_id"])
-        self.findings.blockSignals(quiet)
+        self.findings.blockSignals(True)
         self.findings.clear()
-        verdicts = {"verified_constraint": strings.MANUSCRIPT_VERDICT_VERIFIED,
-                    "confirmed_conflict": strings.MANUSCRIPT_VERDICT_CONFLICT,
-                    "needs_review": strings.MANUSCRIPT_VERDICT_NEEDS_REVIEW,
-                    "not_evaluated": strings.MANUSCRIPT_VERDICT_NOT_EVALUATED}
         for index, finding in enumerate(report["findings"]):
             source_span = finding.get("source_span") or {}
             target_span = finding.get("target_span") or {}
             target_text = target_span.get("text")
-            verdict = verdicts[finding["verdict"]]
+            verdict = sr.localized_verdict_label(
+                finding["verdict"],
+                finding.get("reason") if finding["verdict"] == "not_evaluated" else None,
+            )
             second_line = f"{target_text} · {verdict}" if target_text else verdict
             choice = self._choice_at(index)
             if choice is not None:
@@ -2775,15 +3254,38 @@ class ManuscriptView(QWidget):
             if self._finding_recheck[index]:
                 second_line += " · " + strings.MANUSCRIPT_FINDING_RECHECK
             self.findings.addItem(f'{source_span.get("text", "")}\n{second_line}')
-        if self.findings.count():
-            self.findings.setCurrentRow(row if 0 <= row < self.findings.count() and (quiet or self._term_mode == "segments")
-                                        else 0)
         self.findings.blockSignals(False)
-        if quiet:
-            self._render_finding(self.findings.currentRow())
-            self._update_controls()
-        elif not self.findings.count():
-            self._render_finding(-1)
+
+        if refs is not None:
+            records = self._records() or []
+            groups = sr.group_term_occurrences(
+                records, self._current_pairs(),
+                self._payload["source"], self._payload["target"], self._payload["direction"],
+                alignments=self._payload["alignments"], basis=self._term_basis,
+            )
+        else:
+            groups = self._build_document_term_groups(report)
+        self._term_groups_data = groups
+        matched_by_index: list[set[str]] = [set() for _ in report["findings"]]
+        for grp in groups:
+            keys = {key for key in _TERM_FILTER_KEYS if sr.group_matches_filter(grp, key)}
+            for occ in grp["occurrences"]:
+                f_idx = occ["finding_index"]
+                if 0 <= f_idx < len(matched_by_index):
+                    matched_by_index[f_idx] = keys
+        if not groups and report["findings"]:
+            for idx, f in enumerate(report["findings"]):
+                if f["verdict"] == "not_evaluated":
+                    status = "not_evaluated"
+                elif f["verdict"] == "verified_constraint" and state == "current":
+                    status = "confirmed"
+                else:
+                    status = "pending"
+                matched_by_index[idx] = {"all", status}
+        self._finding_group_status = matched_by_index
+
+        preferred = row if 0 <= row < len(report["findings"]) and (quiet or self._term_mode == "segments") else -1
+        self._refresh_term_lists(quiet=quiet, preferred_index=preferred)
 
     def _show_segment_term_report(self) -> None:
         """Long manuscripts: one display report from every segment record whose
@@ -3301,8 +3803,55 @@ class ManuscriptView(QWidget):
             self._update_controls()
             return
         self._translate_run, self._translate_state = None, "idle"
-        self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
+        mismatched = [p for p in self._current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT]
+        if mismatched:
+            self._mismatch_prompt_active = True
+            self.status_label.setText(strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=len(mismatched)))
+        else:
+            self._mismatch_prompt_active = False
+            self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
         self._update_controls()
+
+    def _render_mismatch_prompt(self) -> None:
+        if not self._mismatch_prompt_active:
+            if not self.mismatch_banner.isHidden():
+                self.mismatch_banner.hide()
+            return
+        pairs = self._cached_pairs()
+        if pairs is None:
+            pairs = self._current_pairs()
+        count = sum(1 for p in pairs if p.status == STATUS_NEEDS_MANUAL_SPLIT)
+        if count <= 0:
+            self._mismatch_prompt_active = False
+            self.mismatch_banner.hide()
+            return
+        self.mismatch_label.setText(strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=count))
+        if self.mismatch_banner.isHidden():
+            self.mismatch_banner.show()
+
+    def _jump_first_mismatch(self) -> None:
+        if not self._input_ready():
+            return
+        pairs = self._current_pairs()
+        target_pair = next((p for p in pairs if p.status == STATUS_NEEDS_MANUAL_SPLIT), None)
+        if target_pair is None:
+            self._mismatch_prompt_active = False
+            self.mismatch_banner.hide()
+            self.status_label.setText(strings.MANUSCRIPT_NO_PENDING_SEGMENT)
+            return
+        if self.inspector.isHidden():
+            self._inspector_requested = True
+            self.inspector.show()
+            self._update_inspector_button()
+        self._show_track(TRACK_SEGMENTS)
+        if self.segment_list.currentRow() == target_pair.index:
+            self._segment_cursor = target_pair.index
+            self._render_segment(target_pair)
+            self._update_tracks()
+            self._select_cores(target_pair)
+        else:
+            self.segment_list.setCurrentRow(target_pair.index)
+        self.status_label.setText(strings.MANUSCRIPT_MISMATCH_JUMPED.format(number=target_pair.index + 1))
 
     def _translation_basis_unchanged(self, run: _Translation) -> bool:
         payload = self._payload
@@ -3372,6 +3921,7 @@ class ManuscriptView(QWidget):
         self._update_controls()
 
     def _select_finding(self, index: int) -> None:
+        self._sync_group_row_to_finding(index)
         self._render_finding(index)
         if self._report is None or not 0 <= index < len(self._report["findings"]):
             self._update_controls()
@@ -3675,6 +4225,10 @@ class ManuscriptView(QWidget):
         self._undo_editor_states.clear()
         self._redo_editor_states.clear()
         self._conflict_mode = self._history_removal = False
+        self._mismatch_prompt_active = False
+        self._term_view_override = None
+        self._term_filter = "all"
+        self._quiet_ref = None
         self._refresh_conflicts()
         self._set_payload(value)
         self._reset_term_session(cursor)
@@ -3724,11 +4278,16 @@ class ManuscriptView(QWidget):
                 findings = []
                 if record["result"] is not None:
                     for finding in sr.expand_result(record, source, target)["findings"]:
-                        findings.append({"verdict": finding["verdict"],
-                                         "source_span": _offset(finding["source_span"], record["source_start"]),
-                                         "target_span": _offset(finding["target_span"], record["target_start"]),
-                                         "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]],
-                                         "candidates_truncated": finding["candidates_truncated"] is True})
+                        exported_finding: dict = {
+                            "verdict": finding["verdict"],
+                            "source_span": _offset(finding["source_span"], record["source_start"]),
+                            "target_span": _offset(finding["target_span"], record["target_start"]),
+                            "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]],
+                            "candidates_truncated": finding["candidates_truncated"] is True,
+                        }
+                        if "reason" in finding:
+                            exported_finding["reason"] = finding["reason"]
+                        findings.append(exported_finding)
                 choices = [{**choice, "source_span": _offset(choice["source_span"], record["source_start"])}
                            for choice in record["choices"]]
                 # Truncation goes with the row, so an export never reads complete
