@@ -60,7 +60,7 @@ from PySide6.QtWidgets import QApplication
 from wuwaterm_client import semantic, theme
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.config import ClientConfig
-from wuwaterm_client.manuscript import empty_workfile
+from wuwaterm_client.manuscript import empty_workfile, save_workfile
 from wuwaterm_client.ui import main_window as main_window_module
 from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC, TRACK_TERMS
 
@@ -671,6 +671,25 @@ def _states(semantic: bool):
         view.term_groups.verticalScrollBar().setValue(0)
         return window
 
+    def term_groups_saved_reopen():
+        """A reviewed manuscript written out and opened again: the new session has no
+        basis, so every segment result is a saved one and nothing may read as 已核
+        before the first check."""
+        window = _window(_Server(semantic))
+        _load(window, RESONATOR_SOURCE, RESONATOR_TARGET, direction="en")
+        _review(window)
+        view = window.manuscript_view
+        view._refresh_derived()
+        view._show_track(TRACK_TERMS)
+        path = Path(os.environ["APPDATA"]) / "saved-reopen.json"
+        save_workfile(path, view._payload)
+        view._saved_payload = dict(view._payload)
+        if not view.open_path(path):
+            raise AssertionError("the written workfile did not open again")
+        QApplication.processEvents()
+        view.term_groups.verticalScrollBar().setValue(0)
+        return window
+
     def term_group_after_replace():
         window = _window(_Server(semantic))
         _load(window, RESONATOR_SOURCE, RESONATOR_TARGET, direction="en")
@@ -721,6 +740,7 @@ def _states(semantic: bool):
                 ("09b-term-groups-replace", homograph_replace),
                 ("09c-term-groups-after-replace", term_group_after_replace),
                 ("09d-term-groups-pending-filter", term_group_pending_filter),
+                ("09e-term-groups-saved-reopen", term_groups_saved_reopen),
                 ("10-term-groups-tuner-reason", tuner_and_reason_groups),
                 ("11-translation-mismatch", translation_mismatch)]
     return [("04-terms", terms), ("05-semantic-issue", semantic_issue),

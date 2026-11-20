@@ -968,7 +968,15 @@ def _attention(choice: Mapping[str, Any] | None, freshness: str, verdict: str) -
     stale; a place whose choice waits for the next check, or that sits in a
     stale segment, needs a check; a conflict needs a decision. ``ok`` is a
     verified place with nothing to do.
+
+    ``saved`` (``_record_freshness``: a reopened result whose basis this session
+    has not checked against the live server yet) is never ``settled`` or ``ok``:
+    nothing about a saved result is verified here, so every saved place needs
+    that check. A conflict it records still reads as a conflict, because a
+    recorded conflict is a decision to make, never a settled place.
     """
+    if freshness == "saved":
+        return "conflict" if verdict == "confirmed_conflict" else "pending"
     if choice is not None and choice.get("confirmed") and freshness != "stale":
         return "settled"
     if choice is not None and not choice.get("confirmed"):
@@ -1163,6 +1171,11 @@ def group_term_occurrences(
     its source core may hold one of a group's spellings: ``unverified_segments``
     lists it, and the group is never ``confirmed`` while one stands, so a header
     cannot claim the term is settled across a manuscript that still owes a check.
+
+    Saved results (a reopened manuscript, before the session has checked the live
+    basis) are listed as usual, with ``saved_count`` saying how many places are
+    such results. They are never settled: every saved place counts as pending, so
+    the group is never ``confirmed`` either.
     """
     raw_groups: list[dict[str, Any]] = []
     finding_index = 0
@@ -1324,11 +1337,13 @@ def group_term_occurrences(
 
         pending_count = sum(1 for o in occurrences if _needs_action(o))
         not_evaluated_count = sum(1 for o in occurrences if o["attention"] == "not_evaluated")
+        saved_count = sum(1 for o in occurrences if o["freshness"] == "saved")
         unverified = _unchecked_holding(grp["surfaces"], unchecked, direction)
 
         if inconsistent:
             status = "inconsistent"
-        elif pending_count > 0 or bool(unverified):
+        elif pending_count > 0 or saved_count > 0 or bool(unverified):
+            # A saved result is never settled: its basis is not the live one.
             status = "pending"
         elif not_evaluated_count > 0:
             status = "not_evaluated"
@@ -1353,6 +1368,7 @@ def group_term_occurrences(
             "status": status,
             "inconsistent": inconsistent,
             "pending_count": pending_count,
+            "saved_count": saved_count,
             "not_evaluated_count": not_evaluated_count,
             "confirmed_count": len(occurrences) - pending_count - not_evaluated_count,
             "unverified_segments": unverified,

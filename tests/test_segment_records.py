@@ -137,19 +137,34 @@ B2 = {**B1, "matcher_revision": "3" * 64}
 B3 = {**B1, "dictionary": {**B1["dictionary"], "revision": "4" * 64}}
 
 
-def core_report(request: sr.Request, server: dict, terms: dict = TERMS, truncated: tuple = ()) -> dict:
-    """What Core answers for the request under the server's basis: one finding per occurrence."""
+def core_report(request: sr.Request, server: dict, terms: dict = TERMS, truncated: tuple = (), *,
+                verdict: str = "needs_review", reason: str | None = None) -> dict:
+    """What Core answers for the request under the server's basis: one finding per occurrence.
+
+    ``verdict`` is what the stand-in says about them; a first candidate's English
+    rendering that the target core really holds becomes the finding's target span."""
     found = sorted((start, surface) for surface in terms
                    for start in range(len(request.source)) if request.source.startswith(surface, start))
-    findings = [{"id": f"{s}:{s + len(t)}:{t}", "verdict": "needs_review", "rule_id": "review.term_pair",
-                 "source_span": {"start": s, "end": s + len(t), "text": t}, "target_span": None,
-                 "candidates": [{"zh": c["zh"], "en": c["en"], "category": c["category"], "sources": [],
-                                 "candidate_id": c["candidate_id"]} for c in terms[t]],
-                 "candidates_truncated": t in truncated} for s, t in found]
+    findings = []
+    for source_start, term in found:
+        at = request.target.find(terms[term][0]["en"])
+        finding = {"id": f"{source_start}:{source_start + len(term)}:{term}", "verdict": verdict,
+                   "rule_id": "review.term_pair",
+                   "source_span": {"start": source_start, "end": source_start + len(term), "text": term},
+                   "target_span": None if at < 0 else {
+                       "start": at, "end": at + len(terms[term][0]["en"]), "text": terms[term][0]["en"]},
+                   "candidates": [{"zh": c["zh"], "en": c["en"], "category": c["category"], "sources": [],
+                                   "candidate_id": c["candidate_id"]} for c in terms[term]],
+                   "candidates_truncated": term in truncated}
+        if reason is not None:
+            finding["reason"] = reason
+        findings.append(finding)
+    not_evaluated = sum(1 for f in findings if f["verdict"] == "not_evaluated")
     return {"request_id": "synthetic", "source_revision": sr.content_hash(request.source),
             "target_revision": sr.content_hash(request.target), "rule_version": "review-v2",
             "matcher_revision": server["matcher_revision"], "dictionary": dict(server["dictionary"]),
-            "coverage": {"evaluated": len(findings), "not_evaluated": 0, "rules": list(sr.COVERAGE_RULES)},
+            "coverage": {"evaluated": len(findings) - not_evaluated, "not_evaluated": not_evaluated,
+                         "rules": list(sr.COVERAGE_RULES)},
             "findings": findings, "truncated": False}
 
 
@@ -179,11 +194,11 @@ def check(payload: dict, index: int, basis: dict | None, server: dict, **report)
     return payload, basis, applied
 
 
-def review_all(payload: dict, server: dict, basis: dict | None = None) -> tuple[dict, dict]:
+def review_all(payload: dict, server: dict, basis: dict | None = None, **report) -> tuple[dict, dict]:
     payload = sr.with_parts(payload, sr.normalize(payload, pairs_of(payload), basis))
     attempted: set[int] = set()
     while (index := sr.next_index(payload, pairs_of(payload), basis, attempted)) is not None:
-        payload, basis, _ = check(payload, index, basis, server)
+        payload, basis, _ = check(payload, index, basis, server, **report)
         attempted.add(index)
     return payload, basis
 
@@ -450,3 +465,124 @@ def test_more_than_512_history_entries_fail_with_the_code() -> None:
         sr.normalize(full, pairs_of(full))
     assert error.value.code == "workfile_too_many_entries"
     assert len(sr.normalize(full, pairs_of(full), check_limits=False).history) == 513
+
+
+# ---- saved results: a reopened manuscript before its live basis check ----
+# P2 #2: a saved result was computed under a basis this session has not checked
+# against the live server. It is listed as usual, but it is never settled: its
+# places count as pending work and its group is never 已核 (``confirmed``).
+
+def _reviewed_term(surface: str = "椿", en: str = "Camellya", *,
+                   verdict: str = "verified_constraint", reason: str | None = None) -> tuple[dict, dict]:
+    """A long manuscript holding exactly one ``surface`` term, reviewed under B1 by a
+    stand-in Core that reports ``verdict`` for it."""
+    payload = {
+        "source": f"庭院深处，{surface}静静注视着枝头。" + "今汐在城楼远望。" * 300,
+        "target": f"Deep in the courtyard, {en} quietly watched the branch. " + "Jinhsi looked afar. " * 300,
+        "direction": "en", "alignments": None, "choices": [], "history": [],
+    }
+    terms = {surface: [_candidate(surface, en)]}
+    return review_all(payload, B1, terms=terms, verdict=verdict, reason=reason)
+
+
+def _term_groups(payload: dict, basis: dict | None) -> list[dict]:
+    return sr.group_term_occurrences(sr.parts_of(payload).segments, pairs_of(payload),
+                                     payload["source"], payload["target"], payload["direction"],
+                                     alignments=payload["alignments"], basis=basis)
+
+
+def test_a_saved_result_is_pending_until_the_live_basis_is_checked() -> None:
+    """P2 #2: 椿 -> Camellya reads the same in all three states — but only the checked
+    basis may call it settled. Saved: 待处理 with one pending place, never 已核."""
+    payload, basis = _reviewed_term()
+    assert basis == B1 and statuses(payload) == ["done"] * len(pairs_of(payload))
+
+    (current,) = _term_groups(payload, B1)
+    assert (current["status"], current["pending_count"]) == ("confirmed", 0)
+    assert current["saved_count"] == 0
+    assert sr.group_matches_filter(current, "confirmed") and not sr.group_matches_filter(current, "pending")
+    assert [(o["freshness"], o["attention"]) for o in current["occurrences"]] == [("current", "ok")]
+
+    (saved,) = _term_groups(payload, None)
+    assert (saved["status"], saved["pending_count"]) == ("pending", 1)
+    assert sr.group_matches_filter(saved, "pending") and not sr.group_matches_filter(saved, "confirmed")
+    assert [(o["freshness"], o["attention"]) for o in saved["occurrences"]] == [("saved", "pending")]
+    assert saved["saved_count"] == 1
+    assert saved["confirmed_count"] == 0
+    # Still displayed: the group, its count, its distribution and the place itself.
+    assert (saved["surface"], saved["count"], saved["segments"]) == ("椿", 1, [1])
+    assert saved["distribution_text"] == current["distribution_text"] == "Camellya ×1"
+    assert [(o["surface"], o["actual_translation"]) for o in saved["occurrences"]] == [("椿", "Camellya")]
+
+    (stale,) = _term_groups(payload, B2)
+    assert (stale["status"], stale["pending_count"]) == ("pending", 1)
+    assert stale["saved_count"] == 0
+    assert sr.group_matches_filter(stale, "pending") and not sr.group_matches_filter(stale, "confirmed")
+    assert [(o["freshness"], o["attention"]) for o in stale["occurrences"]] == [("stale", "pending")]
+
+
+def test_a_saved_group_is_never_confirmed_even_with_a_confirmed_choice() -> None:
+    """A choice confirmed under a saved result does not settle the place: the choice
+    is recorded, but the basis it was confirmed against is not the live one."""
+    payload, basis = _reviewed_term()
+    terms = {"椿": [_candidate("椿", "Camellya")]}
+    start = sr.parts_of(payload).segments[0]["result"]["findings"][0]["source"][0]
+    payload = sr.with_parts(payload, sr.choose(payload, 0, start, start + 1, sr.NOT_A_TERM, None))
+    payload, basis, applied = check(payload, 0, basis, B1, terms=terms, verdict="verified_constraint")
+    assert applied.outcome == "stored" and statuses(payload)[0] == "done"
+    assert [(c["choice"], c["confirmed"]) for c in sr.parts_of(payload).segments[0]["choices"]] == [
+        (sr.NOT_A_TERM, True)]
+
+    (current,) = _term_groups(payload, B1)
+    assert (current["status"], current["pending_count"]) == ("confirmed", 0)
+    assert [o["attention"] for o in current["occurrences"]] == ["settled"]
+
+    (saved,) = _term_groups(payload, None)
+    # The saved place keeps its confirmed choice and still waits for the check.
+    assert saved["occurrences"][0]["choice_state"] == "confirmed"
+    assert (saved["status"], saved["pending_count"]) == ("pending", 1)
+    assert saved["saved_count"] == 1
+    assert [o["attention"] for o in saved["occurrences"]] == ["pending"]
+    assert sr.group_matches_filter(saved, "pending") and not sr.group_matches_filter(saved, "confirmed")
+
+
+def test_a_saved_conflict_is_still_a_decision_to_make() -> None:
+    """A recorded conflict is not a settled place either, but it is not work for the
+    basis check alone: the group stays 不一致 so the decision is not hidden."""
+    payload, _ = _reviewed_term(verdict="confirmed_conflict")
+    (current,) = _term_groups(payload, B1)
+    assert current["status"] == "inconsistent" and current["pending_count"] == 1
+    (saved,) = _term_groups(payload, None)
+    assert [o["attention"] for o in saved["occurrences"]] == ["conflict"]
+    assert saved["status"] == "inconsistent"
+    assert saved["saved_count"] == 1
+    assert sr.group_matches_filter(saved, "pending") and not sr.group_matches_filter(saved, "confirmed")
+
+
+def test_a_saved_place_the_live_check_never_evaluated_still_waits_for_the_check() -> None:
+    """A saved result whose place was not evaluated (普通词义) is not 未评估 work either:
+    nothing in a saved result is verified, so the check comes first."""
+    payload, _ = _reviewed_term(verdict="not_evaluated", reason="ordinary_word")
+    (current,) = _term_groups(payload, B1)
+    assert (current["status"], current["not_evaluated_count"]) == ("not_evaluated", 1)
+    assert sr.group_matches_filter(current, "not_evaluated")
+    (saved,) = _term_groups(payload, None)
+    assert (saved["status"], saved["pending_count"]) == ("pending", 1)
+    assert saved["saved_count"] == 1
+    assert saved["not_evaluated_count"] == 0 and saved["occurrences"][0]["verdict"] == "not_evaluated"
+    assert saved["occurrences"][0]["verdict_label"] == "未评估（普通词义）"
+    assert sr.group_matches_filter(saved, "pending") and not sr.group_matches_filter(saved, "confirmed")
+
+
+def test_showing_a_saved_result_changes_nothing_in_the_file() -> None:
+    """The saved state is runtime only: grouping reads the records and leaves the v3
+    payload as it was, so reopening a manuscript never clears or rewrites a report."""
+    payload, _ = _reviewed_term()
+    before = manuscript.serialize_workfile(payload)
+    for basis in (None, B1, B2):
+        groups = _term_groups(payload, basis)
+        assert [g["count"] for g in groups] == [len(g["occurrences"]) for g in groups] == [1]
+    assert manuscript.serialize_workfile(payload) == before
+    assert json.loads(before)["format"] == manuscript.WORKFILE_FORMAT_V3
+    assert statuses(payload) == ["done"] * len(pairs_of(payload))
+    assert sr.parts_of(payload).segments[0]["result"] is not None

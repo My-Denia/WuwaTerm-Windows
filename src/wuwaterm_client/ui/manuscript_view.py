@@ -748,6 +748,7 @@ class ManuscriptView(QWidget):
         # relative to that record's source core, and whether it awaits a re-check.
         self._finding_refs: list[tuple[int, int, int]] = []
         self._finding_recheck: list[bool] = []
+        self._finding_saved: list[bool] = []
         self._quiet_row = -1
         self._quiet_ref: tuple[int, int, int] | None = None
         # Term inspector view mode ("grouped" default in long mode, "order" in short)
@@ -2500,6 +2501,14 @@ class ManuscriptView(QWidget):
             basis=basis if self._review_state == "current" else None,
         )
 
+    def _group_status_label(self, group: dict) -> str:
+        """The group header's status word. A saved result's basis is not the live
+        one yet, so a group that waits only for that check names the check
+        rather than a state this session cannot vouch for."""
+        if group.get("saved_count") and group["status"] == "pending":
+            return strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED
+        return strings.MANUSCRIPT_TERM_GROUP_STATUS.get(group["status"], group["status"])
+
     def _refresh_term_lists(self, *, quiet: bool = False, preferred_index: int = -1) -> None:
         report = self._report
         total = len(report["findings"]) if report is not None else 0
@@ -2524,9 +2533,13 @@ class ManuscriptView(QWidget):
                     header_text = strings.MANUSCRIPT_TERM_GROUP_HEADER.format(
                         surface=group["surface"],
                         count=group["count"],
-                        status=strings.MANUSCRIPT_TERM_GROUP_STATUS.get(group["status"], group["status"]),
+                        status=self._group_status_label(group),
                         distribution=group["distribution_text"],
                     )
+                    if group.get("saved_count"):
+                        # The results come from the file, not from this session: the
+                        # header says so and never reads as 已核 before the check.
+                        header_text += "\n" + strings.MANUSCRIPT_TERM_SAVED_NOTE
                     if group["unverified_segments"]:
                         # Places the group does not hold yet: the header says so
                         # rather than counting a manuscript as settled.
@@ -2547,7 +2560,10 @@ class ManuscriptView(QWidget):
                             summary_parts.append(occ["actual_translation"])
                         elif occ["verdict"] != "not_evaluated":
                             summary_parts.append(strings.MANUSCRIPT_TERM_TARGET_MISS)
-                        summary_parts.append(occ["verdict_label"])
+                        summary_parts.append(
+                            strings.MANUSCRIPT_TERM_SAVED_NOTE if occ["freshness"] == "saved"
+                            else occ["verdict_label"]
+                        )
                         if occ["choice"] is not None:
                             summary_parts.append(
                                 strings.MANUSCRIPT_FINDING_CHOSEN
@@ -2658,7 +2674,11 @@ class ManuscriptView(QWidget):
         self.finding_verdict.show()
         self.finding_title.setTextFormat(Qt.TextFormat.PlainText)
         self.finding_title.setText(source.get("text", ""))
-        self.finding_verdict.setText(sr.localized_verdict_label(verdict, reason))
+        # A saved result is not this session's verification: the badge names the
+        # check this place waits for instead of a verdict nothing has confirmed.
+        saved_result = 0 <= index < len(self._finding_saved) and self._finding_saved[index]
+        self.finding_verdict.setText(strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED if saved_result
+                                     else sr.localized_verdict_label(verdict, reason))
         self.finding_verdict.setProperty("verdict", verdict)
         self.finding_verdict.style().unpolish(self.finding_verdict)
         self.finding_verdict.style().polish(self.finding_verdict)
@@ -3058,7 +3078,7 @@ class ManuscriptView(QWidget):
         self._quiet_row = self.findings.currentRow()
         self._quiet_ref = self._finding_record(self._quiet_row)
         self._report = None
-        self._finding_refs, self._finding_recheck = [], []
+        self._finding_refs, self._finding_recheck, self._finding_saved = [], [], []
         self._term_groups_data, self._finding_group_status = [], []
         self.findings.clear()
         self.term_groups.clear()
@@ -3219,9 +3239,11 @@ class ManuscriptView(QWidget):
         return True
 
     def _show_term_report(self, report: dict, *, state: str = "current", refs: list | None = None,
-                          recheck: list | None = None) -> None:
-        """List a report's findings. ``refs`` and ``recheck`` belong to a long
-        manuscript's findings: their records, and whether each awaits a re-check."""
+                          recheck: list | None = None, saved: list | None = None) -> None:
+        """List a report's findings. ``refs``, ``recheck`` and ``saved`` belong to a
+        long manuscript's findings: their records, whether each awaits a re-check,
+        and whether each comes from a saved result whose basis this session has
+        not checked against the live server yet."""
         row = self.findings.currentRow()
         prev_ref = self._finding_record(row) if row >= 0 else self._quiet_ref
         # Rebuilt from the records (after an edit, an action or a segment of a
@@ -3235,6 +3257,7 @@ class ManuscriptView(QWidget):
         self._report = report
         self._finding_refs = list(refs or [])
         self._finding_recheck = list(recheck or [False] * len(report["findings"]))
+        self._finding_saved = list(saved or [False] * len(report["findings"]))
         self._set_review_state(state, request_id=report["request_id"])
         self.findings.blockSignals(True)
         self.findings.clear()
@@ -3246,6 +3269,10 @@ class ManuscriptView(QWidget):
                 finding["verdict"],
                 finding.get("reason") if finding["verdict"] == "not_evaluated" else None,
             )
+            if self._finding_saved[index]:
+                # A saved result is not this session's verification: the row says
+                # that instead of naming a verdict it cannot vouch for.
+                verdict = strings.MANUSCRIPT_TERM_SAVED_NOTE
             second_line = f"{target_text} · {verdict}" if target_text else verdict
             choice = self._choice_at(index)
             if choice is not None:
@@ -3297,7 +3324,7 @@ class ManuscriptView(QWidget):
             return
         payload = self._payload
         source, target, basis = payload["source"], payload["target"], self._term_basis
-        findings, refs, recheck = [], [], []
+        findings, refs, recheck, saved_flags = [], [], [], []
         evaluated = not_evaluated = shown = 0
         truncated = False
         for index, record in enumerate(records):
@@ -3310,6 +3337,7 @@ class ManuscriptView(QWidget):
                                  "target_span": _offset(finding["target_span"], record["target_start"])})
                 refs.append((index, finding["source_span"]["start"], finding["source_span"]["end"]))
                 recheck.append(state == "stale")
+                saved_flags.append(state == "saved")
             evaluated += report["coverage"]["evaluated"]
             not_evaluated += report["coverage"]["not_evaluated"]
             truncated = truncated or report["truncated"]
@@ -3320,7 +3348,7 @@ class ManuscriptView(QWidget):
             "request_id": None, "findings": findings,
             "coverage": {"evaluated": evaluated, "not_evaluated": not_evaluated, "rules": list(sr.COVERAGE_RULES)},
             "truncated": truncated,
-        }, state="saved" if basis is None else "current", refs=refs, recheck=recheck)
+        }, state="saved" if basis is None else "current", refs=refs, recheck=recheck, saved=saved_flags)
 
     def _content_current(self, record: dict) -> bool:
         """The record's result describes the text now at its cores."""

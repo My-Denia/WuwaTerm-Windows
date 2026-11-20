@@ -752,6 +752,10 @@ MANUSCRIPT_TERM_GROUP_STATUS = {
     "not_evaluated": "未评估",
     "confirmed": "已核",
 }
+# A saved result was computed under a basis this session has not checked against
+# the live server yet, so no label may read as verified (已核) before that check.
+MANUSCRIPT_TERM_SAVED_NOTE = "已保存，尚未核对当前依据"
+MANUSCRIPT_TERM_GROUP_STATUS_SAVED = "待核对依据"
 MANUSCRIPT_TERM_GROUP_HEADER = "▸ {surface}（{count} 处） · {status}\n   {distribution}"
 MANUSCRIPT_TERM_GROUP_UNVERIFIED = "另有 {count} 段待复核：{segments}"
 MANUSCRIPT_TERM_OCCURRENCE_ROW = "  #{segment} · {summary}\n  原文：{source_context}\n  译文：{target_context}"
