@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.6.1**(2026-11-20 发布,发布日期与资产见下文「发布」一节的发布记录;下载步骤以它为例)。这次维护版修复重开长稿后把没核对过的结果当成已核:重开的 v3/v4 稿件在核对当前服务的审校依据之前,术语分组里每一处都按待处理计,组标题显示「待核对依据」并注明「已保存，尚未核对当前依据」,分组行与按出现顺序的行里原本写「约束已核」的位置改为同一句说明,单处详情的状态徽标改为「待核对依据」,「已核」筛选不再列出它,第一次审校拿到当前依据后恢复「已核」;其中已记录冲突的一处照旧算待决定,组状态仍是「不一致」。稿件格式(`wuwaterm-manuscript-v1` 至 `v4`)与接口合同不变,其余能力与 0.6.0 相同。它有自己的版本号,与服务端的版本号分开走。
+当前版本 **0.6.2**（2026-11-20 发布，发布日期与资产见下文「发布」一节的发布记录；下载步骤以它为例）。这次维护版集中长稿逐段审校状态和任务排程的内部逻辑，让结果显示、术语分组和复核计划使用同一套判定；启用术语审校时，重开稿件会优先取得当前服务的审校依据，再安排后续需要的术语与语义审校。稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。它有自己的版本号，与服务端的版本号分开走。
 
 这个客户端说的是 HTTP 接口的 **`v1`** 版本 —— 也就是 `/v1/*` 这组路径,以及
 `GET /v1/meta` 回复里的 `api_version` 字段。稿件审校还需要服务端支持 `review-v2`;语义审校和翻译
@@ -35,11 +35,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载 `WuwaTerm-0.6.1-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
+1. 下载 `WuwaTerm-0.6.2-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.6.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.6.2-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
@@ -68,7 +68,7 @@ Get-FileHash .\WuwaTerm-0.6.1-windows-x64.zip -Algorithm SHA256
 
 ## 它能做什么
 
-以下为 0.6.1 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
+以下为 0.6.2 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
 
 - 通过共享的「词典优先」流水线翻译文本(`POST /v1/translations`),方向可自动判定,
   也可强制指定。
@@ -530,6 +530,7 @@ gh release view vX.Y.Z --repo My-Denia/WuwaTerm-Windows --json isDraft,targetCom
 
 ### 发布记录
 
+- v0.6.2（2026-11-20）：集中长稿逐段审校状态和任务排程的内部逻辑，让结果显示、术语分组和复核计划使用同一套判定；启用术语审校时优先取得当前服务依据，再按需安排后续术语与语义审校。与固定的 Web 源码共享工作台状态案例，稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.2)，源码提交 `f60e14618b60eacf9841c4b1aca5d3e427fa37a0`（#34），发布 CI 校验的 main push 运行 44747897498，发布构建运行 44759124071。`WuwaTerm-0.6.2-windows-x64.zip` 为 57,296,633 字节，SHA-256 为 `62d3183cd51077d8aa218f07fa516bf3f6255369c9b0e8ac2d83e2263c94dcba`；同次发布包含 `manifest.json` 和 `SHA256SUMS`。公开 ZIP 重新下载后，离屏及 Windows 默认环境 `--self-check` 通过，实际稿件保存、编辑、关闭、重开通过；与固定 Web 提交 `dfa3cf40c2c5ff8e18c6c2de31b9a94a368b5bef` 的 v1–v4 稿件互通和共享状态案例通过。未做 Windows 代码签名。
 - v0.6.1（2026-11-20）：修复重开长稿后把没核对过的结果当成已核——重开的 v3/v4 稿件在核对当前服务的审校依据之前，术语分组把每一处都算作待处理，组标题显示「待核对依据」并注明「已保存，尚未核对当前依据」，分组行与按出现顺序的行里原本写「约束已核」的位置改为同一句说明，单处详情的状态徽标改为「待核对依据」，「已核」筛选不再列出这样的组，第一次审校拿到当前依据后恢复正常；已记录冲突的一处照旧算待决定，组状态仍是「不一致」。稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）与接口合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.1)，源码提交 `4da26ba9f394475432ff0b2890ae24d21f7606b1`，发布 CI 校验的 main push 运行 44674837925，发布构建运行 44676073282。`WuwaTerm-0.6.1-windows-x64.zip` 的 SHA-256 为 `a9a5b16556aae70c574861b8e79c0bff3d8b6f98609be4ba199ebcc9c6fb92c4`。未做 Windows 代码签名；混合 DPI 多屏拖窗没有验收（MY-371）。
 - v0.6.0（2026-11-20）：长稿逐段审校容纳密集结果——每段的发现与选择、整篇的选择、历史报告里的发现与已提交决定，上限从 32 条提到 128 条（单条发现附带的候选仍为 8 个），「未评估」的发现可带结构化原因，超过上限或有原因时按新的 `wuwaterm-manuscript-v4` 保存（复核请求声明 `X-WuwaTerm-Review-Features: dense-128,reason-v1`，Markdown 报告输出本地化的未评估原因行）；审校面板把同一个词的各次出现按词形与候选归集，给出渲染分布与词边界上下文，并按状态筛选；修复编辑器对回车、CRLF 与裸 CR 的拼接，被拒绝的编辑保留光标与滚动位置；未审校的短稿段落在分段列表中误显示为「已审」的问题已修正（恢复显示「待审」）；翻译后无法可靠分段时给出提示与跳转入口。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.0)，源码提交 `eaceb8bbe847f4db14f227dea274261fa2dc5784`，发布 CI 校验的 main push 运行 44584175515，发布构建运行 44586162075。`WuwaTerm-0.6.0-windows-x64.zip` 的 SHA-256 为 `0b46cd1664a12fb4bcc5088c162d775198c0eac0752532e594f0ef98fa30a841`。未做 Windows 代码签名；混合 DPI 多屏拖窗没有验收（MY-371）。
 - v0.5.1（2026-11-17）：修复中文输入法组合态时空白稿件占位文字与预编辑串重叠，并在稿件级撤销、重做后保存并恢复两侧编辑器的光标、选区、焦点与滚动位置（#27）；原生 150% DPI（`AppliedDPI=144`）实时中文 IME 复验已在 owner 设备上完成（候选 ZIP `fecb470e…` / EXE `82dafc61…`：双侧空框预编辑隐藏占位文字无重叠、Escape 恢复；1,911 字长段 `cell16` 处 Undo/Redo 保持视口与光标，重做后紧接物理拼音准确落入下标 694），混合 DPI 多屏拖窗没有验收；[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.5.1)，源码提交 `62a6ae5a3e39ff13d6affad41830f6c17b8527ee`，发布 CI 校验的 main push 运行 44020553485，发布构建运行 44021524321。`WuwaTerm-0.5.1-windows-x64.zip` 的 SHA-256 为 `51b91dd8957535284fe8c60a066a4ff9ca45986a31cba3be73f9e315108788f5`。未做 Windows 代码签名。
