@@ -102,11 +102,6 @@ def _normalize_semantic(payload: dict) -> dict:
     return payload
 
 
-def _core_key(source_core: tuple[int, int], target_core: tuple[int, int], source: str, target: str) -> tuple:
-    (a, b), (c, d) = source_core, target_core
-    return (a, b, c, d, source[a:b], target[c:d])
-
-
 def _blank(text: str) -> bool:
     return all(char in WHITESPACE for char in text)
 
@@ -740,7 +735,7 @@ class ManuscriptView(QWidget):
         self._term_basis: dict | None = None
         # What the records were last normalized against (identity checks only).
         self._records_seen: tuple | None = None
-        self._state_cache: dict = {}
+        self._record_views = sr.RecordViews()
         # The selected segment: written to progress.current only on save, so
         # navigating never makes the manuscript look edited.
         self._segment_cursor: int | None = None
@@ -1506,9 +1501,7 @@ class ManuscriptView(QWidget):
     def _segment_key(self, pair) -> tuple:
         """A pair's identity: where its cores are and what they say. Identical
         paragraphs at different places are different segments."""
-        source, target = self._payload["source"], self._payload["target"]
-        return _core_key((pair.source.core_start, pair.source.core_end),
-                         (pair.target.core_start, pair.target.core_end), source, target)
+        return sr.pair_key(pair, self._payload["source"], self._payload["target"])
 
     # -- long manuscripts: segment records (segment_records) ---------------
     def _long_now(self) -> bool:
@@ -1545,28 +1538,7 @@ class ManuscriptView(QWidget):
         return payload.get("segments") or [] if long else None
 
     def _term_state(self, record: dict) -> str:
-        """current, saved (before the session's first check), stale or pending,
-        by the segment record reuse rule. Cached per record object while the
-        texts, inputs and basis are the same objects: records never change in
-        place, and every status refresh asks for all of them."""
-        if record["result"] is None:
-            return "pending"
-        payload = self._payload
-        key = (payload["source"], payload["target"], payload["alignments"], payload["direction"], self._term_basis)
-        cache = self._state_cache
-        if cache.get("key") is None or any(a is not b for a, b in zip(cache["key"], key)) \
-                or cache["key"][3] != key[3]:
-            cache.clear()
-            cache["key"] = key
-        hit = cache.get(id(record))
-        if hit is not None and hit[0] is record:
-            return hit[1]
-        if self._term_basis is None:
-            state = "saved" if sr.reuse_candidate(record, payload) else "stale"
-        else:
-            state = "current" if sr.is_current(record, payload, self._term_basis) else "stale"
-        cache[id(record)] = (record, state)
-        return state
+        return self._record_views.get(record, self._payload, self._term_basis).state
 
     def _has_results(self) -> bool:
         return bool(self._session.results) or any(r["status"] != "pending" for r in self._payload.get("segments") or ())
@@ -1586,13 +1558,8 @@ class ManuscriptView(QWidget):
                 term = "pending"
         else:
             term = self._term_state(records[pair.index])
-        result = self._session.result_for(pair, self._payload["source"], self._payload["target"])
-        if term == "current" and not self._basis().needs(result):
-            return "reviewed"
         failure = self._segment_failures.get(self._segment_key(pair))
-        if failure is not None:
-            return failure
-        return term if term in ("saved", "stale", "failed") else "pending"
+        return sr.review_status(pair, term, self._payload, self._session, self._basis(), failure)
 
     def _progress(self) -> tuple[int, int] | None:
         pairs = self._cached_pairs()
@@ -2147,13 +2114,7 @@ class ManuscriptView(QWidget):
         """An unconfirmed choice can be confirmed again only against a checked
         result that still reports its occurrence and, for an official pair,
         its candidate (SPEC "Runtime" step 7)."""
-        if choice["confirmed"] or self._term_basis is None:
-            return False
-        record = self._payload["segments"][index]
-        span = choice["source_span"]
-        finding = next((f for f in (record["result"] or {}).get("findings", ())
-                        if f["source"] == [span["start"], span["end"]]), None)
-        return finding is not None and (choice["choice"] == sr.NOT_A_TERM or choice["candidate"] in finding["candidates"])
+        return sr.choice_reconfirmable(self._payload["segments"][index], choice, self._term_basis)
 
     def _update_segment_actions(self) -> None:
         pair = self._current_segment()
@@ -3328,8 +3289,9 @@ class ManuscriptView(QWidget):
         evaluated = not_evaluated = shown = 0
         truncated = False
         for index, record in enumerate(records):
-            state = self._term_state(record) if record["result"] is not None else "pending"
-            if state == "pending" or not self._content_current(record):
+            view = self._record_views.get(record, payload, basis)
+            state = view.state
+            if not view.content_current:
                 continue
             report = sr.expand_result(record, source, target)
             for finding in report["findings"]:
@@ -3349,13 +3311,6 @@ class ManuscriptView(QWidget):
             "coverage": {"evaluated": evaluated, "not_evaluated": not_evaluated, "rules": list(sr.COVERAGE_RULES)},
             "truncated": truncated,
         }, state="saved" if basis is None else "current", refs=refs, recheck=recheck, saved=saved_flags)
-
-    def _content_current(self, record: dict) -> bool:
-        """The record's result describes the text now at its cores."""
-        source, target = self._payload["source"], self._payload["target"]
-        return (record["direction"] == self._payload["direction"]
-                and sr.content_hash(source[record["source_start"]:record["source_end"]]) == record["source_hash"]
-                and sr.content_hash(target[record["target_start"]:record["target_end"]]) == record["target_hash"])
 
     def _task_finished(self, task: asyncio.Task, generation: int) -> None:
         if generation != self._generation:
@@ -3423,25 +3378,11 @@ class ManuscriptView(QWidget):
             self._refresh_segments()
         self._update_controls()
 
-    def _next_pair(self, attempted: set) -> object | None:
-        """The next pair that needs a term check or a semantic request.
-
-        Long manuscripts: while the session has no term basis, the probe of
-        ``segment_records.next_index`` (SPEC step 4) goes first. Otherwise
-        pairs go in order."""
-        source, target = self._payload["source"], self._payload["target"]
+    def _next_review(self, attempted: set) -> sr.NextReview | None:
         pairs = self._current_pairs()
-        skip = {i for i, pair in enumerate(pairs) if self._segment_key(pair) in attempted}
-        term = None
-        if self._term_mode == "segments" and self._records() is not None:
-            term = sr.next_index(self._payload, pairs, self._term_basis, skip)
-            if self._term_basis is None and term is not None:
-                return pairs[term]
-        basis = self._basis()
-        semantic_index = next((i for i, pair in enumerate(pairs) if i not in skip and pair.status == STATUS_READY
-                               and basis.needs(self._session.result_for(pair, source, target))), None)
-        found = [i for i in (term, semantic_index) if i is not None]
-        return pairs[min(found)] if found else None
+        terms = self._term_mode == "segments" and self._records() is not None
+        return sr.next_review(self._payload, pairs, self._term_basis, self._session, self._basis(),
+                              terms=terms, attempted=attempted, views=self._record_views)
 
     def _basis(self) -> sessions.Basis:
         """The current basis of the semantic reuse rule (``sessions.Basis``)."""
@@ -3538,9 +3479,10 @@ class ManuscriptView(QWidget):
             # Segments that need no request still show their term results.
             self._show_segment_term_report()
         while generation == self._semantic_generation:
-            pair = self._next_pair(attempted)
-            if pair is None:
+            next_review = self._next_review(attempted)
+            if next_review is None:
                 break
+            pair = self._current_pairs()[next_review.index]
             source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
             key = self._segment_key(pair)
             attempted.add(key)
@@ -3548,10 +3490,7 @@ class ManuscriptView(QWidget):
                 # The final pre-send assertion: never send an oversized pair.
                 self._segment_failures[key] = "needs_manual_split"
                 continue
-            records = self._records() if self._term_mode == "segments" else None
-            need_term = records is not None and (
-                self._term_basis is None or sr.needs_check(records[pair.index], self._payload, self._term_basis))
-            need_semantic = self._basis().needs(self._session.result_for(pair, source, target))
+            need_term, need_semantic = next_review.term, next_review.semantic
             self._session.pending = sessions.SegmentResult(
                 sent_source=key[4], sent_target=key[5],
                 source_core=(pair.source.core_start, pair.source.core_end),
