@@ -1706,3 +1706,210 @@ def test_replacing_one_occurrence_never_leaves_a_header_claiming_the_term_is_set
     finally:
         view.close()
         asyncio.run(client.aclose())
+
+
+# ---- P2 #2: a reopened saved manuscript's term results are not 已核 ----
+
+def _one_place_term_manuscript() -> tuple[str, str]:
+    """A long manuscript whose 椿 appears exactly once, so its group has one place."""
+    return ("庭院深处，椿静静注视着枝头。" + "今汐在城楼远望。" * 300,
+            "Deep in the courtyard, Camellya quietly watched the branch. " + "Jinhsi looked afar. " * 300)
+
+
+def _one_place_term_handler(candidate: dict, *, verdict: str, matcher: dict,
+                            reason: str | None = None):
+    """Core stand-in: one finding for 椿 -> Camellya at the matcher revision in ``matcher``."""
+    def handler(request):
+        body = json.loads(request.content)
+        s_core, t_core = body["source"], body["target"]
+        findings = []
+        if "椿" in s_core and "Camellya" in t_core:
+            start, at = s_core.index("椿"), t_core.index("Camellya")
+            finding = {"id": f"{start}:{start + 1}:椿", "rule_id": "review.term_pair", "verdict": verdict,
+                       "source_span": {"start": start, "end": start + 1, "text": "椿"},
+                       "target_span": {"start": at, "end": at + len("Camellya"), "text": "Camellya"},
+                       "candidates": [candidate], "candidates_truncated": False}
+            if reason is not None:
+                finding["reason"] = reason
+            findings.append(finding)
+        report = _segment_report(s_core, t_core, findings)
+        report["matcher_revision"] = matcher["value"]
+        return httpx.Response(200, json=report)
+    return handler
+
+
+def _term_rows(view) -> tuple[list[str], list[str]]:
+    rows = [view.term_groups.item(r).text() for r in range(view.term_groups.count())]
+    return [row for row in rows if row.startswith("▸")], [row for row in rows if row.startswith("  #")]
+
+
+def _run_review(view) -> None:
+    async def run():
+        view._start_review()
+        for _ in range(400):
+            tasks = [t for t in (view._task, view._semantic_task) if t is not None and not t.done()]
+            if not tasks:
+                await asyncio.sleep(0)
+                break
+            await asyncio.wait(tasks)
+    asyncio.run(run())
+
+
+def _reopen_saved(view, tmp_path: Path, name: str) -> None:
+    """Write the workbench out and open it again: a new session without a basis."""
+    path = tmp_path / name
+    save_workfile(path, view._payload)
+    view._saved_payload = copy.deepcopy(view._payload)
+    assert view.open_path(path)
+    assert view._saved_payload == view._payload
+
+
+def test_a_reopened_saved_manuscript_shows_its_terms_as_pending_not_confirmed(qapp, tmp_path) -> None:
+    """P2 #2: a saved v3/v4 result is still listed — 按术语分组 and 按出现顺序, with its
+    translation — but never as 已核 before the session checks the live basis; its
+    places are 待处理 work and a later basis makes them 待复核, not 已核."""
+    from wuwaterm_client import strings
+    from wuwaterm_client.ui.manuscript_view import TRACK_TERMS
+
+    candidate = {"candidate_id": "1" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}
+    source, target = _one_place_term_manuscript()
+    matcher = {"value": "a" * 64}
+    handler = _one_place_term_handler(candidate, verdict="verified_constraint", matcher=matcher)
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        # 1) Checked basis: the place is verified and the header may say 已核.
+        assert view._term_basis is not None
+        headers, places = _term_rows(view)
+        assert len(headers) == 1 and len(places) == 1
+        assert "已核" in headers[0] and "Camellya ×1" in headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in headers[0]
+        assert "约束已核" in places[0]
+
+        # 2) Reopened before any check: saved results, listed, and never 已核.
+        _reopen_saved(view, tmp_path, "saved-terms.json")
+        assert view._term_basis is None
+        qapp.processEvents()
+        group = view._term_groups_data[0]
+        assert (group["status"], group["pending_count"]) == ("pending", 1)
+        assert group["distribution_text"] == "Camellya ×1"
+        headers, places = _term_rows(view)
+        assert len(headers) == 1 and len(places) == 1, headers + places
+        assert group["saved_count"] == 1
+        assert "椿（1 处）" in headers[0] and "Camellya ×1" in headers[0]
+        assert strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE in headers[0], headers[0]
+        assert "已核" not in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE in places[0], places[0]
+        assert "约束已核" not in places[0], places[0]
+
+        # The 已核 filter cannot reach it; 待处理 must, or the places would vanish.
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("confirmed"))
+        qapp.processEvents()
+        assert view.term_groups.count() == 0
+        assert view.finding_title.text() == strings.MANUSCRIPT_TERM_FILTER_EMPTY
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("pending"))
+        qapp.processEvents()
+        headers, places = _term_rows(view)
+        assert len(headers) == 1 and len(places) == 1, headers + places
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE in headers[0]
+
+        # 按出现顺序: the row names the saved state instead of a verdict it cannot vouch for.
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
+        qapp.processEvents()
+        view.term_view_combo.setCurrentIndex(view.term_view_combo.findData("order"))
+        qapp.processEvents()
+        assert view.findings.isVisible() and not view.term_groups.isVisible()
+        row_text = view.findings.item(0).text()
+        assert "Camellya" in row_text and strings.MANUSCRIPT_TERM_SAVED_NOTE in row_text, row_text
+        assert "约束已核" not in row_text, row_text
+        # The occurrence detail names the check, not 约束已核.
+        assert view.finding_verdict.text() == strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED
+
+        # 3) The live check restores 已核: the same place, now verified.
+        _run_review(view)
+        qapp.processEvents()
+        assert view._term_basis is not None
+        headers, places = _term_rows(view)
+        assert "已核" in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in headers[0]
+        row_text = view.findings.item(0).text()
+        assert "约束已核" in row_text and strings.MANUSCRIPT_TERM_SAVED_NOTE not in row_text
+        assert view.finding_verdict.text() == strings.MANUSCRIPT_VERDICT_VERIFIED
+
+        # 4) A basis the records were not computed under: 待复核, still not 已核.
+        view._term_basis = {**view._term_basis, "matcher_revision": "e" * 64}
+        view._show_segment_term_report()
+        qapp.processEvents()
+        assert [g["status"] for g in view._term_groups_data] == ["pending"]
+        headers, places = _term_rows(view)
+        assert "已核" not in headers[0] and "待处理" in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in headers[0]
+        assert strings.MANUSCRIPT_FINDING_RECHECK in places[0] and "约束已核" in places[0], places[0]
+        # The same place in order view carries 待复核 next to the saved verdict.
+        row_text = view.findings.item(0).text()
+        assert strings.MANUSCRIPT_FINDING_RECHECK in row_text, row_text
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in row_text, row_text
+    finally:
+        view.close()
+        asyncio.run(client.aclose())
+
+
+def test_a_saved_not_a_term_choice_is_recorded_but_never_已核_before_the_check(qapp, tmp_path) -> None:
+    """A confirmed 不是术语 choice settles the place only under a checked basis.
+    Reopened, the place keeps its choice and reads 待核对依据, not 已核."""
+    from wuwaterm_client import strings
+
+    candidate = {"candidate_id": "1" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}
+    source, target = _one_place_term_manuscript()
+    matcher = {"value": "a" * 64}
+    handler = _one_place_term_handler(candidate, verdict="not_evaluated", matcher=matcher,
+                                      reason="not_a_term")
+    client, view = _long_term_workbench(qapp, source, target, handler)
+    try:
+        assert [g["status"] for g in view._term_groups_data] == ["not_evaluated"]
+        view.term_view_combo.setCurrentIndex(view.term_view_combo.findData("order"))
+        qapp.processEvents()
+        assert view.findings.currentRow() == 0
+
+        # Record 不是术语 and let the next check confirm it against the live basis.
+        view.choice_combo.setCurrentIndex(view.choice_combo.findText(strings.MANUSCRIPT_CHOICE_NOT_TERM))
+        view.choice_button.click()
+        qapp.processEvents()
+        _run_review(view)
+        qapp.processEvents()
+        record = view._payload["segments"][0]
+        assert [(c["choice"], c["confirmed"]) for c in record["choices"]] == [("not_a_term", True)]
+        assert record["status"] == "done"
+        assert [g["status"] for g in view._term_groups_data] == ["confirmed"]
+        view.term_view_combo.setCurrentIndex(view.term_view_combo.findData("grouped"))
+        qapp.processEvents()
+        headers, places = _term_rows(view)
+        assert "已核" in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in headers[0] and places
+        assert strings.MANUSCRIPT_FINDING_CHOSEN in places[0], places[0]
+        assert "未评估（已标记为非术语）" in places[0], places[0]
+
+        # Reopened: the saved result keeps its recorded decision and is not 已核.
+        _reopen_saved(view, tmp_path, "saved-not-a-term.json")
+        qapp.processEvents()
+        group = view._term_groups_data[0]
+        assert (group["status"], group["pending_count"]) == ("pending", 1)
+        assert group["occurrences"][0]["choice_state"] == "confirmed"
+        headers, places = _term_rows(view)
+        assert strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED in headers[0], headers[0]
+        assert group["saved_count"] == 1
+        assert "已核" not in headers[0], headers[0]
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE in places[0], places[0]
+        assert strings.MANUSCRIPT_FINDING_CHOSEN in places[0], places[0]
+        assert "约束已核" not in places[0], places[0]
+
+        view.term_view_combo.setCurrentIndex(view.term_view_combo.findData("order"))
+        qapp.processEvents()
+        row_text = view.findings.item(0).text()
+        assert strings.MANUSCRIPT_TERM_SAVED_NOTE in row_text, row_text
+        assert "未评估（已标记为非术语）" not in row_text, row_text
+        assert "已记录选择" in row_text, row_text
+        assert view.finding_verdict.text() == strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED
+    finally:
+        view.close()
+        asyncio.run(client.aclose())
