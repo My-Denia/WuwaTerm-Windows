@@ -71,6 +71,7 @@ from . import manuscript, strings
 from .manuscript import (ALIGNMENT_AUTOMATIC, MAX_CORE_SCALARS, MAX_SEGMENT_CHOICE_HISTORY, MAX_SEGMENTS,
                          MAX_V4_CHOICES, SEGMENTATION_VERSION, WorkfileError)
 from .segmentation import STATUS_READY, _sentence_pieces, pair_is_sendable
+from . import semantic_session as sessions
 from .semantic_session import _shift
 
 LONG_MODE_SCALARS = 2000  # long mode: either side has more scalars than this
@@ -378,24 +379,103 @@ def _set_choice(parts: Parts, index: int, place: tuple[int, int], new: dict | No
 
 # ---- reuse and planning (SPEC "Runtime" steps 3 to 5) ----
 
+def content_current(record: Mapping, payload: Mapping[str, Any]) -> bool:
+    """Whether a result describes the current text and direction at its cores."""
+    source, target = payload["source"], payload["target"]
+    (a, b), (c, d) = _cores(record)
+    return (record["direction"] == payload["direction"]
+            and 0 <= a <= b <= len(source) and 0 <= c <= d <= len(target)
+            and content_hash(source[a:b]) == record["source_hash"]
+            and content_hash(target[c:d]) == record["target_hash"])
+
+
 def reuse_candidate(record: Mapping, payload: Mapping[str, Any]) -> bool:
     """Rule items 1 to 3 (step 3), recomputed from the current text."""
-    if record["status"] != "done" or record["direction"] != payload["direction"]:
-        return False
-    (a, b), (c, d) = _cores(record)
-    return (content_hash(payload["source"][a:b]) == record["source_hash"]
-            and content_hash(payload["target"][c:d]) == record["target_hash"]
+    return (record["status"] == "done" and content_current(record, payload)
             and _input_now(record, payload) == record["alignment_input"])
+
+
+@dataclass(frozen=True)
+class RecordView:
+    """A result's freshness and whether it can be displayed or needs a check."""
+
+    state: str  # pending, saved, current, stale
+    content_current: bool
+
+    @property
+    def needs_check(self) -> bool:
+        return self.state in ("pending", "stale")
+
+
+def record_view(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> RecordView:
+    """Derive the same freshness for display, grouping and review planning."""
+    if record["result"] is None:
+        return RecordView("pending", False)
+    content = content_current(record, payload)
+    if (record["status"] != "done" or not content
+            or _input_now(record, payload) != record["alignment_input"]):
+        return RecordView("stale", content)
+    if basis is None:
+        return RecordView("saved", content)
+    return RecordView("current" if same_basis(record["basis"], basis) else "stale", content)
+
+
+class RecordViews:
+    """Cache derived views while immutable records and their inputs are unchanged."""
+
+    def __init__(self) -> None:
+        self._key: tuple | None = None
+        self._views: dict[int, tuple[Mapping, RecordView]] = {}
+
+    def get(self, record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> RecordView:
+        key = (payload["source"], payload["target"], payload["alignments"], payload["direction"], basis)
+        if (self._key is None or any(a is not b for a, b in zip(self._key, key))
+                or self._key[3] != key[3]):
+            self._key = key
+            self._views.clear()
+        hit = self._views.get(id(record))
+        if hit is None or hit[0] is not record:
+            hit = record, record_view(record, payload, basis)
+            self._views[id(record)] = hit
+        return hit[1]
 
 
 def is_current(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> bool:
     """The whole reuse rule (step 5); never while the session has no basis."""
-    return same_basis(record["basis"], basis) and reuse_candidate(record, payload)
+    return record_view(record, payload, basis).state == "current"
 
 
 def needs_check(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> bool:
     """Without a basis yet: not a reuse candidate. With one: not current."""
-    return not (is_current(record, payload, basis) if basis is not None else reuse_candidate(record, payload))
+    return record_view(record, payload, basis).needs_check
+
+
+@dataclass(frozen=True)
+class TermPlan:
+    due: tuple[int, ...]
+    probe: int | None
+    order: tuple[int, ...]
+
+
+def term_plan(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None,
+              skip: Collection[int] = (), views: RecordViews | None = None) -> TermPlan:
+    """Plan sendable term checks and the single first live-basis probe."""
+    parts = parts_of(payload)
+    if len(parts.segments) != len(pairs) or any(
+            _cores(r) != ((p.source.core_start, p.source.core_end), (p.target.core_start, p.target.core_end))
+            for r, p in zip(parts.segments, pairs, strict=True)):
+        raise ValueError("normalize the parts to the current pairing first")
+    source, target = payload["source"], payload["target"]
+    views = views if views is not None else RecordViews()
+    ready = [i for i, pair in enumerate(pairs) if i not in skip and pair_is_sendable(pair, source, target)]
+    due = tuple(i for i in ready if views.get(parts.segments[i], payload, basis).needs_check)
+    probe = None
+    if basis is None and ready:
+        current = parts.progress["current"]
+        probe = (current if current in due else due[0] if due
+                 else current if current in ready else ready[0])
+    order = due if probe is None else (probe, *(i for i in due if i != probe))
+    return TermPlan(due, probe, order)
 
 
 def next_index(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None,
@@ -406,30 +486,67 @@ def next_index(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | Non
     the probe): the segment at ``progress.current`` if it needs a check, else
     the first that does, else ``progress.current`` or the first sendable
     segment, because the probe must still supply the basis."""
-    parts = parts_of(payload)
-    # Text typed right at a core's end leaves the record's range as it was, so
-    # only equal ranges show that the records follow the current pairing.
-    if len(parts.segments) != len(pairs) or any(
-            _cores(r) != ((p.source.core_start, p.source.core_end), (p.target.core_start, p.target.core_end))
-            for r, p in zip(parts.segments, pairs, strict=True)):
-        raise ValueError("normalize the parts to the current pairing first")
+    plan = term_plan(payload, pairs, basis, skip)
+    return plan.order[0] if plan.order else None
+
+
+def pair_key(pair: Any, source: str, target: str) -> tuple:
+    """Occurrence and text version, distinguishing identical paragraphs."""
+    a, b = pair.source.core_start, pair.source.core_end
+    c, d = pair.target.core_start, pair.target.core_end
+    return a, b, c, d, source[a:b], target[c:d]
+
+
+@dataclass(frozen=True)
+class NextReview:
+    index: int
+    term: bool
+    semantic: bool
+
+
+def next_review(payload: Mapping[str, Any], pairs: Sequence, term_basis: Mapping | None,
+                session: sessions.Session, semantic_basis: sessions.Basis, *, terms: bool,
+                attempted: Collection[tuple] = (), views: RecordViews | None = None) -> NextReview | None:
+    """Combine term and semantic work, giving the first term-basis probe priority."""
     source, target = payload["source"], payload["target"]
+    skip = {i for i, pair in enumerate(pairs) if pair_key(pair, source, target) in attempted}
+    views = views if views is not None else RecordViews()
+    plan = term_plan(payload, pairs, term_basis, skip, views) if terms else None
+    term = plan.order[0] if plan and plan.order else None
+    if plan is not None and plan.probe is not None:
+        index = plan.probe
+    else:
+        semantic = next((i for i, pair in enumerate(pairs) if i not in skip and pair.status == STATUS_READY
+                         and semantic_basis.needs(session.result_for(pair, source, target))), None)
+        indexes = [i for i in (term, semantic) if i is not None]
+        if not indexes:
+            return None
+        index = min(indexes)
+    need_term = terms and (term_basis is None or views.get(parts_of(payload).segments[index], payload, term_basis).needs_check)
+    need_semantic = semantic_basis.needs(session.result_for(pairs[index], source, target))
+    return NextReview(index, need_term, need_semantic)
 
-    def sendable(i: int) -> bool:
-        return i not in skip and pair_is_sendable(pairs[i], source, target)
 
-    def needing(i: int) -> bool:
-        return sendable(i) and needs_check(parts.segments[i], payload, basis)
+def review_status(pair: Any, term: str, payload: Mapping[str, Any], session: sessions.Session,
+                  semantic_basis: sessions.Basis, failure: str | None) -> str:
+    """Combine term, semantic and failure state for one segment."""
+    if pair.status != STATUS_READY:
+        return pair.status
+    result = session.result_for(pair, payload["source"], payload["target"])
+    if term == "current" and not semantic_basis.needs(result):
+        return "reviewed"
+    if failure is not None:
+        return failure
+    return term if term in ("saved", "stale", "failed") else "pending"
 
-    current = parts.progress["current"]
-    if basis is None and current is not None and needing(current):
-        return current
-    first = next((i for i in range(len(pairs)) if needing(i)), None)
-    if first is not None or basis is not None:
-        return first
-    if current is not None and sendable(current):
-        return current
-    return next((i for i in range(len(pairs)) if sendable(i)), None)
+
+def choice_reconfirmable(record: Mapping, choice: Mapping, basis: Mapping | None) -> bool:
+    """An unconfirmed choice can be renewed only against a matching finding."""
+    if choice["confirmed"] or basis is None:
+        return False
+    span = choice["source_span"]
+    finding = _finding_at(record["result"], span["start"], span["end"])
+    return finding is not None and (choice["choice"] == NOT_A_TERM or choice["candidate"] in finding["candidates"])
 
 
 @dataclass(frozen=True)
@@ -1121,21 +1238,9 @@ def _record_freshness(
 ) -> str | None:
     """``current``, ``saved`` or ``stale`` when the record's content hashes and
     direction match the current cores; ``None`` when pending or content-diverged."""
-    if record["status"] == "pending" or record["result"] is None or record["direction"] != direction:
-        return None
-    (a, b), (c, d) = _cores(record)
-    if not (0 <= a <= b <= len(source) and 0 <= c <= d <= len(target)):
-        return None
-    if (content_hash(source[a:b]) != record["source_hash"]
-            or content_hash(target[c:d]) != record["target_hash"]):
-        return None
-    if record["status"] != "done":
-        return "stale"
-    if alignment_input(alignments, source, target, (a, b), (c, d)) != record["alignment_input"]:
-        return "stale"
-    if basis is None:
-        return "saved"
-    return "current" if same_basis(record["basis"], basis) else "stale"
+    view = record_view(record, {"source": source, "target": target, "direction": direction,
+                                "alignments": alignments}, basis)
+    return view.state if view.content_current else None
 
 
 def _canonical_group_surface(surfaces: Sequence[str], candidates: Sequence[Mapping]) -> str:

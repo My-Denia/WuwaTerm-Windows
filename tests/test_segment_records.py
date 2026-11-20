@@ -14,6 +14,7 @@ import pytest
 
 from wuwaterm_client import manuscript
 from wuwaterm_client import segment_records as sr
+from wuwaterm_client import semantic_session as sessions
 from wuwaterm_client.segmentation import pair_segments
 
 NOT_CURRENT_INPUTS = ("valid-v3-hash-not-current.json", "valid-v3-inputs-not-current.json",
@@ -100,6 +101,44 @@ def test_fixture_reuse_candidates_and_reopening(contract_source) -> None:
         else:
             assert parts == sr.parts_of(value), name
     assert not_candidates <= seen
+
+
+def test_shared_workbench_cases_drive_the_domain_state_and_plan(contract_source) -> None:
+    folder = contract_source("web") / "contracts" / "workbench-state"
+    suite = json.loads((folder / "cases.json").read_text(encoding="utf-8"))
+    assert suite["schema"] == "wuwaterm-workbench-state-cases-v1"
+    assert len(suite["cases"]) == 6
+    original = manuscript.parse_workfile((folder / suite["manuscript"]).read_text(encoding="utf-8"))
+    matching = original["segments"][suite["basis_record"]]["basis"]
+    views = sr.RecordViews()
+
+    for case in suite["cases"]:
+        payload = original
+        edit = case.get("edit")
+        if edit:
+            payload = dict(original)
+            if "side" in edit:
+                side = edit["side"]
+                before = original[side]
+                assert edit["find"] in before, case["id"]
+                start = before.index(edit["find"])
+                payload[side] = before[:start] + edit["replace"] + before[start + len(edit["find"]):]
+                parts = sr.apply_edit(sr.parts_of(original), before, side, start,
+                                      start + len(edit["find"]), len(edit["replace"]))
+                payload = sr.with_parts(payload, parts)
+            else:
+                payload.update(edit)
+            pairs = pair_segments(payload["source"], payload["target"], 1800, payload["alignments"] or None)
+            payload = sr.with_parts(payload, sr.normalize(payload, pairs))
+        pairs = pair_segments(payload["source"], payload["target"], 1800, payload["alignments"] or None)
+        basis = (None if case["basis"] == "unknown" else matching if case["basis"] == "matching"
+                 else {**matching, "matcher_revision": "a" * 64})
+        derived = [views.get(record, payload, basis) for record in payload["segments"]]
+        plan = sr.term_plan(payload, pairs, basis, views=views)
+        assert [view.state for view in derived] == case["states"], case["id"]
+        assert list(plan.due) == case["due"], case["id"]
+        assert plan.probe == case["probe"], case["id"]
+        assert payload["progress"]["completed"] == case["completed"], case["id"]
 
 
 def test_alignment_input_rule_example() -> None:
@@ -211,6 +250,31 @@ def choose_all(payload: dict, index: int, choices: list[tuple]) -> dict:
 
 def statuses(payload: dict) -> list[str]:
     return [r["status"] for r in sr.parts_of(payload).segments]
+
+
+def test_combined_plan_probes_before_semantics_and_skips_attempted_pairs() -> None:
+    payload, basis = review_all(manuscript_of([500] * 12, {}), B1)
+    payload = sr.with_parts(payload, sr.set_current(sr.parts_of(payload), 2))
+    pairs = pairs_of(payload)
+    session = sessions.Session()
+    semantic_basis = sessions.Basis(semantic_required=True)
+    views = sr.RecordViews()
+
+    # All term results are saved on reopen; position 2 is the one probe,
+    # even though semantic work also starts at position 0.
+    probe = sr.next_review(payload, pairs, None, session, semantic_basis, terms=True, views=views)
+    assert probe == sr.NextReview(2, term=True, semantic=True)
+    # Once the probe matches, the same saved results are current and the
+    # earliest semantic request does not repeat the term request.
+    first = sr.next_review(payload, pairs, basis, session, semantic_basis, terms=True, views=views)
+    assert first == sr.NextReview(0, term=False, semantic=True)
+    attempted = {sr.pair_key(pairs[0], payload["source"], payload["target"])}
+    second = sr.next_review(payload, pairs, basis, session, semantic_basis,
+                            terms=True, attempted=attempted, views=views)
+    assert second == sr.NextReview(1, term=False, semantic=True)
+    attempted.update(sr.pair_key(pair, payload["source"], payload["target"]) for pair in pairs)
+    assert sr.next_review(payload, pairs, basis, session, semantic_basis,
+                          terms=True, attempted=attempted, views=views) is None
 
 
 def test_reopening_costs_one_probe_and_a_matcher_change_makes_done_records_stale() -> None:
