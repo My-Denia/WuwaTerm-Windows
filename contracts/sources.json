@@ -30,10 +30,10 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "dfa3cf40c2c5ff8e18c6c2de31b9a94a368b5bef",
+    "commit": "ba8d01b26e7dd7d0ca3c1e28a61a847d5dc5a131",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
-      "package.json": "d19a46017b13ff20b2d341bb2508a79b792eabd0088d4ee049bbece8ae5272c0",
+      "package.json": "a2d2e27d243c21594777d1fc64f7a7fadd710304e5f021979a791351fc81618b",
       "lib/manuscript.js": "8ea2a3550a60248076d246b3d9e1c961d5054635efe87ed65f9012594f3ed663",
       "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
       "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
