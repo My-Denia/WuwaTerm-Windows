@@ -1,11 +1,13 @@
-"""The workbench's runs, exercised without a widget (``document_controller``).
+"""The workbench's runs and document commands, exercised without a widget.
 
-Pure Python, like the module it tests: no PySide6 and no HTTP. ``FakeClient``
-stands in for ``ApiClient``, and its term and semantic answers are the shapes
+Pure Python, like the modules it tests (``document_controller``,
+``document_edits``): no PySide6 and no HTTP. ``FakeClient`` stands in for
+``ApiClient``, and its term and semantic answers are the shapes
 ``segment_records`` and ``semantic_session`` accept, so the reuse rules, the
-retry/realign steps and the commits are the shipped code. ``StubHost`` is the
-view's side of the protocol: it records what a run asked it to show, and applies
-the one write a run cannot do itself (the target text).
+retry/realign steps, the commits and the editing commands are the shipped
+code. ``StubHost`` is the view's side of the protocol: it records what a run or
+a command asked it to show, and applies the one write a run cannot do itself
+(the target text).
 """
 from __future__ import annotations
 
@@ -16,13 +18,16 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import typing
 
 import pytest
 
 from wuwaterm_client import document_controller as dc
+from wuwaterm_client import document_edits as de
 from wuwaterm_client import segment_records as sr
 from wuwaterm_client import semantic, strings
-from wuwaterm_client.manuscript import empty_workfile
+from wuwaterm_client import semantic_session as sessions
+from wuwaterm_client.manuscript import ReviewReport, empty_workfile
 from wuwaterm_client.segmentation import SEGMENT_LIMIT, segment_text
 from wuwaterm_client.errors import ClientError
 
@@ -184,6 +189,9 @@ class StubHost:
         self.precedents = True
         self.segment = None
         self.refuse_write = False
+        # What the editor would say its view state is; opaque to the controller.
+        self.view = {"side": "target", "source": {}, "target": {}}
+        self.editor_states = 0
 
     def _record(self, name: str) -> None:
         self.calls.append(name)
@@ -208,6 +216,10 @@ class StubHost:
 
     def show_term_report(self, report: dict) -> None:
         self.reports.append(report)
+
+    def editor_state(self) -> dict:
+        self.editor_states += 1
+        return dict(self.view)
 
     def render_review_state(self) -> None:
         self.review_states.append((self.controller.review_state, self.controller.review_detail,
@@ -592,4 +604,361 @@ def test_an_editor_that_cannot_show_the_result_writes_nothing() -> None:
         assert controller.payload["target"] == ""
         assert controller.translate_state == "idle"
         assert host.statuses[-1] == strings.MANUSCRIPT_EDIT_REJECTED
+    asyncio.run(scenario())
+
+
+# -- the typed client boundary ----------------------------------------------
+
+def test_the_client_protocol_names_exactly_the_calls_the_runs_make() -> None:
+    """A run asks for these four things and nothing else, so the protocol must
+    not grow into a second client: a wider one would not be ``ApiClient``."""
+    declared = {name for name in dir(dc.WorkbenchApiClient) if not name.startswith("_")}
+    assert declared == {"get_capabilities", "review_pair", "semantic_review", "translate"}
+
+
+def test_the_workbench_accepts_a_client_and_a_host_that_conform() -> None:
+    """Structural, as the protocol is: the stand-ins here are what the runs use."""
+    assert isinstance(FakeClient(), dc.WorkbenchApiClient)
+    assert isinstance(StubHost(), dc.WorkbenchHost)
+    assert not isinstance(object(), dc.WorkbenchApiClient)
+
+
+def test_the_controller_takes_the_typed_client_not_any() -> None:
+    hints = typing.get_type_hints(dc.DocumentRunController.__init__)
+    assert hints["api_client"] is dc.WorkbenchApiClient
+    assert hints["host"] is dc.WorkbenchHost
+
+
+def test_the_client_calls_name_the_wire_shapes_they_answer_with() -> None:
+    """The types are documentation of the boundary; the checks stay runtime."""
+    hints = typing.get_type_hints(dc.WorkbenchApiClient.review_pair)
+    assert hints["return"] is ReviewReport
+    assert typing.get_type_hints(dc.WorkbenchApiClient.semantic_review)["return"] is semantic.SemanticReviewReport
+    assert typing.get_type_hints(dc.WorkbenchApiClient.translate)["return"] is dc.TranslationResponse
+    # The same shapes annotate the commits, so the boundary is typed end to end.
+    assert typing.get_type_hints(dc.DocumentRunController.store_semantic)["report"] is semantic.SemanticReviewReport
+    assert typing.get_type_hints(dc.WorkbenchHost.show_term_report)["report"] is ReviewReport
+
+
+def test_the_output_types_do_not_replace_runtime_validation() -> None:
+    """An annotation accepts anything; the validators still refuse a body that
+    is not this service's answer for the exact text that was sent."""
+    from wuwaterm_client.manuscript import valid_report
+    source, target = "Jinhsi 椿", "今汐"
+    start = source.index(TERM)
+    good = {"request_id": "req", "source_revision": sr.content_hash(source),
+            "target_revision": sr.content_hash(target), "rule_version": "review-v2",
+            "matcher_revision": "2" * 64,
+            "dictionary": {"schema_version": "s", "source_commit": "c", "term_count": 0, "revision": "1" * 64},
+            "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": []},
+            "findings": [{"id": f"{start}:{start + len(TERM)}:{TERM}", "rule_id": "review.term_pair",
+                          "verdict": "needs_review",
+                          "source_span": {"start": start, "end": start + len(TERM), "text": TERM},
+                          "target_span": None, "candidates_truncated": False,
+                          "candidates": [{**CANDIDATE, "sources": []}]}],
+            "truncated": False}
+    assert valid_report(good, source, target, v4=True)
+    # Same type, wrong facts: the whole point of the runtime check.
+    wrong_span = {**good, "findings": [{**good["findings"][0],
+                                       "target_span": {"start": 0, "end": 1, "text": "x"}}]}
+    assert not valid_report(wrong_span, source, target, v4=True)
+    assert not valid_report({key: value for key, value in good.items() if key != "request_id"},
+                            source, target, v4=True)
+    answer = semantic_report(source, target)
+    assert semantic.valid_semantic_report(answer, source, target)
+    assert not semantic.valid_semantic_report(answer, source + "x", target)
+
+
+# -- the command module is the desktop-free half ---------------------------
+
+def test_the_command_module_takes_no_desktop_dependency() -> None:
+    module = importlib.import_module("wuwaterm_client.document_edits")
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    for forbidden in ("PySide6", "QtCore", "QtWidgets", "import httpx", "from .api import", "keyring"):
+        assert forbidden not in source, f"{forbidden} leaked into the command module"
+
+
+def test_importing_the_commands_loads_no_desktop_or_http_module() -> None:
+    program = (
+        "import sys\n"
+        "import wuwaterm_client.document_edits\n"
+        "loaded = {name.split('.')[0] for name in sys.modules}\n"
+        "raise SystemExit(1 if loaded & {'PySide6', 'httpx', 'keyring'} else 0)\n"
+    )
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    completed = subprocess.run([sys.executable, "-c", program],
+                               env={**os.environ, "PYTHONPATH": src + os.pathsep + os.environ.get("PYTHONPATH", "")},
+                               capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stderr
+
+
+# -- document edits and the undo history -----------------------------------
+
+def test_an_edit_commits_as_one_step_and_undo_and_redo_restore_it_with_the_view() -> None:
+    controller, client, host = make(FakeClient(capabilities=()), document_draft())
+    host.view = {"side": "target", "source": {"row": 1}, "target": {"row": 2}}
+
+    value = controller.draft_snapshot()
+    value["target"] = "今汐 "
+    outcome = controller.apply_edit(value, edits=[("target", 2, 2, 1)])
+
+    assert outcome.committed and outcome.review_inputs_changed
+    assert controller.payload["target"] == "今汐 "
+    assert controller.can_undo() and not controller.can_redo()
+    assert controller.document_revision == 1
+    assert controller.history.undo[-1].view == host.view, "the step keeps the host's own view state"
+
+    host.view = {"side": "source", "source": {"row": 9}, "target": {"row": 9}}
+    undone = controller.undo()
+
+    assert undone.entry.view == {"side": "target", "source": {"row": 1}, "target": {"row": 2}}
+    assert controller.payload["target"] == "今汐"
+    assert controller.can_undo() is False and controller.can_redo()
+    # Redo records where the owner is now, not where the undone step was.
+    redone = controller.redo()
+    assert redone is not None and controller.payload["target"] == "今汐 "
+    assert controller.history.undo[-1].view == {"side": "source", "source": {"row": 9}, "target": {"row": 9}}
+
+
+def test_an_unchanged_draft_is_not_a_step() -> None:
+    controller, _client, _host = make(FakeClient(capabilities=()), document_draft())
+
+    outcome = controller.apply_edit(controller.draft_snapshot())
+
+    assert not outcome.committed and not controller.can_undo()
+    assert controller.document_revision == 0
+
+
+def test_a_direction_change_drops_the_other_directions_results() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        assert controller.session.results
+        value = controller.draft_snapshot()
+        value["direction"] = "zh"
+
+        outcome = controller.apply_edit(value)
+
+        assert outcome.committed and outcome.semantic_cleared
+        assert controller.session.results == [], "results belong to one direction"
+    asyncio.run(scenario())
+
+
+def test_a_new_document_clears_the_history() -> None:
+    controller, _client, _host = make(FakeClient(capabilities=()), document_draft())
+    value = controller.draft_snapshot()
+    value["target"] = "别的"
+    controller.apply_edit(value)
+    assert controller.can_undo()
+
+    controller.clear_history()
+
+    assert not controller.can_undo() and not controller.can_redo()
+
+
+# -- term choices -----------------------------------------------------------
+
+async def term_scene() -> tuple[dc.DocumentRunController, FakeClient, StubHost]:
+    """A long manuscript whose first segment has one term finding, reviewed."""
+    return await long_run(FakeClient(), manuscript(words={0: TERM}))
+
+
+def first_finding(controller: dc.DocumentRunController) -> tuple[int, int, int]:
+    record = controller.payload["segments"][0]
+    finding = record["result"]["findings"][0]
+    return (0, *finding["source"])
+
+
+def choices(controller: dc.DocumentRunController) -> list:
+    return controller.payload["segments"][0]["choices"]
+
+
+def test_choosing_an_official_term_is_a_command_with_an_undo_step() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await term_scene()
+        index, start, end = first_finding(controller)
+
+        outcome = controller.choose_term(index, start, end, sr.OFFICIAL_PAIR, CANDIDATE["candidate_id"])
+
+        assert outcome.committed and outcome.changed
+        choice = choices(controller)[0]
+        assert (choice["choice"], choice["confirmed"]) == (sr.OFFICIAL_PAIR, True)
+        assert choice["candidate"]["candidate_id"] == CANDIDATE["candidate_id"]
+        assert controller.payload["segments"][0]["status"] == "stale", "a changed confirmed choice is stale"
+
+        controller.undo()
+        assert choices(controller) == [] and controller.payload["segments"][0]["status"] == "done"
+        controller.redo()
+        assert len(choices(controller)) == 1
+    asyncio.run(scenario())
+
+
+def test_choosing_not_a_term_and_taking_the_choice_back_again() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await term_scene()
+        index, start, end = first_finding(controller)
+
+        controller.choose_term(index, start, end, sr.NOT_A_TERM)
+        assert choices(controller)[0]["choice"] == sr.NOT_A_TERM
+
+        outcome = controller.unchoose_term(index, start, end)
+
+        assert outcome.committed
+        assert choices(controller) == []
+    asyncio.run(scenario())
+
+
+def test_a_choice_the_records_refuse_commits_nothing() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await term_scene()
+        index, start, end = first_finding(controller)
+
+        # A candidate that is not this finding's: segment_records refuses it.
+        outcome = controller.choose_term(index, start, end, sr.OFFICIAL_PAIR, "0" * 64)
+
+        assert not outcome.committed and outcome.reason == de.REASON_FAILED
+        assert choices(controller) == [] and not controller.can_undo()
+    asyncio.run(scenario())
+
+
+def test_a_finished_mark_is_one_step_and_a_second_press_changes_nothing() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await term_scene()
+
+        outcome = controller.set_finished(0, True)
+        assert outcome.committed and outcome.changed
+        assert controller.payload["progress"]["completed"] == [0]
+
+        again = controller.set_finished(0, True)
+        assert again.committed and not again.changed, "the records already held that state"
+
+        controller.undo()
+        assert controller.payload["progress"]["completed"] == []
+    asyncio.run(scenario())
+
+
+# -- semantic decisions -----------------------------------------------------
+
+GREETS = "拜会"
+DECISION_SOURCE = "Jinhsi meets Camellya"
+DECISION_TARGET = "今汐 遇见 椿"
+
+
+def decision_report(source: str, target: str) -> dict:
+    """A complete semantic answer with one meaning_shift issue with a suggestion,
+    in the shape ``semantic.valid_semantic_report`` accepts for these sides."""
+    start = target.index("遇见")
+    end = start + len("遇见")
+    source_start = source.index("meets")
+    return {**semantic_report(source, target), "issues": [{
+        "id": hashlib.sha256(b"issue").hexdigest()[:32],
+        "fingerprint": hashlib.sha256(b"fingerprint").hexdigest()[:32],
+        "category": "meaning_shift", "origin": "model", "confidence": "high",
+        "source_span": {"start": source_start, "end": source_start + len("meets"), "text": "meets"},
+        "target_span": {"start": start, "end": end, "text": target[start:end]},
+        "source_excerpt": "meets", "target_excerpt": target[start:end],
+        "rationale": "遇见 is a meeting; the source says a greeting.",
+        "suggestion": {"target_span": {"start": start, "end": end, "text": target[start:end]},
+                       "replacement": GREETS, "term_effect": "none"},
+        "suggestion_withheld": None, "alternatives": [],
+    }]}
+
+
+async def decision_scene() -> tuple[dc.DocumentRunController, FakeClient, StubHost]:
+    client = FakeClient()
+    client.semantic = lambda call: decision_report(call["source"], call["target"])
+    controller, client, host = make(client, document_draft(source=DECISION_SOURCE, target=DECISION_TARGET))
+    controller.start_review()
+    await settle(controller)
+    return controller, client, host
+
+
+def only_issue(controller: dc.DocumentRunController) -> sessions.LiveIssue:
+    issues = controller.session.issues()
+    assert len(issues) == 1
+    return issues[0]
+
+
+def test_accepting_an_issue_is_a_domain_command_with_an_undo_step() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        issue = only_issue(controller)
+        accepted = DECISION_TARGET.replace("遇见", GREETS)
+        assert controller.issue_state(issue) == "pending"
+        assert controller.can_accept(issue) and controller.can_adjust(issue) and controller.can_ignore(issue)
+
+        outcome = controller.accept_issue(issue, can_display=lambda text: True)
+
+        assert outcome.committed and outcome.changed
+        assert controller.payload["target"] == accepted
+        assert [d["decision"] for d in controller.payload["semantic_decisions"]] == ["accepted"]
+        decision = controller.payload["semantic_decisions"][0]
+        assert decision["applied_text"] == GREETS
+        assert decision["target_revision"] == semantic.text_revision(DECISION_TARGET)
+        assert controller.issue_state(issue) == "accepted"
+        assert not controller.can_accept(issue) and not controller.can_ignore(issue)
+
+        controller.undo()
+        assert controller.payload["target"] == DECISION_TARGET
+        assert controller.payload.get("semantic_decisions") == []
+        controller.redo()
+        assert controller.payload["target"] == accepted
+    asyncio.run(scenario())
+
+
+def test_ignoring_an_issue_records_the_decision_without_touching_the_text() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        issue = only_issue(controller)
+
+        outcome = controller.ignore_issue(issue)
+
+        assert outcome.committed
+        assert controller.payload["target"] == DECISION_TARGET
+        assert [d["decision"] for d in controller.payload["semantic_decisions"]] == ["ignored"]
+        assert controller.issue_state(issue) == "ignored"
+        assert not controller.can_ignore(issue), "a decision already made is not decided again"
+        assert not controller.can_accept(issue)
+    asyncio.run(scenario())
+
+
+def test_adjusting_an_issue_applies_the_owners_own_replacement() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        issue = only_issue(controller)
+
+        outcome = controller.adjust_issue(issue, "碰见", can_display=lambda text: True)
+
+        assert outcome.committed
+        assert controller.payload["target"] == DECISION_TARGET.replace("遇见", "碰见")
+        assert controller.payload["semantic_decisions"][0]["decision"] == "adjusted"
+        assert controller.payload["semantic_decisions"][0]["applied_text"] == "碰见"
+    asyncio.run(scenario())
+
+
+def test_a_decision_the_editor_cannot_display_commits_nothing() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        issue = only_issue(controller)
+
+        outcome = controller.accept_issue(issue, can_display=lambda text: False)
+
+        assert not outcome.committed and outcome.reason == de.REASON_REJECTED
+        assert controller.payload["target"] == DECISION_TARGET
+        assert not controller.can_undo()
+    asyncio.run(scenario())
+
+
+def test_a_decision_whose_span_moved_is_refused_as_stale() -> None:
+    async def scenario() -> None:
+        controller, _client, _host = await decision_scene()
+        issue = only_issue(controller)
+        # An edit inside the reported text: the suggestion no longer describes it.
+        controller.apply_edit({"target": DECISION_TARGET.replace("遇见", "碰见")})
+
+        assert controller.issue_state(issue) == "stale"
+        assert not controller.can_accept(issue)
+        outcome = controller.accept_issue(issue, can_display=lambda text: True)
+
+        assert not outcome.committed and outcome.reason == de.REASON_STALE
+        assert controller.payload["target"] == DECISION_TARGET.replace("遇见", "碰见")
     asyncio.run(scenario())
