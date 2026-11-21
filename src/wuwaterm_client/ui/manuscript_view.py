@@ -3,15 +3,20 @@
 A QTextDocument normalises several characters. LosslessEditor retains the
 original text and maps each real edit through the document's UTF-16 offsets;
 opening and saving without editing therefore does not rewrite a manuscript.
+
+This is the Qt half of the workbench. The runs themselves — what is requested,
+in what order, whether an answer still belongs to the run that asked, and how a
+finished answer is committed — live in ``document_controller``, which imports
+no Qt. The view is its host: it triggers commands, renders the state the
+controller holds (through the properties below ``__init__``), and performs the
+one write a run cannot do itself, the editor's own translation edit.
 """
 from __future__ import annotations
 
-import asyncio
 import bisect
 import copy
 import os
 import tempfile
-from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
@@ -27,32 +32,19 @@ from .. import segment_records as sr
 from .. import semantic, strings
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .. import semantic_session as sessions
-from ..errors import (
-    ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_INVALID_REQUEST, ERROR_LLM_BUDGET_EXHAUSTED,
-    ERROR_LLM_UNAVAILABLE, ERROR_NOT_CONFIGURED, ERROR_OFFLINE, ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
+from ..document_controller import (
+    DOCUMENT_REVIEW_LIMIT as _DOCUMENT_REVIEW_LIMIT, PART_KEYS as _PART_KEYS, Translation as _Translation,
+    DocumentRunController, WorkbenchHost, blank as _blank, copy_payload as _copy_payload,
+    normalize_semantic as _normalize_semantic,
 )
 from ..manuscript import (
-    MAX_HISTORY_SEGMENTS, MAX_SEGMENT_CHOICE_HISTORY, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, WorkfileError,
-    choice_conflict_groups,
+    MAX_SEGMENT_CHOICE_HISTORY, MAX_SEMANTIC_DECISIONS, WorkfileError, choice_conflict_groups,
     empty_workfile, load_workfile, parse_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
 )
-from ..segmentation import (
-    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
-    pair_segments, segment_text,
-)
+from ..segmentation import STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
 from .components import ChevronComboBox
 from .icons import icon
 
-# The whole-manuscript term review keeps its historical request shape; above
-# this length each side is reviewed per segmentation-v1 pair instead.
-_DOCUMENT_REVIEW_LIMIT = 2000
-# A pause, not a failure: the run keeps its results and can continue later.
-_QUOTA_CODES = frozenset({ERROR_RATE_LIMITED, ERROR_LLM_BUDGET_EXHAUSTED})
-# Nothing else can succeed until the owner fixes these, so the run stops.
-_FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGURED,
-                          ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE, ERROR_LLM_UNAVAILABLE})
-# The same failure on consecutive segments is the service, not the segment.
-_REPEATED_FAILURES = 2
 # Precedents (the owner's earlier choices in this manuscript) go with both
 # translation and semantic review by default, as on the Web, because the
 # Core evaluation's M' gates (same-sense reuse, led astray) were met with
@@ -67,68 +59,13 @@ _DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 _REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
 # The term-view status filters, in the order the combo lists them.
 _TERM_FILTER_KEYS = ("all", "inconsistent", "pending", "not_evaluated", "confirmed")
-# The v3 long-mode parts (segment_records). Their values are never changed in
-# place, so copies of the payload share them instead of copying hundreds of
-# records on every keystroke.
-_PART_KEYS = ("segments", "segment_choice_history", "progress")
 # What a finding of a long manuscript still needs, by its record's state.
 _RECHECK_STATES = ("stale", "pending", "failed", "not_reviewed", "needs_manual_split", "untranslated",
                    "unpaired_target")
 
 
-def _copy_payload(value: dict) -> dict:
-    """A deep copy that shares the immutable long-mode parts."""
-    return {key: item if key in _PART_KEYS else copy.deepcopy(item) for key, item in value.items()}
-
-
 def _offset(span: dict | None, by: int) -> dict | None:
     return None if span is None else {"start": span["start"] + by, "end": span["end"] + by, "text": span["text"]}
-
-
-def _normalize_semantic(payload: dict) -> dict:
-    """Semantic keys are present together, and only with semantic data.
-
-    A manuscript without semantic data stays byte-for-byte a v1 workfile, so
-    an untouched draft never looks edited because of an empty list.
-    """
-    decisions = payload.get("semantic_decisions") or []
-    history = payload.get("semantic_history") or []
-    if decisions or history:
-        payload["semantic_decisions"], payload["semantic_history"] = decisions, history
-        payload["semantic_texts"] = payload.get("semantic_texts") or []
-    else:
-        for key in ("semantic_decisions", "semantic_texts", "semantic_history"):
-            payload.pop(key, None)
-    return payload
-
-
-def _blank(text: str) -> bool:
-    return all(char in WHITESPACE for char in text)
-
-
-@dataclass
-class _Translation:
-    """One translation run and, once it stops, the cursor to resume it.
-
-    ``target`` is what the next finished pieces are written onto: the blank
-    target the run started from (``written`` False: they replace it) or the
-    target as the partial write left it (``written`` True: they are appended).
-    ``segment`` is the source start of a single untranslated segment, or None
-    for the whole manuscript. ``out`` holds the pieces finished since the last
-    write, each with its separators exactly as a full run writes them.
-    """
-    generation: int
-    source: str
-    direction: str
-    target: str
-    segment: int | None = None
-    written: bool = False
-    retry: bool = False
-    next_piece: int = 0
-    done: int = 0
-    count: int = 0
-    previous: tuple[str, str] | None = None
-    out: list[str] = field(default_factory=list)
 
 
 def _display_map(raw: str) -> tuple[str, list[int]]:
@@ -644,6 +581,85 @@ class _ElidedDocumentLabel(QLabel):
             self._update_elision()
 
 
+class _WorkbenchHostAdapter(WorkbenchHost):
+    """``document_controller.WorkbenchHost``, implemented over one view.
+
+    This is the whole Qt boundary of a run: the controller says what happened,
+    this says how the workbench shows it. Nothing here decides anything about a
+    request, and nothing outside it is called by the controller, so the runs
+    stay testable without a widget.
+    """
+
+    def __init__(self, view: "ManuscriptView") -> None:
+        self._view = view
+
+    def refresh_semantic(self) -> None:
+        self._view._refresh_semantic()
+
+    def refresh_segments(self) -> None:
+        self._view._refresh_segments()
+
+    def refresh_segments_if_shown(self) -> None:
+        if self._view.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._view._refresh_segments()
+
+    def update_controls(self) -> None:
+        self._view._update_controls()
+
+    def render_semantic_progress(self) -> None:
+        self._view._render_semantic_progress()
+
+    def show_segment_term_report(self) -> None:
+        self._view._show_segment_term_report()
+
+    def show_term_report(self, report: dict) -> None:
+        self._view._show_term_report(report)
+
+    def render_review_state(self) -> None:
+        self._view._render_review_state()
+        if self._view._report is None:
+            self._view._render_finding(-1)
+
+    def clear_report(self) -> None:
+        self._view._report = None
+        self._view.findings.clear()
+
+    def report_status(self, text: str) -> None:
+        self._view.status_label.setText(text)
+
+    def report_unstorable_report(self, code: str) -> None:
+        self._view._conflict_mode = True
+        self._view._refresh_conflicts()
+
+    def report_translation_complete(self, mismatched: int) -> None:
+        view = self._view
+        view._mismatch_prompt_active = bool(mismatched)
+        view.status_label.setText(strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=mismatched) if mismatched
+                                  else strings.MANUSCRIPT_TRANSLATED)
+        view._update_controls()
+
+    def trust_review_snapshot(self, snapshot: dict) -> None:
+        self._view._session_snapshots.append(snapshot)
+
+    def precedents_selected(self) -> bool:
+        return self._view.precedents_check.isChecked()
+
+    def selected_segment(self):
+        view = self._view
+        return view._current_segment() if view.track_stack.currentIndex() == TRACK_SEGMENTS else None
+
+    def apply_target_write(self, changed: str, edit: tuple) -> bool:
+        view = self._view
+        if not view.target_edit.can_display(changed):
+            return False
+        value = view._draft_snapshot()
+        value["target"] = changed
+        if value["alignments"] is not None:
+            value["alignments"] = []
+        view._apply_edit(value, edits=[edit])
+        return True
+
+
 class ManuscriptView(QWidget):
     documentChanged = Signal()
     lookup_requested = Signal(str)
@@ -657,13 +673,13 @@ class ManuscriptView(QWidget):
 
     def __init__(self, api_client, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._api_client = api_client
-        self._payload = empty_workfile()
+        # The runs and the document state they commit to. Its host is
+        # _WorkbenchHostAdapter below: it renders state and performs the one
+        # edit a run cannot do itself.
+        self._controller = DocumentRunController(api_client, _WorkbenchHostAdapter(self))
         self._saved_payload = _copy_payload(self._payload)
         self._path: Path | None = None
         self._report: dict | None = None
-        self._task: asyncio.Task | None = None
-        self._generation = 0
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
         # an edit undo must never erase a report added later or undo a save.
@@ -674,13 +690,9 @@ class ManuscriptView(QWidget):
         self._redo_sessions: list[dict] = []
         self._undo_editor_states: list[dict] = []
         self._redo_editor_states: list[dict] = []
-        self._review_state = "none"
-        self._review_detail = ""
-        self._request_id: str | None = None
         self._conflict_mode = False
         self._conflict_indexes: list[int] = []
         self._document_state: tuple[Path | None, bool, int] | None = None
-        self._document_revision = 0
         # Work position (see work_position): the editor last focused, an issue
         # fingerprint waiting for its review to come back, and a counter that
         # drops a deferred scroll restore once another document is open.
@@ -690,24 +702,6 @@ class ManuscriptView(QWidget):
         self.setAcceptDrops(True)
         self._compact = False
         self._inspector_requested = True
-        # Semantic review (semantic-review-v1). Capabilities are probed only
-        # when the owner starts a review or a translation, never on startup.
-        self._capabilities: frozenset[str] | None = None
-        self._session = sessions.Session()
-        self._semantic_task: asyncio.Task | None = None
-        self._semantic_generation = 0
-        self._semantic_state = "none"
-        self._semantic_detail = ""
-        self._segment_failures: dict[tuple[str, str], str] = {}
-        self._segment_notes: dict[tuple[str, str], list[str]] = {}
-        # Old whole texts by sha256, so an ignored decision can still recover
-        # its spans after the owner edits elsewhere (Web ``semantic_texts``).
-        self._known_texts: dict[str, str] = {}
-        self._history_run = 0
-        self._history_written = -1
-        self._term_mode = "document"
-        self._pairs_key: tuple | None = None
-        self._pairs: list = []
         self._issue_rows: list[sessions.LiveIssue] = []
         self._row_texts: list[str] = []
         self._rows_dirty = False
@@ -716,26 +710,11 @@ class ManuscriptView(QWidget):
         # The pairing the rows were listed from (identity only).
         self._segment_rows_from: list | None = None
         self._refreshing_lists = False
-        self._translate_task: asyncio.Task | None = None
-        self._translate_generation = 0
-        # idle | waiting | retrying | paused | failed. In paused and failed the
-        # run record is the resume cursor; it is kept only while the source,
-        # direction and target are exactly what the run left.
-        self._translate_state = "idle"
-        self._translate_run: _Translation | None = None
-        self._translate_status = ""
         # Pairing a long manuscript is not free; typing never waits for it.
         self._derived_timer = QTimer(self)
         self._derived_timer.setSingleShot(True)
         self._derived_timer.setInterval(300)
         self._derived_timer.timeout.connect(self._refresh_derived)
-        # Long manuscripts (segment_records). The term basis of this session:
-        # None until a review-v2 response supplies it, so nothing saved counts
-        # as current before the first check. Never saved.
-        self._term_basis: dict | None = None
-        # What the records were last normalized against (identity checks only).
-        self._records_seen: tuple | None = None
-        self._record_views = sr.RecordViews()
         # The selected segment: written to progress.current only on save, so
         # navigating never makes the manuscript look edited.
         self._segment_cursor: int | None = None
@@ -1236,6 +1215,121 @@ class ManuscriptView(QWidget):
         self._update_controls()
         self._guard_text_inputs()
 
+    # -- the controller's state, read here for rendering ---------------------
+    #
+    # The runs and the document state they commit to belong to
+    # ``DocumentRunController``; these properties keep the workbench's existing
+    # attribute protocol (rendering reads them, and the tests read them) without
+    # duplicating a single field. Writes during a run go through the controller
+    # only; the setters exist for the owner's commands (open, new, the term
+    # basis a test pins) and delegate there too.
+    @property
+    def _api_client(self):
+        """The client every run uses; the controller's, never a second copy."""
+        return self._controller.api_client
+
+    @_api_client.setter
+    def _api_client(self, value) -> None:
+        self._controller.api_client = value
+
+    @property
+    def _payload(self) -> dict:
+        return self._controller.payload
+
+    @_payload.setter
+    def _payload(self, value: dict) -> None:
+        self._controller.payload = value
+
+    @property
+    def _session(self) -> sessions.Session:
+        return self._controller.session
+
+    @property
+    def _record_views(self) -> sr.RecordViews:
+        return self._controller.record_views
+
+    @property
+    def _term_basis(self) -> dict | None:
+        return self._controller.term_basis
+
+    @_term_basis.setter
+    def _term_basis(self, value: dict | None) -> None:
+        self._controller.term_basis = value
+
+    @property
+    def _segment_failures(self) -> dict[tuple[str, str], str]:
+        return self._controller.segment_failures
+
+    @property
+    def _segment_notes(self) -> dict[tuple[str, str], list[str]]:
+        return self._controller.segment_notes
+
+    @property
+    def _known_texts(self) -> dict[str, str]:
+        return self._controller.known_texts
+
+    @property
+    def _capabilities(self) -> frozenset[str] | None:
+        return self._controller.capabilities
+
+    @_capabilities.setter
+    def _capabilities(self, value: frozenset[str] | None) -> None:
+        self._controller.capabilities = value
+
+    @property
+    def _term_mode(self) -> str:
+        return self._controller.term_mode
+
+    @property
+    def _review_state(self) -> str:
+        return self._controller.review_state
+
+    @property
+    def _review_detail(self) -> str:
+        return self._controller.review_detail
+
+    @property
+    def _request_id(self) -> str | None:
+        return self._controller.request_id
+
+    @property
+    def _semantic_state(self) -> str:
+        return self._controller.semantic_state
+
+    @property
+    def _semantic_detail(self) -> str:
+        return self._controller.semantic_detail
+
+    @property
+    def _translate_state(self) -> str:
+        return self._controller.translate_state
+
+    @property
+    def _document_revision(self) -> int:
+        return self._controller.document_revision
+
+    @_document_revision.setter
+    def _document_revision(self, value: int) -> None:
+        self._controller.document_revision = value
+
+    # The runs' handles: read by the workbench's tests to await a run, and by
+    # nothing in the view (it waits for the controller's callback instead).
+    @property
+    def _generation(self) -> int:
+        return self._controller.generation
+
+    @property
+    def _task(self):
+        return self._controller.task
+
+    @property
+    def _semantic_task(self):
+        return self._controller.semantic_task
+
+    @property
+    def _translate_task(self):
+        return self._controller.translate_task
+
     # -- semantic review: widgets -------------------------------------------
     def _build_semantic_widgets(self) -> None:
         """The two tracks stay apart: deterministic term constraints, and
@@ -1453,7 +1547,8 @@ class ManuscriptView(QWidget):
 
     # -- semantic review: derived state --------------------------------------
     def _decisions(self) -> list[dict]:
-        return self._payload.get("semantic_decisions", [])
+        """The semantic decisions stored in the manuscript (controller state)."""
+        return self._controller.decisions()
 
     def _decision_index(self) -> sessions.DecisionIndex:
         """Decisions by occurrence, rebuilt only when the decisions list is
@@ -1466,12 +1561,9 @@ class ManuscriptView(QWidget):
     def _issue_state(self, issue: sessions.LiveIssue) -> str:
         return sessions.state_of(issue, self._decision_index(), self._payload["source"], self._payload["target"])
 
-    def _pairs_key_now(self) -> tuple:
-        return (self._payload["source"], self._payload["target"], repr(self._payload["alignments"] or None))
-
     def _cached_pairs(self) -> list | None:
         """The pairing of the current text if already computed; never computes."""
-        return self._pairs if self._pairs_key == self._pairs_key_now() else None
+        return self._controller.cached_pairs()
 
     def _refresh_derived(self) -> None:
         self._current_pairs()
@@ -1486,56 +1578,28 @@ class ManuscriptView(QWidget):
         self._render_semantic_progress()
 
     def _current_pairs(self) -> list:
-        source, target = self._payload["source"], self._payload["target"]
-        alignments = self._payload["alignments"] or None
-        key = self._pairs_key_now()
-        if key != self._pairs_key:
-            try:
-                pairs = pair_segments(source, target, SEGMENT_LIMIT, alignments)
-            except (ValueError, TypeError, AssertionError):
-                # Alignments the rule cannot use fall back to automatic pairing.
-                pairs = pair_segments(source, target, SEGMENT_LIMIT, None)
-            self._pairs_key, self._pairs = key, pairs
-        return self._pairs
+        """The segmentation-v1 pairing of the current text (controller state)."""
+        return self._controller.current_pairs()
 
     def _segment_key(self, pair) -> tuple:
         """A pair's identity: where its cores are and what they say. Identical
         paragraphs at different places are different segments."""
-        return sr.pair_key(pair, self._payload["source"], self._payload["target"])
+        return self._controller.segment_key(pair)
 
-    # -- long manuscripts: segment records (segment_records) ---------------
     def _long_now(self) -> bool:
-        return sr.long_mode(self._payload["source"], self._payload["target"])
+        """Whether the manuscript is reviewed per segment (controller state)."""
+        return self._controller.long_now()
 
     def _put_parts(self, parts: sr.Parts) -> None:
         """Hold ``parts`` in the payload, in place; not an undo step of its own."""
-        value = sr.with_parts(self._payload, parts)
-        for key in _PART_KEYS:
-            if key in value:
-                self._payload[key] = value[key]
-            else:
-                self._payload.pop(key, None)
+        self._controller.put_parts(parts)
 
     def _records(self) -> list | None:
         """The long-mode records, one per pair of ``_current_pairs()``, or None
-        in document mode. The only way records are read: they are normalized
-        here whenever the text, inputs, pairing, basis or parts changed.
-        Normalizing is not an edit, and an unchanged file stays unchanged."""
-        payload = self._payload
-        long = self._long_now()
-        if not long and not payload.get("segments"):
-            return None
-        pairs = self._current_pairs() if long else []
-
-        def now() -> tuple:
-            # The stored objects themselves: an absent part is None, never a fresh [].
-            return (payload["source"], payload["target"], payload["alignments"], self._term_basis, pairs,
-                    *(payload.get(key) for key in _PART_KEYS))
-        seen = self._records_seen
-        if seen is None or seen[-1] != payload["direction"] or any(a is not b for a, b in zip(seen, now())):
-            self._put_parts(sr.normalize(payload, pairs, self._term_basis, check_limits=False))
-            self._records_seen = (*now(), payload["direction"])
-        return payload.get("segments") or [] if long else None
+        in document mode. The controller normalizes them whenever the text,
+        inputs, pairing, basis or parts changed; normalizing is not an edit, and
+        an unchanged file stays unchanged."""
+        return self._controller.records()
 
     def _term_state(self, record: dict) -> str:
         return self._record_views.get(record, self._payload, self._term_basis).state
@@ -1571,13 +1635,13 @@ class ManuscriptView(QWidget):
         return done, len(ready)
 
     def _semantic_available(self) -> bool:
-        return self._capabilities is not None and semantic.CAPABILITY_SEMANTIC_REVIEW in self._capabilities
+        return self._controller.semantic_available()
 
     def _semantic_running(self) -> bool:
-        return self._semantic_task is not None and not self._semantic_task.done()
+        return self._controller.semantic_running()
 
     def _translating(self) -> bool:
-        return self._translate_task is not None and not self._translate_task.done()
+        return self._controller.translating()
 
     def _busy(self) -> bool:
         return self._review_state == "reviewing" or self._semantic_running() or self._translating()
@@ -2890,10 +2954,7 @@ class ManuscriptView(QWidget):
         self.request_id_label.setText(strings.REQUEST_ID_LABEL.format(request_id=self._request_id or strings.REQUEST_ID_PLACEHOLDER))
 
     def _set_review_state(self, state: str, *, detail: str = "", request_id: str | None = None) -> None:
-        self._review_state, self._review_detail, self._request_id = state, detail, request_id
-        self._render_review_state()
-        if self._report is None:
-            self._render_finding(-1)
+        self._controller.set_review_state(state, detail=detail, request_id=request_id)
 
     def _draft_snapshot(self) -> dict:
         value = {key: self._payload[key] for key in _DRAFT_KEYS}
@@ -3022,10 +3083,8 @@ class ManuscriptView(QWidget):
         return True
 
     def _cancel_pending(self) -> None:
-        self._generation += 1
-        task, self._task = self._task, None
-        if task is not None and not task.done():
-            task.cancel()
+        """Drop the document review in flight; its answer is no longer wanted."""
+        self._controller.cancel_pending()
 
     def cancel_background_work(self) -> None:
         """Stop every request this view started (window close)."""
@@ -3068,8 +3127,7 @@ class ManuscriptView(QWidget):
 
     def _reset_term_session(self, cursor: int | None) -> None:
         """A new document or service: no term basis yet, so nothing saved is current."""
-        self._term_basis = None
-        self._records_seen = None
+        self._controller.reset_term_session()
         self._segment_cursor = cursor if isinstance(cursor, int) else None
         self.segment_list.setCurrentRow(-1)
 
@@ -3095,23 +3153,10 @@ class ManuscriptView(QWidget):
         self._apply_edit(value, editors_already_updated=True, edits=[edit] if edit is not None else None)
 
     def _start_review(self) -> None:
+        """Start the document review from the text as it is now."""
         if not self.review_button.isEnabled() or not self._input_ready():
             return
-        self._cancel_pending()
-        self._stop_semantic()
-        generation = self._generation
-        source, target = self._payload["source"], self._payload["target"]
-        direction = self._payload["direction"]
-        alignments = copy.deepcopy(self._payload["alignments"])
-        self._report = None
-        self.findings.clear()
-        # A new run retries the segments that failed before.
-        self._segment_failures.clear()
-        self._semantic_state = "none"
-        self._set_review_state("reviewing")
-        self._task = asyncio.ensure_future(self._run_review(generation, source, target, direction, alignments))
-        self._task.add_done_callback(lambda task: self._task_finished(task, generation))
-        self._update_controls()
+        self._controller.start_review()
 
     def _use_auto_alignment(self) -> None:
         if self._payload["alignments"] is None or not self._input_ready():
@@ -3132,72 +3177,6 @@ class ManuscriptView(QWidget):
                    and sr.alignment_input(alignments, payload["source"], payload["target"],
                                           (record["source_start"], record["source_end"]),
                                           (record["target_start"], record["target_end"])) != record["alignment_input"])
-
-    async def _run_review(self, generation, source, target, direction, alignments) -> None:
-        try:
-            # Old servers answer 404 and the client keeps its previous
-            # behaviour: the deterministic review only.
-            capabilities = await self._api_client.get_capabilities()
-        except ClientError as exc:
-            if generation == self._generation:
-                self._set_review_state("error", detail=exc.message, request_id=exc.request_id)
-            return
-        except asyncio.CancelledError:
-            if generation == self._generation:
-                self._set_review_state("cancelled")
-            return
-        if generation != self._generation:
-            return
-        self._capabilities = capabilities
-        document = len(source) <= _DOCUMENT_REVIEW_LIMIT and len(target) <= _DOCUMENT_REVIEW_LIMIT
-        self._term_mode = "document" if document else "segments"
-        # Every review, short or long, applies the reuse rule first (one entry).
-        self._rebuild_plan()
-        self._refresh_semantic()
-        if document and not await self._run_document_review(generation, source, target, direction, alignments):
-            return
-        if generation != self._generation:
-            return
-        if not document:
-            self._set_review_state("none")
-        if not document or self._semantic_available():
-            self._start_semantic_run()
-        self._update_controls()
-
-    async def _run_document_review(self, generation, source, target, direction, alignments) -> bool:
-        try:
-            report = await self._api_client.review_pair(source, target, direction, alignments=alignments)
-        except ClientError as exc:
-            if generation == self._generation:
-                self._set_review_state("error", detail=exc.message, request_id=exc.request_id)
-            return False
-        except asyncio.CancelledError:
-            if generation == self._generation:
-                self._set_review_state("cancelled")
-            return False
-        if generation != self._generation:
-            return False
-        # The resolutions this check sent: a short manuscript sends none, and
-        # [] (not unknown) lets the next check compare with it, as on the Web.
-        snapshot = {"source": source, "target": target, "direction": direction,
-                    "alignments": alignments, "report": report, "resolutions": []}
-        candidate = _copy_payload(self._payload)
-        candidate["history"] = (candidate["history"] + [snapshot])[-2:]
-        try:
-            serialize_workfile(candidate)
-        except WorkfileError as exc:
-            self._set_review_state("error", detail=strings.MANUSCRIPT_REPORT_UNSAVEABLE)
-            if exc.code == "workfile_duplicate_choices":
-                self._conflict_mode = True
-                self._refresh_conflicts()
-            return False
-        self._payload = candidate
-        self._session_snapshots.append(snapshot)
-        self._document_revision += 1
-        self._show_term_report(report)
-        self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
-        self._update_controls()
-        return True
 
     def _show_term_report(self, report: dict, *, state: str = "current", refs: list | None = None,
                           recheck: list | None = None, saved: list | None = None) -> None:
@@ -3312,322 +3291,36 @@ class ManuscriptView(QWidget):
             "truncated": truncated,
         }, state="saved" if basis is None else "current", refs=refs, recheck=recheck, saved=saved_flags)
 
-    def _task_finished(self, task: asyncio.Task, generation: int) -> None:
-        if generation != self._generation:
-            return
-        self._task = None
-        if task.cancelled():
-            self._set_review_state("cancelled")
-        self._update_controls()
-
     def _cancel_review(self) -> None:
-        if self._translating():
-            run = self._translate_run
-            self._stop_translation()
-            self._translation_stopped(run, "paused")
-            return
-        if self._semantic_running():
-            self._stop_semantic("paused")
-            self._refresh_semantic()
-            self._update_controls()
-            return
-        if self._task is None:
-            return
-        self._cancel_pending()
-        self._set_review_state("cancelled")
-        self._update_controls()
+        """The cancel button: pause what is in flight, in the order a press means
+        it (see DocumentRunController.cancel_review)."""
+        self._controller.cancel_review()
 
-    # -- segmented semantic run ------------------------------------------------
+    # -- segmented term and semantic run --------------------------------------
     def _start_semantic_run(self) -> None:
-        self._stop_semantic()
-        self._history_run += 1
-        self._semantic_state = "running"
-        generation = self._semantic_generation
-        self._semantic_task = asyncio.ensure_future(self._run_segments(generation))
-        self._semantic_task.add_done_callback(lambda task: self._semantic_finished(task, generation))
-        self._render_semantic_progress()
+        """Start the serial segmented run (see the controller)."""
+        self._controller.start_semantic_run()
 
     def _stop_semantic(self, state: str | None = None) -> None:
-        self._semantic_generation += 1
-        task, self._semantic_task = self._semantic_task, None
-        self._session.pending = None
-        if task is not None and not task.done():
-            task.cancel()
-        if state is not None:
-            self._semantic_state = state
+        """Hard stop of the segmented run; results already stored stay."""
+        self._controller.stop_semantic(state)
 
     def _clear_semantic(self) -> None:
-        self._stop_semantic("none")
-        self._session.clear()
-        self._segment_failures.clear()
-        self._segment_notes.clear()
-        self._refresh_semantic()
-        self._refresh_segments()
-
-    def _semantic_finished(self, task: asyncio.Task, generation: int) -> None:
-        if generation != self._semantic_generation:
-            return
-        self._semantic_task = None
-        if task.cancelled():
-            self._semantic_state = "paused"
-        elif task.exception() is not None:
-            self._semantic_state = "error"
-            self._semantic_detail = strings.ERROR_MSG_UNKNOWN
-        self._refresh_semantic()
-        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-            self._refresh_segments()
-        self._update_controls()
-
-    def _next_review(self, attempted: set) -> sr.NextReview | None:
-        pairs = self._current_pairs()
-        terms = self._term_mode == "segments" and self._records() is not None
-        return sr.next_review(self._payload, pairs, self._term_basis, self._session, self._basis(),
-                              terms=terms, attempted=attempted, views=self._record_views)
+        """A new document, direction or service: no semantic result survives."""
+        self._controller.clear_semantic()
 
     def _basis(self) -> sessions.Basis:
         """The current basis of the semantic reuse rule (``sessions.Basis``)."""
-        return sessions.Basis(semantic_required=self._semantic_available())
-
-    def _ready_pair_for(self, result: sessions.SegmentResult):
-        source, target = self._payload["source"], self._payload["target"]
-        return next((p for p in self._current_pairs()
-                     if p.status == STATUS_READY and result.matches(p, source, target)), None)
-
-    def _rebuild_plan(self) -> None:
-        """Apply the reuse rule: keep only results, failures and notes that a
-        current ready pair can use under the current basis."""
-        source, target = self._payload["source"], self._payload["target"]
-        pairs = self._current_pairs()
-        self._session.rebuild(pairs, source, target, self._basis())
-        keys = {self._segment_key(p) for p in pairs if p.status == STATUS_READY}
-        self._segment_failures = {k: v for k, v in self._segment_failures.items() if k in keys}
-        self._segment_notes = {k: v for k, v in self._segment_notes.items() if k in keys}
+        return self._controller.basis()
 
     def _alignments_for(self, source_core: tuple[int, int], target_core: tuple[int, int]) -> list | None:
         """The owner's correspondence for one segment's term request
         (``segment_records.alignment_list``): automatic stays automatic, an
         explicit list, even empty, never becomes automatic."""
-        return sr.alignment_list(self._payload["alignments"], self._payload["source"], self._payload["target"],
-                                 source_core, target_core)
-
-    def _context_for(self, pair) -> dict | None:
-        if pair.index == 0:
-            return None
-        previous = self._current_pairs()[pair.index - 1]
-        source, target = self._payload["source"], self._payload["target"]
-        return semantic.context_before(source[previous.source.core_start:previous.source.core_end],
-                                       target[previous.target.core_start:previous.target.core_end])
-
-    async def _check_term(self, index: int, generation: int) -> ClientError | str | None:
-        """One segment's term check (SPEC "Runtime" steps 4 to 7): the planned
-        request, at most one fallback without resolutions when Core rejects
-        them, and one more request when the kept choices must go out. Returns
-        None when the record is current or holds the new result, ``"changed"``
-        when the text moved on while the request was out, ``"not_storable"``,
-        or the error."""
-        request = sr.plan_request(self._payload, index, self._term_basis)
-        fell_back = False
-
-        def still_there() -> bool:
-            # The owner may have edited while the refused request was out:
-            # replan only for the same segment, with the same cores, in long mode.
-            records = self._records() if self._term_mode == "segments" else None
-            if records is None or not 0 <= index < len(records):
-                return False
-            record, payload = records[index], self._payload
-            return (payload["direction"] == request.direction
-                    and payload["source"][record["source_start"]:record["source_end"]] == request.source
-                    and payload["target"][record["target_start"]:record["target_end"]] == request.target)
-        for _ in range(3):
-            try:
-                report = await self._api_client.review_pair(
-                    request.source, request.target, request.direction, alignments=request.alignments,
-                    resolutions=request.resolutions or None, resolution_context=request.resolution_context)
-            except ClientError as exc:
-                if (exc.code == ERROR_INVALID_REQUEST and request.resolutions and not fell_back
-                        and generation == self._semantic_generation):
-                    fell_back = True
-                    if not still_there():
-                        return "changed"
-                    request = sr.plan_request(self._payload, index, self._term_basis, allow_resolutions=False)
-                    continue
-                return exc
-            if generation != self._semantic_generation:
-                return "changed"
-            applied = sr.apply_response(self._payload, request, report, self._term_basis)
-            self._term_basis = applied.basis
-            self._put_parts(applied.parts)
-            self._document_revision += 1
-            if applied.outcome == "discarded":
-                return "changed"
-            if applied.outcome == "not_storable":
-                return "not_storable"
-            if not applied.again:
-                return None
-            request = sr.plan_request(self._payload, index, self._term_basis)
-        return None
-
-    async def _run_segments(self, generation: int) -> None:
-        """Serial, one request in flight. Long-manuscript term checks follow the
-        segment record reuse rule (``segment_records``); semantic requests the
-        semantic reuse rule (``sessions.Basis``). A failure changes only its
-        segment, and the next run continues from it."""
-        attempted: set[tuple] = set()
-        failure_streak: tuple[str | None, int] = (None, 0)
-        self._rebuild_plan()
-        if self._term_mode == "segments":
-            # Segments that need no request still show their term results.
-            self._show_segment_term_report()
-        while generation == self._semantic_generation:
-            next_review = self._next_review(attempted)
-            if next_review is None:
-                break
-            pair = self._current_pairs()[next_review.index]
-            source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
-            key = self._segment_key(pair)
-            attempted.add(key)
-            if not pair_is_sendable(pair, source, target):
-                # The final pre-send assertion: never send an oversized pair.
-                self._segment_failures[key] = "needs_manual_split"
-                continue
-            need_term, need_semantic = next_review.term, next_review.semantic
-            self._session.pending = sessions.SegmentResult(
-                sent_source=key[4], sent_target=key[5],
-                source_core=(pair.source.core_start, pair.source.core_end),
-                target_core=(pair.target.core_start, pair.target.core_end),
-                hard_cut=pair.hard_cut, report=None, index=pair.index)
-            before = self._context_for(pair)
-            precedents = semantic.select_precedents(
-                sessions.precedent_candidates(self._payload, self._current_pairs()), key[4], pair.source.core_start
-            ) if self.precedents_check.isChecked() and need_semantic else []
-            self._render_semantic_progress()
-            report = None
-            error: ClientError | str | None = None
-            if need_term:
-                error = await self._check_term(pair.index, generation)
-                if generation != self._semantic_generation:
-                    return
-                if error == "changed":
-                    error = None  # the edited segment is a new segment; it gets its own turn
-                if error is None:
-                    self._segment_failures.pop(key, None)
-                    self._show_segment_term_report()
-            try:
-                if error is None and need_semantic and generation == self._semantic_generation:
-                    report = await self._api_client.semantic_review(
-                        key[4], key[5], direction, before=before, precedents=precedents)
-            except ClientError as exc:
-                error = exc
-            if generation != self._semantic_generation:
-                return
-            pending, self._session.pending = self._session.pending, None
-            # Only an answer for a pair that still exists, exactly, is stored.
-            target_pair = self._ready_pair_for(pending) if pending is not None else None
-            if target_pair is not None:
-                key = self._segment_key(target_pair)
-                if report is not None:
-                    self._store_semantic(target_pair, pending, report, direction)
-            if error is not None:
-                code = error if isinstance(error, str) else error.code
-                if code == ERROR_CANCELLED:
-                    return
-                if code in _QUOTA_CODES:
-                    self._semantic_state = "quota"
-                    return
-                failure_streak = (code, failure_streak[1] + 1 if failure_streak[0] == code else 1)
-                if target_pair is not None:
-                    self._segment_failures[key] = "failed"
-                if code in _FATAL_CODES or failure_streak[1] >= _REPEATED_FAILURES:
-                    self._semantic_state = "error"
-                    self._semantic_detail = (strings.MANUSCRIPT_TERM_NOT_STORABLE if code == "not_storable"
-                                             else error.message)
-                    return
-                self._refresh_semantic()
-                if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-                    self._refresh_segments()
-                continue
-            if report is not None and report["status"] != "complete":
-                if target_pair is not None:
-                    self._segment_failures[key] = "not_reviewed"
-                continue
-            if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-                self._refresh_segments()
-            failure_streak = (None, 0)
-        if generation == self._semantic_generation:
-            self._semantic_state = "done"
-            self._rebuild_plan()
-            if self._term_mode == "segments":
-                self._show_segment_term_report()
-
-    def _store_semantic(self, pair, pending: sessions.SegmentResult, report: dict, direction: str) -> None:
-        """Store a semantic report for ``pair``; an incomplete one is not stored."""
-        source, target = self._payload["source"], self._payload["target"]
-        if report["status"] != "complete":
-            return
-        result = self._session.result_for(pair, source, target)
-        if result is None:
-            result = sessions.SegmentResult(
-                sent_source=pending.sent_source, sent_target=pending.sent_target,
-                source_core=pending.source_core, target_core=pending.target_core,
-                hard_cut=pending.hard_cut, report=None, index=pair.index)
-            self._session.add(result)
-        key = self._segment_key(pair)
-        result.report, result.index = report, pair.index
-        result.issues = sessions.live_issues_from_report(
-            report, segment_index=pair.index, source_offset=result.source_core[0],
-            target_offset=result.target_core[0], source_revision=sessions.revision(source),
-            target_revision=sessions.revision(target))
-        self._known_texts.setdefault(sessions.revision(source), source)
-        self._known_texts.setdefault(sessions.revision(target), target)
-        notes = []
-        if report["omitted_issues"]:
-            notes.append(strings.MANUSCRIPT_SEGMENT_HINT["truncated"].format(count=report["omitted_issues"]))
-        if report["dropped_unanchored"]:
-            notes.append(strings.MANUSCRIPT_SEGMENT_HINT["dropped"].format(count=report["dropped_unanchored"]))
-        self._segment_notes[key] = notes
-        # "Exactly one candidate" is judged over the whole current report.
-        sessions.apply_reconcile(self._session.issues(), self._decisions(), self._texts_for_reconcile(),
-                                 source, target)
-        self._remember_semantic_report(direction)
-        if not self._basis().needs(result):
-            self._segment_failures.pop(key, None)
-        self._refresh_semantic()
-        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-            self._refresh_segments()
-        self._update_controls()
-
-    def _texts_for_reconcile(self) -> dict[str, str]:
-        texts = sessions.verified_texts(self._payload.get("semantic_texts") or [])
-        texts.update(self._known_texts)
-        return texts
+        return self._controller.alignments_for(source_core, target_core)
 
     def _semantic_texts(self, payload: dict) -> list[dict]:
-        return sessions.semantic_texts_for(payload.get("semantic_decisions") or [], self._texts_for_reconcile(),
-                                           payload["source"], payload["target"])
-
-    def _remember_semantic_report(self, direction: str) -> None:
-        """Keep this run as one untrusted snapshot of the whole manuscript
-        (Web ``semantic_history``); the writer drops the oldest if too large."""
-        source, target = self._payload["source"], self._payload["target"]
-        segments = [{"segment_index": r.index, "source_start": r.source_core[0], "source_end": r.source_core[1],
-                     "target_start": r.target_core[0], "target_end": r.target_core[1], "report": r.report}
-                    for r in self._session.results
-                    if sessions.semantic_part_valid(r) and self._ready_pair_for(r) is not None]
-        snapshot = {"source": source, "target": target, "direction": direction,
-                    "segments": copy.deepcopy(segments[:MAX_HISTORY_SEGMENTS])}
-        candidate = _copy_payload(self._payload)
-        history = list(candidate.get("semantic_history", []))
-        if self._history_written == self._history_run and history:
-            history[-1] = snapshot
-        else:
-            history.append(snapshot)
-        candidate["semantic_history"] = history[-MAX_SEMANTIC_HISTORY:]
-        candidate.setdefault("semantic_decisions", [])
-        candidate["semantic_texts"] = self._semantic_texts(candidate)
-        if semantic_payload_fits(_normalize_semantic(candidate)):
-            self._payload = candidate
-            self._history_written = self._history_run
-            self._document_revision += 1
+        return self._controller.semantic_texts(payload)
 
     # -- translation in the manuscript ---------------------------------------
     def _translate_ready(self) -> bool:
@@ -3637,28 +3330,17 @@ class ManuscriptView(QWidget):
 
     def _stop_translation(self) -> None:
         """Hard stop: nothing is written and nothing is offered afterwards."""
-        self._translate_generation += 1
-        task, self._translate_task = self._translate_task, None
-        self._translate_run, self._translate_state = None, "idle"
-        if task is not None and not task.done():
-            task.cancel()
+        self._controller.stop_translation()
 
     def _resumable(self) -> _Translation | None:
         """The stopped run, while the text is exactly what it left."""
-        run = self._translate_run
-        if run is None or self._translate_state not in ("paused", "failed") or self._translating():
-            return None
-        payload = self._payload
-        same = (payload["source"] == run.source and payload["direction"] == run.direction
-                and payload["target"] == run.target)
-        return run if same else None
+        return self._controller.resumable()
 
     def _sync_translation(self) -> None:
         """An edit, an undo or a redo withdraws the offer to continue."""
-        if self._translate_state in ("paused", "failed") and self._resumable() is None:
-            self._translate_run, self._translate_state = None, "idle"
-            if self.status_label.text() == self._translate_status:
-                self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
+        previous = self._controller.withdraw_translation_offer()
+        if previous is not None and self.status_label.text() == previous:
+            self.status_label.setText(strings.MANUSCRIPT_REPORT_NOTE)
 
     def _render_translate_offer(self) -> None:
         """Both translate buttons say what the next press does."""
@@ -3679,105 +3361,11 @@ class ManuscriptView(QWidget):
     def _translate(self) -> None:
         """Translate a blank translation or one untranslated segment; never
         overwrite text the owner already has. After a pause or a failure the
-        same press continues from the first unfinished piece."""
+        same press continues from the first unfinished piece (the run itself,
+        and what it resumes from, is DocumentRunController.start_translation)."""
         if not self._input_ready() or not self._translate_ready():
             return
-        source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
-        cursor = self._resumable()
-        pair = None
-        if cursor is not None and cursor.segment is not None:
-            pair = next((p for p in self._current_pairs()
-                         if p.status == STATUS_UNTRANSLATED and p.source.core_start == cursor.segment), None)
-            if pair is None:
-                cursor = None
-        if cursor is None and not _blank(target):
-            pair = self._current_segment() if self.track_stack.currentIndex() == TRACK_SEGMENTS else None
-            if pair is None or pair.status != STATUS_UNTRANSLATED:
-                self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
-                return
-        retry = cursor is not None and self._translate_state == "failed"
-        self._stop_translation()
-        # A new record, so the ended task's callback never sees this run's identity.
-        # A single-segment run carries its unwritten pieces (``out``) along.
-        fresh = {"generation": self._translate_generation, "retry": retry,
-                 "out": [] if cursor is None else list(cursor.out)}
-        run = replace(cursor, **fresh) if cursor is not None else _Translation(
-            source=source, direction=direction, target=target,
-            segment=None if pair is None else pair.source.core_start, **fresh)
-        text = source if pair is None else source[pair.source.core_start:pair.source.core_end]
-        pieces = segment_text(text, SEGMENT_LIMIT)
-        run.count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
-        self._translate_run, self._translate_state = run, "retrying" if retry else "waiting"
-        self._translate_task = asyncio.ensure_future(self._run_translation(run, pair, text, pieces))
-        self._translate_task.add_done_callback(lambda _task: self._translate_done(run))
-        self._update_controls()
-
-    def _translate_done(self, run: _Translation) -> None:
-        """A task that ended without an outcome (an unexpected error) is a failure."""
-        if run.generation == self._translate_generation and self._translate_state in ("waiting", "retrying"):
-            self._translation_stopped(run, "failed", strings.ERROR_MSG_UNKNOWN)
-        self._update_controls()
-
-    async def _run_translation(self, run: _Translation, pair, text: str, pieces: list) -> None:
-        generation = run.generation
-        base = 0 if pair is None else pair.source.core_start
-        try:
-            # Capabilities are part of the basis: probe again, never reuse.
-            self._capabilities = await self._api_client.get_capabilities()
-            context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self._capabilities
-            candidates = (sessions.precedent_candidates(self._payload, self._current_pairs())
-                          if context_on and self.precedents_check.isChecked() else [])
-            template = strings.MANUSCRIPT_TRANSLATE_RETRYING if run.retry else strings.MANUSCRIPT_TRANSLATING
-            for position in range(run.next_piece, len(pieces)):
-                piece = pieces[position]
-                core = text[piece.core_start:piece.core_end]
-                if not core:
-                    run.out.append(text[piece.start:piece.end])
-                    run.next_piece = position + 1
-                    continue
-                self.status_label.setText(template.format(index=run.done + 1, total=run.count))
-                context = None
-                if context_on:
-                    before = semantic.context_before(*run.previous) if run.previous is not None else None
-                    precedents = semantic.select_precedents(candidates, core, base + piece.core_start)
-                    context = {**({"before": before} if before is not None else {}),
-                               **({"precedents": precedents} if precedents else {})} or None
-                result = await self._api_client.translate(core, to=run.direction, context=context)
-                if generation != self._translate_generation:
-                    return
-                run.out.append(text[piece.start:piece.core_start] + result.text + text[piece.core_end:piece.end])
-                run.next_piece, run.previous = position + 1, (core, result.text)
-                run.done += 1
-        except ClientError as exc:
-            if generation == self._translate_generation:
-                if exc.code == ERROR_CANCELLED:
-                    self._translation_stopped(run, "paused")
-                else:
-                    self._translation_stopped(run, "paused" if exc.code in _QUOTA_CODES else "failed",
-                                              exc.message, quota=exc.code in _QUOTA_CODES)
-            return
-        if generation != self._translate_generation:
-            return
-        self._translate_task = None
-        if not self._translation_basis_unchanged(run):
-            self._translate_run, self._translate_state = None, "idle"
-            self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
-            self._update_controls()
-            return
-        if not self._write_translation(run, "".join(run.out), pair):
-            self._translate_run, self._translate_state = None, "idle"
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            self._update_controls()
-            return
-        self._translate_run, self._translate_state = None, "idle"
-        mismatched = [p for p in self._current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT]
-        if mismatched:
-            self._mismatch_prompt_active = True
-            self.status_label.setText(strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=len(mismatched)))
-        else:
-            self._mismatch_prompt_active = False
-            self.status_label.setText(strings.MANUSCRIPT_TRANSLATED)
-        self._update_controls()
+        self._controller.start_translation()
 
     def _render_mismatch_prompt(self) -> None:
         if not self._mismatch_prompt_active:
@@ -3819,73 +3407,6 @@ class ManuscriptView(QWidget):
         else:
             self.segment_list.setCurrentRow(target_pair.index)
         self.status_label.setText(strings.MANUSCRIPT_MISMATCH_JUMPED.format(number=target_pair.index + 1))
-
-    def _translation_basis_unchanged(self, run: _Translation) -> bool:
-        payload = self._payload
-        return (payload["source"] == run.source and payload["direction"] == run.direction
-                and payload["target"] == run.target)
-
-    def _write_translation(self, run: _Translation, added: str, pair=None) -> bool:
-        """Write finished pieces as one undoable edit; False if the editor
-        cannot show the result. Without ``pair`` they go to the whole target:
-        replacing the blank one, or appended to the part already written."""
-        target = run.target
-        if pair is None:
-            changed = (target if run.written else "") + added
-            edit = ("target", len(target) if run.written else 0, len(target), len(added))
-        else:
-            position = pair.target.core_start
-            left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
-            right = "\n\n" if position < len(target) and target[position] not in WHITESPACE else ""
-            inserted = left + added + right
-            changed = target[:position] + inserted + target[position:]
-            edit = ("target", position, position, len(inserted))
-        if not self.target_edit.can_display(changed):
-            return False
-        value = self._draft_snapshot()
-        value["target"] = changed
-        if value["alignments"] is not None:
-            value["alignments"] = []
-        self._apply_edit(value, edits=[edit])
-        return True
-
-    def _translation_stopped(self, run: _Translation, state: str, reason: str = "", *, quota: bool = False) -> None:
-        """The run ended before its last piece: the owner paused it, the
-        service asked to wait, or a piece failed. The run stays as the cursor
-        for the next press. A whole-manuscript run writes what is finished as
-        one edit. A single-segment run keeps its finished pieces unwritten and
-        writes them all when the segment completes: writing part of it would
-        make the segment no longer untranslated, so the resume could not find
-        it again."""
-        self._translate_task = None
-        if not self._translation_basis_unchanged(run):
-            self._translate_run, self._translate_state = None, "idle"
-            self.status_label.setText(strings.MANUSCRIPT_TRANSLATE_CHANGED)
-            self._update_controls()
-            return
-        segment = run.segment is not None
-        if not segment:
-            kept = "".join(run.out)
-            if kept:
-                if not self._write_translation(run, kept):
-                    self._translate_run, self._translate_state = None, "idle"
-                    self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-                    self._update_controls()
-                    return
-                run.target, run.written = self._payload["target"], True
-            run.out = []
-        if state == "failed":
-            text = (strings.MANUSCRIPT_TRANSLATE_SEGMENT_FAILED if segment else strings.MANUSCRIPT_TRANSLATE_FAILED).format(
-                index=run.done + 1, total=run.count, done=run.done, reason=reason)
-        else:
-            if segment:
-                template = strings.MANUSCRIPT_TRANSLATE_SEGMENT_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_SEGMENT_PAUSED
-            else:
-                template = strings.MANUSCRIPT_TRANSLATE_QUOTA if quota else strings.MANUSCRIPT_TRANSLATE_PAUSED
-            text = template.format(done=run.done, total=run.count)
-        self._translate_run, self._translate_state, self._translate_status = run, state, text
-        self.status_label.setText(text)
-        self._update_controls()
 
     def _select_finding(self, index: int) -> None:
         self._sync_group_row_to_finding(index)
@@ -4146,11 +3667,9 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.MANUSCRIPT_OPEN_FAILED.format(reason=str(exc)))
             return False
         self._replace_document(value, (value.get("progress") or {}).get("current"))
-        self._known_texts = sessions.verified_texts(value.get("semantic_texts") or [])
         # The loaded texts are the versions on-file decisions usually refer to;
         # keep them so an edit before the next review does not lose them.
-        for text in (value["source"], value["target"]):
-            self._known_texts.setdefault(sessions.revision(text), text)
+        self._controller.reset_known_texts(value)
         self._path = Path(name)
         # A file this client wrote normalizes to itself; anything else is
         # mapped now, before the baseline, so opening never looks edited.
@@ -4169,7 +3688,7 @@ class ManuscriptView(QWidget):
             return False
         value = empty_workfile()
         self._replace_document(value, None)
-        self._known_texts = {}
+        self._controller.reset_known_texts()
         self._saved_payload = _copy_payload(value)
         self._path = None
         self._set_review_state("none")
