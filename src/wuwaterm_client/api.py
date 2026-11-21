@@ -28,8 +28,8 @@ from .errors import (
     ERROR_UNKNOWN,
     ClientError,
 )
-from .manuscript import valid_report
-from .semantic import encode_request, parse_capabilities, valid_semantic_report
+from .manuscript import ReviewReport, valid_report
+from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
 
 TokenProvider = Callable[[], "str | None"]
 
@@ -197,7 +197,7 @@ class MetaResult:
 
 def _review_report(
     data: Any, source: str, target: str, *, review_version: str = "review-v2"
-) -> dict[str, Any]:
+) -> ReviewReport:
     """Accept a report only for the exact text and locations submitted.
 
     A successful HTTP response alone does not prove that a report belongs to
@@ -572,7 +572,7 @@ class ApiClient:
         resolutions: list[dict[str, Any]] | None = None,
         resolution_context: dict[str, str] | None = None,
         review_version: str = "review-v2",
-    ) -> dict[str, Any]:
+    ) -> ReviewReport:
         """One term check. ``resolutions`` and ``resolution_context`` go out
         only when there are resolutions: review-v2 rejects a null field, and
         non-empty resolutions need their context."""
@@ -617,7 +617,7 @@ class ApiClient:
         explain_language: str = "zh",
         before: dict[str, str] | None = None,
         precedents: Any = (),
-    ) -> dict[str, Any]:
+    ) -> SemanticReviewReport:
         content = encode_request(
             source, target, direction,
             explain_language=explain_language, before=before, precedents=precedents,
@@ -629,7 +629,7 @@ class ApiClient:
             timeout=self._translate_timeout,
         )
 
-        def accept(data: Any) -> dict[str, Any]:
+        def accept(data: Any) -> SemanticReviewReport:
             if not valid_semantic_report(data, source, target):
                 raise ValueError("review is not a supported semantic report")
             return data

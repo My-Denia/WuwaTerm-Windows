@@ -14,7 +14,6 @@ one write a run cannot do itself, the editor's own translation edit.
 from __future__ import annotations
 
 import bisect
-import copy
 import os
 import tempfile
 from pathlib import Path
@@ -33,13 +32,16 @@ from .. import semantic, strings
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .. import semantic_session as sessions
 from ..document_controller import (
-    DOCUMENT_REVIEW_LIMIT as _DOCUMENT_REVIEW_LIMIT, PART_KEYS as _PART_KEYS, Translation as _Translation,
-    DocumentRunController, WorkbenchHost, blank as _blank, copy_payload as _copy_payload,
-    normalize_semantic as _normalize_semantic,
+    DOCUMENT_REVIEW_LIMIT as _DOCUMENT_REVIEW_LIMIT, Translation as _Translation,
+    DocumentRunController, WorkbenchHost, blank as _blank,
+)
+from ..document_edits import (
+    REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
+    CommandOutcome, EditOutcome, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
 )
 from ..manuscript import (
-    MAX_SEGMENT_CHOICE_HISTORY, MAX_SEMANTIC_DECISIONS, WorkfileError, choice_conflict_groups,
-    empty_workfile, load_workfile, parse_workfile, save_workfile, semantic_payload_fits, serialize_workfile,
+    MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
+    parse_workfile, save_workfile, serialize_workfile,
 )
 from ..segmentation import STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
 from .components import ChevronComboBox
@@ -55,8 +57,6 @@ TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
 # ceiling as a workfile.
 MAX_IMPORT_BYTES = 1_048_576
 _TEXT_SUFFIXES = (".txt", ".md")
-_DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
-_REVIEW_KEYS = ("source", "target", "direction", "alignments", "choices")
 # The term-view status filters, in the order the combo lists them.
 _TERM_FILTER_KEYS = ("all", "inconsistent", "pending", "not_evaluated", "confirmed")
 # What a finding of a long manuscript still needs, by its record's state.
@@ -615,6 +615,9 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def show_term_report(self, report: dict) -> None:
         self._view._show_term_report(report)
 
+    def editor_state(self) -> dict:
+        return self._view._editor_state()
+
     def render_review_state(self) -> None:
         self._view._render_review_state()
         if self._view._report is None:
@@ -683,13 +686,8 @@ class ManuscriptView(QWidget):
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
         # an edit undo must never erase a report added later or undo a save.
-        self._undo_history: list[dict] = []
-        self._redo_history: list[dict] = []
-        # Semantic positions at each history step, restored with the text.
-        self._undo_sessions: list[dict] = []
-        self._redo_sessions: list[dict] = []
-        self._undo_editor_states: list[dict] = []
-        self._redo_editor_states: list[dict] = []
+        # The steps themselves are the controller's (document_edits.EditHistory);
+        # this half only supplies the editor's own view state.
         self._conflict_mode = False
         self._conflict_indexes: list[int] = []
         self._document_state: tuple[Path | None, bool, int] | None = None
@@ -705,7 +703,6 @@ class ManuscriptView(QWidget):
         self._issue_rows: list[sessions.LiveIssue] = []
         self._row_texts: list[str] = []
         self._rows_dirty = False
-        self._index: sessions.DecisionIndex | None = None
         self._segment_rows: list = []
         # The pairing the rows were listed from (identity only).
         self._segment_rows_from: list | None = None
@@ -1312,6 +1309,16 @@ class ManuscriptView(QWidget):
     def _document_revision(self, value: int) -> None:
         self._controller.document_revision = value
 
+    # The undo and redo steps are the controller's (document_edits.EditHistory);
+    # the view reads them for its buttons and its tests, and never edits them.
+    @property
+    def _undo_history(self) -> list:
+        return self._controller.history.undo
+
+    @property
+    def _redo_history(self) -> list:
+        return self._controller.history.redo
+
     # The runs' handles: read by the workbench's tests to await a run, and by
     # nothing in the view (it waits for the controller's callback instead).
     @property
@@ -1550,16 +1557,8 @@ class ManuscriptView(QWidget):
         """The semantic decisions stored in the manuscript (controller state)."""
         return self._controller.decisions()
 
-    def _decision_index(self) -> sessions.DecisionIndex:
-        """Decisions by occurrence, rebuilt only when the decisions list is
-        replaced (every change assigns a new list: edits, undo/redo, loading)."""
-        decisions = self._decisions()
-        if self._index is None or self._index.decisions is not decisions:
-            self._index = sessions.DecisionIndex(decisions)
-        return self._index
-
     def _issue_state(self, issue: sessions.LiveIssue) -> str:
-        return sessions.state_of(issue, self._decision_index(), self._payload["source"], self._payload["target"])
+        return self._controller.issue_state(issue)
 
     def _cached_pairs(self) -> list | None:
         """The pairing of the current text if already computed; never computes."""
@@ -1783,13 +1782,7 @@ class ManuscriptView(QWidget):
 
     def _selected_option(self, issue: sessions.LiveIssue) -> tuple[str, str] | None:
         """(replacement, term_effect) of the suggestion or its chosen alternative."""
-        suggestion = issue.issue["suggestion"]
-        if suggestion is None:
-            return None
-        alternatives = issue.issue["alternatives"]
-        if self.issue_alternative_button.isChecked() and alternatives:
-            return alternatives[0]["replacement"], alternatives[0]["term_effect"]
-        return suggestion["replacement"], suggestion["term_effect"]
+        return self._controller.selected_option(issue, self.issue_alternative_button.isChecked())
 
     def _render_issue(self, issue: sessions.LiveIssue | None) -> None:
         widgets = (self.issue_confidence, self.issue_excerpts, self.issue_rationale, self.issue_suggestion,
@@ -1858,29 +1851,11 @@ class ManuscriptView(QWidget):
         self.adjust_area.setVisible(self.adjust_area.isVisible() and self._can_adjust(issue))
         self._update_semantic_actions()
 
-    def _basis_holds(self, issue: sessions.LiveIssue) -> bool:
-        """The issue's semantic basis still holds; checked again right before
-        accept or adjust runs.
-
-        This is about one issue, not about reusing its segment's cache: an
-        accept elsewhere in the same segment makes the segment cache not
-        reusable, but leaves the other issues there executable. The issue's
-        own liveness (untouched by edits, spans still equal the text) is
-        checked separately by ``state_of`` and ``span_live``.
-        """
-        if issue.basis_lost or not self._semantic_available():
-            return False
-        return any(issue in r.issues and sessions.semantic_part_valid(r) for r in self._session.results)
-
     def _can_accept(self, issue: sessions.LiveIssue | None) -> bool:
-        return (issue is not None and issue.issue["suggestion"] is not None and self._basis_holds(issue)
-                and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
-                and sessions.span_live(issue.suggestion_span, self._payload["target"]))
+        return self._controller.can_accept(issue)
 
     def _can_adjust(self, issue: sessions.LiveIssue | None) -> bool:
-        return (issue is not None and issue.edit_span() is not None and self._basis_holds(issue)
-                and self._issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
-                and sessions.span_live(issue.edit_span(), self._payload["target"]))
+        return self._controller.can_adjust(issue)
 
     def _update_semantic_actions(self) -> None:
         issue = self._current_issue()
@@ -1889,8 +1864,7 @@ class ManuscriptView(QWidget):
         self.accept_button.setEnabled(free and self._can_accept(issue))
         self.adjust_button.setEnabled(free and self._can_adjust(issue))
         # A decision already made here stays as history; it is not decided again.
-        self.ignore_button.setEnabled(free and issue is not None and self._issue_state(issue) in sessions.UNHANDLED
-                                      and sessions.decision_for(issue, self._decision_index()) is None)
+        self.ignore_button.setEnabled(free and self._controller.can_ignore(issue))
         self.adjust_apply_button.setEnabled(free and self._can_adjust(issue))
         self.semantic_list.setEnabled(not composing)
 
@@ -1945,31 +1919,20 @@ class ManuscriptView(QWidget):
         self.status_label.setText(self.status_label.text() + " " + strings.MANUSCRIPT_ALL_HANDLED)
 
     # -- semantic review: decisions ------------------------------------------
-    def _record_decision(self, issue: sessions.LiveIssue, decision: str, *,
-                         applied_text: str | None = None, target: str | None = None,
-                         replaced: dict | None = None) -> bool:
-        """Apply one decision as one undoable edit, after a save preflight."""
-        record = sessions.make_decision(issue, decision, applied_text)
-        decisions = sessions.with_decision(self._decisions(), issue, record)
-        value = self._draft_snapshot()
-        value["semantic_decisions"] = decisions
-        if target is not None:
-            value["target"] = target
-            if value["alignments"] is not None:
-                value["alignments"] = []
-        candidate = _copy_payload(self._payload)
-        candidate.update(_copy_payload(value))
-        candidate.setdefault("semantic_history", [])
-        candidate["semantic_texts"] = self._semantic_texts(candidate)
-        _normalize_semantic(candidate)
-        if len(decisions) > MAX_SEMANTIC_DECISIONS or not semantic_payload_fits(candidate):
+    def _decision_refused(self, outcome: CommandOutcome, *, refresh: bool = False) -> None:
+        """Say why a decision did not apply, in the workbench's own words.
+
+        ``refresh`` re-lists the issue: its spans described text that has moved
+        since, which is what the owner has to see before deciding again.
+        """
+        if outcome.reason in (REASON_RECONFIRM, REASON_STALE):
+            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
+            if refresh:
+                self._refresh_semantic()
+        elif outcome.reason == REASON_REJECTED:
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+        elif outcome.reason == REASON_FULL:
             self.status_label.setText(strings.MANUSCRIPT_DECISIONS_FULL)
-            return False
-        edits = None
-        if replaced is not None:
-            edits = [("target", replaced["start"], replaced["end"], len(applied_text or ""))]
-        self._apply_edit(value, edits=edits, exempt=issue)
-        return True
 
     def _accept_current(self) -> None:
         if self.adjust_area.isVisible() and self.adjust_edit.hasFocus():
@@ -1980,25 +1943,14 @@ class ManuscriptView(QWidget):
         issue = self._current_issue()
         if issue is None or not self.accept_button.isEnabled():
             return
-        if not self._basis_holds(issue):
-            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
-            self._refresh_semantic()
-            return
-        replacement, _effect = self._selected_option(issue)
-        try:
-            # The executable range must still be exactly what was reported.
-            changed = semantic.apply_span(self._payload["target"], issue.suggestion_span, replacement)
-        except semantic.StaleSpan:
-            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
-            self._refresh_semantic()
-            return
-        if not self.target_edit.can_display(changed):
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            return
-        if self._record_decision(issue, "accepted", applied_text=replacement, target=changed,
-                                 replaced=issue.suggestion_span):
+        outcome = self._controller.accept_issue(
+            issue, alternative=self.issue_alternative_button.isChecked(),
+            can_display=self.target_edit.can_display)
+        if self._commit(outcome, editors=True):
             self.status_label.setText(strings.MANUSCRIPT_ACCEPTED)
             self._advance_after_decision(issue)
+            return
+        self._decision_refused(outcome, refresh=True)
 
     def _adjust_current(self) -> None:
         if not self._input_ready():
@@ -2016,27 +1968,16 @@ class ManuscriptView(QWidget):
         if not self._input_ready():
             return
         issue = self._current_issue()
-        if issue is None or not self._can_adjust(issue):
-            if issue is not None:
-                self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
+        if issue is None:
             return
-        text = self.adjust_edit.toPlainText()
-        if len(text) > semantic.MAX_SIDE_SCALARS:
-            return
-        try:
-            changed = semantic.apply_span(self._payload["target"], issue.edit_span(), text)
-        except semantic.StaleSpan:
-            self.status_label.setText(strings.MANUSCRIPT_RECONFIRM_NEEDED)
-            self._refresh_semantic()
-            return
-        if not self.target_edit.can_display(changed):
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            return
-        if self._record_decision(issue, "adjusted", applied_text=text, target=changed,
-                                 replaced=issue.edit_span()):
+        outcome = self._controller.adjust_issue(issue, self.adjust_edit.toPlainText(),
+                                                can_display=self.target_edit.can_display)
+        if self._commit(outcome, editors=True):
             self.adjust_area.hide()
             self.status_label.setText(strings.MANUSCRIPT_ADJUSTED)
             self._advance_after_decision(issue)
+            return
+        self._decision_refused(outcome)
 
     def _ignore_current(self) -> None:
         if not self._input_ready():
@@ -2044,9 +1985,12 @@ class ManuscriptView(QWidget):
         issue = self._current_issue()
         if issue is None or not self.ignore_button.isEnabled():
             return
-        if self._record_decision(issue, "ignored"):
+        outcome = self._controller.ignore_issue(issue)
+        if self._commit(outcome, editors=True):
             self.status_label.setText(strings.MANUSCRIPT_IGNORED)
             self._advance_after_decision(issue)
+            return
+        self._decision_refused(outcome)
 
     # -- segments --------------------------------------------------------------
     def _refresh_segments(self) -> None:
@@ -2178,7 +2122,7 @@ class ManuscriptView(QWidget):
         """An unconfirmed choice can be confirmed again only against a checked
         result that still reports its occurrence and, for an official pair,
         its candidate (SPEC "Runtime" step 7)."""
-        return sr.choice_reconfirmable(self._payload["segments"][index], choice, self._term_basis)
+        return self._controller.reconfirmable(index, choice)
 
     def _update_segment_actions(self) -> None:
         pair = self._current_segment()
@@ -2211,44 +2155,29 @@ class ManuscriptView(QWidget):
         if selected is None or pair is None or not self._input_ready():
             return
         if selected[0] == "history":
-            try:
-                parts = sr.restore(self._payload, selected[1], pair.index)
-            except (ValueError, WorkfileError):
-                self.status_label.setText(strings.MANUSCRIPT_TERM_CHOICE_FAILED)
-                return
-            self._apply_parts_edit(parts, strings.MANUSCRIPT_SEGMENT_CHOICE_RESTORED)
+            self._finish_choice(self._controller.restore_choice(selected[1], pair.index),
+                                strings.MANUSCRIPT_SEGMENT_CHOICE_RESTORED)
             return
-        choice = selected[1]
-        if not self._reconfirmable(pair.index, choice):
-            return
-        span = choice["source_span"]
-        candidate = choice["candidate"]["candidate_id"] if choice["choice"] == sr.OFFICIAL_PAIR else None
-        try:
-            parts = sr.choose(self._payload, pair.index, span["start"], span["end"], choice["choice"], candidate)
-        except (ValueError, WorkfileError):
-            self.status_label.setText(strings.MANUSCRIPT_TERM_CHOICE_FAILED)
-            return
-        self._apply_parts_edit(parts, strings.MANUSCRIPT_TERM_CHOICE_RECORDED)
+        self._finish_choice(self._controller.confirm_choice(pair.index, selected[1]),
+                            strings.MANUSCRIPT_TERM_CHOICE_RECORDED)
 
     def _segment_choice_removed(self) -> None:
         selected, pair = self._selected_segment_choice(), self._current_segment()
         if selected is None or selected[0] != "choice" or pair is None or not self._input_ready():
             return
         span = selected[1]["source_span"]
-        self._apply_parts_edit(sr.unchoose(self._payload, pair.index, span["start"], span["end"]),
+        self._apply_parts_edit(self._controller.unchoose_term(pair.index, span["start"], span["end"]),
                                strings.MANUSCRIPT_TERM_CHOICE_REMOVED)
 
     def _toggle_finished(self) -> None:
         pair = self._current_segment()
         if pair is None or not self._input_ready() or self._records() is None:
             return
-        parts = sr.parts_of(self._payload)
-        finished = pair.index in parts.progress["completed"]
-        try:
-            parts = sr.set_finished(parts, pair.index, not finished)
-        except ValueError:
+        finished = pair.index in sr.parts_of(self._payload).progress["completed"]
+        outcome = self._controller.set_finished(pair.index, not finished)
+        if outcome.reason == REASON_NOT_APPLICABLE:
             return
-        self._apply_parts_edit(parts, strings.MANUSCRIPT_SEGMENT_UNFINISHED if finished
+        self._apply_parts_edit(outcome, strings.MANUSCRIPT_SEGMENT_UNFINISHED if finished
                                else strings.MANUSCRIPT_SEGMENT_FINISHED)
 
     def _next_pending(self) -> None:
@@ -2829,16 +2758,25 @@ class ManuscriptView(QWidget):
         self.choice_button.setEnabled(free and ref is not None)
         self.unchoice_button.setEnabled(free and self._choice_at(index) is not None)
 
-    def _apply_parts_edit(self, parts: sr.Parts, message: str) -> None:
+    def _apply_parts_edit(self, outcome: CommandOutcome, message: str) -> None:
         """A change of choices, history or finished marks as one undoable edit;
         the editors and their caret are left alone."""
-        self._apply_edit(sr.with_parts(self._draft_snapshot(), parts), editors_already_updated=True)
+        self._commit(outcome, editors=False)
         self.status_label.setText(message)
         if self._long_now():
             self._show_segment_term_report()
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._refresh_segments()
         self._update_controls()
+
+    def _finish_choice(self, outcome: CommandOutcome, message: str) -> None:
+        """Show a choice or a restored history entry; a refusal says so instead."""
+        if outcome.reason == REASON_FAILED:
+            self.status_label.setText(strings.MANUSCRIPT_TERM_CHOICE_FAILED)
+            return
+        if outcome.reason == REASON_NOT_APPLICABLE:
+            return
+        self._apply_parts_edit(outcome, message)
 
     def _choose_term(self) -> None:
         if not self._input_ready() or self._term_basis is None:
@@ -2848,12 +2786,8 @@ class ManuscriptView(QWidget):
             return
         candidate_id = self.choice_combo.currentData()
         choice = sr.OFFICIAL_PAIR if candidate_id else sr.NOT_A_TERM
-        try:
-            parts = sr.choose(self._payload, *ref, choice, candidate_id or None)
-        except (ValueError, WorkfileError):
-            self.status_label.setText(strings.MANUSCRIPT_TERM_CHOICE_FAILED)
-            return
-        self._apply_parts_edit(parts, strings.MANUSCRIPT_TERM_CHOICE_RECORDED)
+        self._finish_choice(self._controller.choose_term(*ref, choice, candidate_id or None),
+                            strings.MANUSCRIPT_TERM_CHOICE_RECORDED)
 
     def _unchoose_term(self) -> None:
         if not self._input_ready():
@@ -2861,7 +2795,7 @@ class ManuscriptView(QWidget):
         ref = self._finding_record(self.findings.currentRow())
         if ref is None or self._choice_at(self.findings.currentRow()) is None:
             return
-        self._apply_parts_edit(sr.unchoose(self._payload, *ref), strings.MANUSCRIPT_TERM_CHOICE_REMOVED)
+        self._apply_parts_edit(self._controller.unchoose_term(*ref), strings.MANUSCRIPT_TERM_CHOICE_REMOVED)
 
     def _request_lookup(self) -> None:
         if not self._input_ready():
@@ -2905,8 +2839,8 @@ class ManuscriptView(QWidget):
         has_target = (self._report is not None and 0 <= index < len(self._report["findings"])
                       and self._target_span_reliable(self._report["findings"][index].get("target_span")))
         self.replace_button.setEnabled(bool(has_target and self.replacement_edit.text() and not composing))
-        self.undo_button.setEnabled(bool(self._undo_history) and not composing)
-        self.redo_button.setEnabled(bool(self._redo_history) and not composing)
+        self.undo_button.setEnabled(self._controller.can_undo() and not composing)
+        self.redo_button.setEnabled(self._controller.can_redo() and not composing)
         self.remove_choice_button.setEnabled(0 <= self.conflict_list.currentRow() < len(self._conflict_indexes))
         self._update_choice_actions()
         self._update_segment_actions()
@@ -2957,60 +2891,8 @@ class ManuscriptView(QWidget):
         self._controller.set_review_state(state, detail=detail, request_id=request_id)
 
     def _draft_snapshot(self) -> dict:
-        value = {key: self._payload[key] for key in _DRAFT_KEYS}
-        # Decisions are part of the draft, so undo and redo take them back too.
-        value["semantic_decisions"] = self._payload.get("semantic_decisions", [])
-        value = copy.deepcopy(value)
-        # So are the long-mode records, choices and progress: held by reference.
-        for key in _PART_KEYS:
-            if key in self._payload:
-                value[key] = self._payload[key]
-        return value
-
-    def _restore_draft(self, value: dict) -> None:
-        value = _copy_payload(value)
-        decisions = value.pop("semantic_decisions", [])
-        for key in _PART_KEYS:
-            self._payload.pop(key, None)
-        self._payload.update(value)
-        self._payload["semantic_decisions"] = decisions
-        self._payload.setdefault("semantic_history", [])
-        self._payload.setdefault("semantic_texts", [])
-        _normalize_semantic(self._payload)
-
-    def _after_draft_change(self, before: dict, after: dict, edits: list | None = None,
-                            exempt: sessions.LiveIssue | None = None) -> None:
-        """Keep model results across edits; invalidate exactly what an edit touched.
-
-        ``edits`` are the replacements actually performed, as
-        ``(side, start, old_end, new_length)``. A text change that arrives
-        without them is treated as replacing that whole side.
-        """
-        if before["direction"] != after["direction"]:
-            if self._session.results or self._semantic_running():
-                self._clear_semantic()
-                self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED)
-        elif edits is not None or before["source"] != after["source"] or before["target"] != after["target"]:
-            if edits is None:
-                edits = [(side, 0, len(before[side]), len(after[side]))
-                         for side in ("source", "target") if before[side] != after[side]]
-            parts = sr.parts_of(self._payload) if "segments" in self._payload else None
-            for side, start, old_end, new_length in edits:
-                self._session.apply_edit(side, start, old_end, new_length, exempt=exempt)
-                if parts is not None:
-                    # Records the edit hit become pending (their finished marks
-                    # go); the rest shift. Normalized on the derived refresh.
-                    parts = sr.apply_edit(parts, before[side], side, start, old_end, new_length)
-            if parts is not None:
-                self._put_parts(parts)
-        if any(before[key] != after[key] for key in _REVIEW_KEYS):
-            self._invalidate_report()
-        if self._conflict_mode:
-            self._refresh_conflicts()
-        self._refresh_semantic()
-        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
-            self._derived_timer.start()
-        self._update_controls()
+        """The undoable draft of the document (the controller's)."""
+        return self._controller.draft_snapshot()
 
     def _editor_state(self) -> dict:
         return {"side": self._last_side, "source": self.source_edit.view_state(),
@@ -3022,40 +2904,54 @@ class ManuscriptView(QWidget):
         for side, widget in (("source", self.source_edit), ("target", self.target_edit)):
             widget.restore_view_state(state[side])
 
-    def _push_history(self, stack: list, sessions_stack: list, editor_states: list, value: dict,
-                      editor_state: dict | None = None) -> tuple[list, list, list]:
-        return ((stack + [value])[-20:], (sessions_stack + [self._session.snapshot()])[-20:],
-                (editor_states + [self._editor_state() if editor_state is None else editor_state])[-20:])
+    def _commit(self, outcome: CommandOutcome, *, editors: bool) -> bool:
+        """The host's side of a committed command: the editors, then the refresh.
+
+        ``editors`` is False when the command's caller already put the text
+        into the editors (``apply_target_write``, typing, a parts-only edit),
+        which is what ``editors_already_updated`` used to say.
+        """
+        self._finish(outcome.edit, editors=editors)
+        return outcome.committed
+
+    def _finish(self, edit: EditOutcome | None, *, editors: bool) -> None:
+        """Write a committed edit into the editors and refresh what it changed."""
+        if edit is None or not edit.committed:
+            return
+        if self.status_label.text() == strings.MANUSCRIPT_SAVE_DONE:
+            self.status_label.setText(strings.MANUSCRIPT_UNSAVED)
+        if editors:
+            self._set_payload(self._payload)
+        self._after_edit(edit)
+
+    def _after_edit(self, outcome: EditOutcome) -> None:
+        """What a committed edit means for the workbench, in the order it means it.
+
+        The results and the records have already moved with the edit (the
+        controller), so this only says so: the direction's results are gone,
+        the listed report is stale, the rows and the buttons follow.
+        """
+        if outcome.semantic_cleared:
+            self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED)
+        if outcome.review_inputs_changed:
+            self._invalidate_report()
+        if self._conflict_mode:
+            self._refresh_conflicts()
+        self._refresh_semantic()
+        if self.track_stack.currentIndex() == TRACK_SEGMENTS:
+            self._derived_timer.start()
+        self._update_controls()
 
     def _apply_edit(self, value: dict, *, editors_already_updated: bool = False, edits: list | None = None,
                     exempt: sessions.LiveIssue | None = None) -> None:
-        before = self._draft_snapshot()
-        incoming = value
-        value = {**before, **_copy_payload(value)}
-        for key in _PART_KEYS:
-            # A draft without long-mode parts has none (it left long mode).
-            if key not in incoming:
-                value.pop(key, None)
-        if value == before:
-            return
         editor_state = self._editor_state()
         if editors_already_updated:
             for side, *_range in edits or []:
                 editor = self.source_edit if side == "source" else self.target_edit
                 if editor.last_edit_view is not None:
                     editor_state[side] = editor.last_edit_view
-        self._undo_history, self._undo_sessions, self._undo_editor_states = self._push_history(
-            self._undo_history, self._undo_sessions, self._undo_editor_states, before, editor_state)
-        self._redo_history.clear()
-        self._redo_sessions.clear()
-        self._redo_editor_states.clear()
-        self._restore_draft(value)
-        self._document_revision += 1
-        if self.status_label.text() == strings.MANUSCRIPT_SAVE_DONE:
-            self.status_label.setText(strings.MANUSCRIPT_UNSAVED)
-        if not editors_already_updated:
-            self._set_payload(self._payload)
-        self._after_draft_change(before, value, edits, exempt)
+        outcome = self._controller.apply_edit(value, view_state=editor_state, edits=edits, exempt=exempt)
+        self._finish(outcome, editors=not editors_already_updated)
 
     def _apply_endpoint_state(self) -> None:
         self._render_inspector_hint()
@@ -3141,7 +3037,7 @@ class ManuscriptView(QWidget):
         if value == self._draft_snapshot():
             if edit is not None:
                 # Text rewritten with identical text: still an edit of that range.
-                self._session.apply_edit(*edit)
+                self._controller.note_edit(edit)
                 self._refresh_semantic()
                 self._update_controls()
             return
@@ -3459,31 +3355,17 @@ class ManuscriptView(QWidget):
 
     def _step_history(self, *, undo: bool) -> None:
         """Undo and redo restore text, decisions and the semantic positions together."""
-        source = self._undo_history if undo else self._redo_history
-        if not source or not self._input_ready():
+        if not (self._controller.can_undo() if undo else self._controller.can_redo()) or not self._input_ready():
             return
-        value = source.pop()
-        saved = (self._undo_sessions if undo else self._redo_sessions).pop()
-        editor_state = (self._undo_editor_states if undo else self._redo_editor_states).pop()
-        before = self._draft_snapshot()
-        if undo:
-            self._redo_history, self._redo_sessions, self._redo_editor_states = self._push_history(
-                self._redo_history, self._redo_sessions, self._redo_editor_states, before)
-        else:
-            self._undo_history, self._undo_sessions, self._undo_editor_states = self._push_history(
-                self._undo_history, self._undo_sessions, self._undo_editor_states, before)
-        later = sr.parts_of(self._payload)
-        self._restore_draft(value)
-        if "segments" in self._payload:
-            # Checks made after the snapshot stay where the content is the same.
-            self._put_parts(sr.carry_results(sr.parts_of(self._payload), later))
-        self._set_payload(self._payload)
-        self._session.restore(saved)
-        # Positions came back with the snapshot; only the review state follows.
-        self._after_draft_change(before, value, edits=[])
+        outcome = (self._controller.undo(view_state=self._editor_state()) if undo
+                   else self._controller.redo(view_state=self._editor_state()))
+        if outcome is None:
+            return
+        self._finish(outcome.edit, editors=True)
         self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
         self._update_controls()
-        self._restore_editor_state(editor_state)
+        if outcome.entry.view is not None:
+            self._restore_editor_state(outcome.entry.view)
 
     def _set_payload(self, value: dict) -> None:
         self._updating = True
@@ -3551,16 +3433,12 @@ class ManuscriptView(QWidget):
         if not 0 <= row < len(self._conflict_indexes):
             return
         if self._history_removal:
-            parts = sr.parts_of(self._payload)
-            history = [entry for number, entry in enumerate(parts.history) if number != row]
-            self._apply_parts_edit(parts._replace(history=history), strings.MANUSCRIPT_HISTORY_CHOICE_REMOVED)
+            self._apply_parts_edit(self._controller.remove_history_choice(row),
+                                   strings.MANUSCRIPT_HISTORY_CHOICE_REMOVED)
             self._refresh_conflicts()
             self.conflict_list.setCurrentRow(min(row, self.conflict_list.count() - 1))
             return
-        index = self._conflict_indexes[row]
-        value = self._draft_snapshot()
-        value["choices"].pop(index)
-        self._apply_edit(value)
+        self._commit(self._controller.remove_choice(self._conflict_indexes[row]), editors=True)
         self.status_label.setText(strings.MANUSCRIPT_CHOICE_REMOVED)
 
     def confirm_discard(self) -> bool:
@@ -3704,12 +3582,7 @@ class ManuscriptView(QWidget):
         self._invalidate_report()
         self._stop_translation()
         self._clear_semantic()
-        self._undo_history.clear()
-        self._redo_history.clear()
-        self._undo_sessions.clear()
-        self._redo_sessions.clear()
-        self._undo_editor_states.clear()
-        self._redo_editor_states.clear()
+        self._controller.clear_history()
         self._conflict_mode = self._history_removal = False
         self._mismatch_prompt_active = False
         self._term_view_override = None

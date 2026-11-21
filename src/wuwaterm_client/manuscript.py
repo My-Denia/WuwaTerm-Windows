@@ -23,7 +23,7 @@ import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from .semantic import CATEGORIES, REVIEW_VERSION, valid_semantic_report
 
@@ -99,6 +99,75 @@ class WorkfileError(ValueError):
 def empty_workfile() -> dict[str, Any]:
     return {"format": WORKFILE_FORMAT, "source": "", "target": "", "direction": "en",
             "alignments": None, "choices": [], "history": []}
+
+
+# -- Response models (review-v1/v2, the shape `valid_report` accepts) --------
+#
+# These name the fields a validated report carries, so the boundary that hands
+# one on (``api`` -> ``document_controller`` -> ``segment_records``) says what
+# it is passing. They are statements about the wire, not checks: the runtime
+# validation is `valid_report` below, unchanged and still the only thing that
+# decides whether a response is this service's.
+
+
+class ReviewSpan(TypedDict):
+    """One location of a finding; offsets are Unicode scalar indices."""
+
+    start: int
+    end: int
+    text: str
+
+
+class ReviewCandidateSource(TypedDict):
+    source_file: str
+    source_id: str
+
+
+class ReviewCandidate(TypedDict):
+    zh: str
+    en: str
+    category: str
+    sources: list[ReviewCandidateSource]
+    candidate_id: NotRequired[str]  # review-v2 only
+
+
+class ReviewDictionary(TypedDict):
+    schema_version: str | None
+    source_commit: str | None
+    term_count: int
+    revision: NotRequired[str]  # review-v2 only
+
+
+class ReviewCoverage(TypedDict):
+    evaluated: int
+    not_evaluated: int
+    rules: list[str]
+
+
+class ReviewFinding(TypedDict):
+    id: str
+    rule_id: str
+    verdict: str
+    source_span: ReviewSpan
+    target_span: ReviewSpan | None
+    candidates: list[ReviewCandidate]
+    candidates_truncated: bool
+    reason: NotRequired[str]  # review-v4 only
+
+
+class ReviewReport(TypedDict):
+    """A review-v1/v2 report: the dictionary and matcher basis it was made
+    with, its coverage and its findings."""
+
+    request_id: str
+    source_revision: str
+    target_revision: str
+    rule_version: str
+    dictionary: ReviewDictionary
+    coverage: ReviewCoverage
+    findings: list[ReviewFinding]
+    truncated: bool
+    matcher_revision: NotRequired[str]  # review-v2 only
 
 
 def _keys(value: Any, fields: set[str]) -> bool:

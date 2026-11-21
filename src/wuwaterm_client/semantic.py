@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, TypedDict
 
 REVIEW_VERSION = "semantic-review-v1"
 CAPABILITY_SEMANTIC_REVIEW = "semantic-review-v1"
@@ -171,6 +171,72 @@ def _issue(issue: Any, source: str, target: str) -> bool:
         and alt["term_effect"] in TERM_EFFECTS
         for alt in alternatives
     )
+
+
+# -- Response models (semantic-review-v1, the shape `_valid_semantic_report` accepts)
+#
+# They name what a validated response carries so the code that hands it on
+# (``api`` -> ``document_controller`` -> ``semantic_session``) can say so.
+# They are not checks: `valid_semantic_report` below stays the only thing that
+# decides whether a body is the contract's answer for the text that was sent.
+
+
+class SemanticSpan(TypedDict):
+    """One side's location, in Unicode scalar indices."""
+
+    start: int
+    end: int
+    text: str
+
+
+class SemanticSuggestion(TypedDict):
+    target_span: SemanticSpan
+    replacement: str
+    term_effect: str
+
+
+class SemanticAlternative(TypedDict):
+    replacement: str
+    term_effect: str
+
+
+class SemanticIssue(TypedDict):
+    id: str
+    fingerprint: str
+    category: str
+    origin: str
+    confidence: str
+    source_span: SemanticSpan | None
+    target_span: SemanticSpan | None
+    source_excerpt: str | None
+    target_excerpt: str | None
+    rationale: str
+    suggestion: SemanticSuggestion | None
+    suggestion_withheld: str | None
+    alternatives: list[SemanticAlternative]
+
+
+class SemanticTermBasis(TypedDict):
+    dictionary_revision: str
+    matcher_revision: str
+
+
+class SemanticReviewReport(TypedDict):
+    """A semantic-review-v1 answer about exactly the source and target sent."""
+
+    request_id: str
+    review_version: str
+    source_revision: str
+    target_revision: str
+    term_basis: SemanticTermBasis
+    status: str
+    status_reason: str | None
+    dropped_unanchored: int
+    checked: list[str]
+    issues: list[SemanticIssue]
+    truncated: bool
+    truncated_reason: str | None
+    omitted_issues: int
 
 
 def valid_semantic_report(data: Any, source: str, target: str) -> bool:

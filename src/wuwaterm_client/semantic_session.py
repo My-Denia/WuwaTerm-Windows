@@ -295,8 +295,8 @@ def semantic_part_valid(result: SegmentResult) -> bool:
             and result.report["review_version"] == semantic.REVIEW_VERSION)
 
 
-def live_issues_from_report(report: dict, *, segment_index: int, source_offset: int, target_offset: int,
-                            source_revision: str, target_revision: str) -> list[LiveIssue]:
+def live_issues_from_report(report: semantic.SemanticReviewReport, *, segment_index: int, source_offset: int,
+                            target_offset: int, source_revision: str, target_revision: str) -> list[LiveIssue]:
     issues = []
     for raw in report["issues"]:
         full = copy.deepcopy(raw)

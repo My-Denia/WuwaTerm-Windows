@@ -21,6 +21,18 @@ from a superseded run is dropped instead of shown:
   piece, resumable from the first unfinished piece, writing what it finished as
   one undoable edit.
 
+The document's own commands live here too, because they commit to the same
+state the runs commit to and through the same checks: ``apply_edit`` and the
+undo/redo pair over it, the term-choice commands (``choose_term``,
+``unchoose_term``, ``restore_choice``, ``confirm_choice``, ``set_finished``),
+the conflict removals, and the semantic decisions (``accept_issue``,
+``adjust_issue``, ``ignore_issue``, ``record_decision``) with the questions
+they ask of the document (``issue_state``, ``basis_holds``, ``can_accept``,
+``can_adjust``, ``can_ignore``). They are pure domain operations: the Qt half
+only says which one the owner asked for, hands in the two things this module
+cannot do itself (the editor's view state and whether the editor can display
+a text), and renders the outcome.
+
 Committing also lives here, because a commit is what must be atomic with the
 generation check: ``store_semantic``, ``remember_semantic_report`` and
 ``translation_stopped`` write the payload and the session, never a widget.
@@ -37,19 +49,25 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from . import segment_records as sr, semantic, strings
 from . import semantic_session as sessions
+from .document_edits import (
+    HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome, PART_KEYS,
+    REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
+    REVIEW_KEYS, copy_payload, draft_of, merge_draft, normalize_semantic, restore_draft_into,
+)
 from .errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_INVALID_REQUEST,
     ERROR_LLM_BUDGET_EXHAUSTED, ERROR_LLM_UNAVAILABLE, ERROR_NOT_CONFIGURED, ERROR_OFFLINE,
     ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
 )
 from .manuscript import (
-    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_HISTORY, WorkfileError, empty_workfile, semantic_payload_fits,
-    serialize_workfile,
+    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, ReviewReport, WorkfileError,
+    empty_workfile, semantic_payload_fits, serialize_workfile,
 )
 from .segmentation import (
     SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
@@ -66,37 +84,15 @@ FATAL_CODES = frozenset({ERROR_UNAUTHORIZED, ERROR_FORBIDDEN, ERROR_NOT_CONFIGUR
                          ERROR_INSECURE_ENDPOINT, ERROR_OFFLINE, ERROR_LLM_UNAVAILABLE})
 # The same failure on consecutive segments is the service, not the segment.
 REPEATED_FAILURES = 2
-# The v3 long-mode parts (segment_records). Their values are never changed in
-# place, so copies of the payload share them instead of copying hundreds of
-# records on every keystroke.
-PART_KEYS = ("segments", "segment_choice_history", "progress")
 # A stopped translation run, by the state it left: both offer a next press, and
 # both are dropped once the text is no longer what the run left.
 TRANSLATION_RESUMABLE = ("paused", "failed")
 # The translation run's phases: idle, and the four the view renders apart.
 TRANSLATION_IDLE = "idle"
 
-
-def copy_payload(value: dict) -> dict:
-    """A deep copy that shares the immutable long-mode parts."""
-    return {key: item if key in PART_KEYS else copy.deepcopy(item) for key, item in value.items()}
-
-
-def normalize_semantic(payload: dict) -> dict:
-    """Semantic keys are present together, and only with semantic data.
-
-    A manuscript without semantic data stays byte-for-byte a v1 workfile, so
-    an untouched draft never looks edited because of an empty list.
-    """
-    decisions = payload.get("semantic_decisions") or []
-    history = payload.get("semantic_history") or []
-    if decisions or history:
-        payload["semantic_decisions"], payload["semantic_history"] = decisions, history
-        payload["semantic_texts"] = payload.get("semantic_texts") or []
-    else:
-        for key in ("semantic_decisions", "semantic_texts", "semantic_history"):
-            payload.pop(key, None)
-    return payload
+# The draft primitives (``copy_payload``, ``normalize_semantic``, ``PART_KEYS``)
+# live in ``document_edits``: the runs and the commands commit through them,
+# and they are imported here so this module's surface does not move with them.
 
 
 def blank(text: str) -> bool:
@@ -128,6 +124,53 @@ class Translation:
     out: list[str] = field(default_factory=list)
 
 
+class TranslationResponse(Protocol):
+    """One finished translation, as far as a run reads it.
+
+    ``api.TranslationResult`` satisfies it. Naming only the field a run uses is
+    what keeps this module (and its tests) importable with no HTTP library: the
+    real result is built, and validated, by the client.
+    """
+
+    text: str
+
+
+@runtime_checkable
+class WorkbenchApiClient(Protocol):
+    """The client calls this workbench makes, and nothing else.
+
+    ``api.ApiClient`` implements it; the narrow surface is declared here so the
+    runs can be driven by a stand-in with no HTTP. These annotations describe
+    what a *validated* answer looks like - they are not checks and replace
+    none: ``api`` refuses anything that is not this service's answer for the
+    text it sent, and that runtime validation stays where it is.
+    """
+
+    async def get_capabilities(self) -> frozenset[str]:
+        """The optional capabilities the server lists (empty when it lists none)."""
+
+    async def review_pair(
+        self, source: str, target: str, direction: str, *,
+        alignments: list[dict[str, Any]] | None = None,
+        resolutions: list[dict[str, Any]] | None = None,
+        resolution_context: dict[str, str] | None = None,
+    ) -> ReviewReport:
+        """One term check (``review-v2``): the report for exactly these sides."""
+
+    async def semantic_review(
+        self, source: str, target: str, direction: str, *,
+        before: dict[str, str] | None = None,
+        precedents: Sequence[Mapping[str, Any]] = (),
+    ) -> semantic.SemanticReviewReport:
+        """One semantic review (``semantic-review-v1``) of exactly these sides."""
+
+    async def translate(
+        self, text: str, *, to: str | None = None, context: dict[str, Any] | None = None,
+    ) -> TranslationResponse:
+        """One piece of text, translated."""
+
+
+@runtime_checkable
 class WorkbenchHost(Protocol):
     """What the Qt half must provide for a run: rendering and the editor write.
 
@@ -153,8 +196,15 @@ class WorkbenchHost(Protocol):
     def show_segment_term_report(self) -> None:
         """List a long manuscript's term results from its segment records."""
 
-    def show_term_report(self, report: dict) -> None:
+    def show_term_report(self, report: ReviewReport) -> None:
         """List the findings of a committed document review."""
+
+    def editor_state(self) -> dict:
+        """The editor's own view state right now (caret, focus, scroll).
+
+        Opaque to this module: it is stored with an undo step and handed back
+        when that step is restored, and nothing here reads it.
+        """
 
     def render_review_state(self) -> None:
         """Show the review phase, its detail and the request id it came from."""
@@ -189,13 +239,18 @@ class WorkbenchHost(Protocol):
 
 
 class DocumentRunController:
-    """The workbench's runs and the document state they commit to."""
+    """The workbench's runs, its document commands and the state both commit to."""
 
-    def __init__(self, api_client: Any, host: WorkbenchHost) -> None:
+    def __init__(self, api_client: WorkbenchApiClient, host: WorkbenchHost) -> None:
         self.api_client = api_client
         self.host = host
         # The manuscript. Everything that commits writes it; the view reads it.
         self.payload: dict[str, Any] = empty_workfile()
+        # The undo and redo steps of edits, term choices and decisions.
+        self.history = EditHistory()
+        # Decisions by occurrence, rebuilt only when the decisions list is
+        # replaced (every change assigns a new list: edits, undo/redo, loading).
+        self.decision_cache: sessions.DecisionIndex | None = None
         # Term review of a short manuscript, one request.
         self.generation = 0
         self.task: asyncio.Task | None = None
@@ -346,7 +401,299 @@ class DocumentRunController:
             if text is not None:
                 self.known_texts.setdefault(sessions.revision(text), text)
 
+    # -- document commands: edits, history, choices and decisions ------------
+    # The Qt half asks for one of these and renders the outcome; each one
+    # commits exactly the way its button always did. They are the domain
+    # operations themselves - which is what makes the workbench's editing
+    # behaviour testable without a widget (tests/test_document_controller.py).
+
+    def draft_snapshot(self) -> dict:
+        """The undoable draft of the document (``document_edits.draft_of``)."""
+        return draft_of(self.payload)
+
+    def restore_draft(self, value: dict) -> None:
+        """Hold a draft in the payload, in place."""
+        restore_draft_into(self.payload, value)
+
+    def decision_index(self) -> sessions.DecisionIndex:
+        """Decisions by occurrence, rebuilt only when the list is replaced."""
+        decisions = self.decisions()
+        if self.decision_cache is None or self.decision_cache.decisions is not decisions:
+            self.decision_cache = sessions.DecisionIndex(decisions)
+        return self.decision_cache
+
+    def issue_state(self, issue: sessions.LiveIssue) -> str:
+        """What still has to happen about this issue (``semantic_session.state_of``)."""
+        return sessions.state_of(issue, self.decision_index(), self.payload["source"], self.payload["target"])
+
+    def apply_edit(self, value: dict, *, view_state: dict | None = None, edits: list | None = None,
+                   exempt: sessions.LiveIssue | None = None) -> EditOutcome:
+        """Commit one edit of the document as one undoable step.
+
+        ``value`` is the draft after the change; keys it does not carry keep
+        their current value, and a draft without long-mode parts leaves long
+        mode. ``edits`` are the text replacements actually performed, as
+        ``(side, start, old_end, new_length)``: without them a changed side is
+        treated as replaced whole. ``exempt`` keeps the issue a decision was
+        about alive across its own edit. ``view_state`` is the host's state to
+        restore when this step is undone; without it the host is asked.
+        """
+        before = self.draft_snapshot()
+        merged = merge_draft(before, value)
+        if merged == before:
+            return EditOutcome()
+        self.history.record(HistoryEntry(before, self.session.snapshot(),
+                                         self.host.editor_state() if view_state is None else view_state))
+        self.restore_draft(merged)
+        self.document_revision += 1
+        cleared = False
+        if before["direction"] != merged["direction"]:
+            # Results belong to one direction; the other side's cannot be kept.
+            if self.session.results or self.semantic_running():
+                self.clear_semantic()
+                cleared = True
+        elif edits is not None or before["source"] != merged["source"] or before["target"] != merged["target"]:
+            self._apply_text_edits(before, merged, edits, exempt)
+        return EditOutcome(True, cleared, any(before[key] != merged[key] for key in REVIEW_KEYS))
+
+    def _apply_text_edits(self, before: dict, after: dict, edits: list | None,
+                          exempt: sessions.LiveIssue | None) -> None:
+        """Move the stored results and the records to where the edit left the text."""
+        if edits is None:
+            edits = [(side, 0, len(before[side]), len(after[side]))
+                     for side in ("source", "target") if before[side] != after[side]]
+        parts = sr.parts_of(self.payload) if "segments" in self.payload else None
+        for side, start, old_end, new_length in edits:
+            self.session.apply_edit(side, start, old_end, new_length, exempt=exempt)
+            if parts is not None:
+                # Records the edit hit become pending (their finished marks go);
+                # the rest shift. Normalized on the derived refresh.
+                parts = sr.apply_edit(parts, before[side], side, start, old_end, new_length)
+        if parts is not None:
+            self.put_parts(parts)
+
+    def note_edit(self, edit: tuple) -> None:
+        """Text rewritten with identical text: still an edit of that range."""
+        self.session.apply_edit(*edit)
+
+    def apply_parts_edit(self, parts: sr.Parts, *, view_state: dict | None = None) -> CommandOutcome:
+        """Commit a change of choices, history or finished marks as one undoable
+        edit; the editors' text does not change."""
+        return CommandOutcome(True, edit=self.apply_edit(sr.with_parts(self.draft_snapshot(), parts),
+                                                       view_state=view_state))
+
+    def can_undo(self) -> bool:
+        return self.history.can_undo()
+
+    def can_redo(self) -> bool:
+        return self.history.can_redo()
+
+    def clear_history(self) -> None:
+        """A new document: nothing before it is undoable."""
+        self.history.clear()
+
+    def undo(self, *, view_state: dict | None = None) -> HistoryOutcome | None:
+        """Take back the last edit, its choices, decisions and positions."""
+        return self._step_history(undo=True, view_state=view_state)
+
+    def redo(self, *, view_state: dict | None = None) -> HistoryOutcome | None:
+        """Put back the last edit taken back."""
+        return self._step_history(undo=False, view_state=view_state)
+
+    def _step_history(self, *, undo: bool, view_state: dict | None) -> HistoryOutcome | None:
+        """Undo and redo restore text, decisions and the semantic positions together."""
+        before = self.draft_snapshot()
+        entry = self.history.step(undo=undo, current=HistoryEntry(
+            before, self.session.snapshot(), self.host.editor_state() if view_state is None else view_state))
+        if entry is None:
+            return None
+        later = sr.parts_of(self.payload)
+        self.restore_draft(entry.value)
+        if "segments" in self.payload:
+            # Checks made after the snapshot stay where the content is the same.
+            self.put_parts(sr.carry_results(sr.parts_of(self.payload), later))
+        self.session.restore(entry.session)
+        cleared = before["direction"] != entry.value["direction"]
+        if cleared and (self.session.results or self.semantic_running()):
+            self.clear_semantic()
+        else:
+            cleared = False
+        return HistoryOutcome(entry, EditOutcome(True, cleared,
+                                                 any(before[key] != entry.value[key] for key in REVIEW_KEYS)))
+
+    # Term choices (segment_records). Each returns what the workbench shows:
+    # ``REASON_FAILED`` is the records refusing the change, never a crash.
+
+    def reconfirmable(self, index: int, choice: dict) -> bool:
+        """An unconfirmed choice can be confirmed again only against a checked
+        result that still reports its occurrence and, for an official pair,
+        its candidate (SPEC "Runtime" step 7)."""
+        return sr.choice_reconfirmable(self.payload["segments"][index], choice, self.term_basis)
+
+    def choose_term(self, index: int, start: int, end: int, choice: str,
+                    candidate_id: str | None = None) -> CommandOutcome:
+        """The owner's choice at a listed finding: an official pair or not a term."""
+        try:
+            parts = sr.choose(self.payload, index, start, end, choice, candidate_id)
+        except (ValueError, WorkfileError):
+            return CommandOutcome(reason=REASON_FAILED)
+        return self.apply_parts_edit(parts)
+
+    def unchoose_term(self, index: int, start: int, end: int) -> CommandOutcome:
+        """Remove the owner's choice at that span."""
+        return self.apply_parts_edit(sr.unchoose(self.payload, index, start, end))
+
+    def restore_choice(self, position: int, index: int) -> CommandOutcome:
+        """Bring a history choice back into that record, unconfirmed."""
+        try:
+            parts = sr.restore(self.payload, position, index)
+        except (ValueError, WorkfileError):
+            return CommandOutcome(reason=REASON_FAILED)
+        return self.apply_parts_edit(parts)
+
+    def confirm_choice(self, index: int, choice: dict) -> CommandOutcome:
+        """Confirm an unconfirmed choice again, against the current result."""
+        if not self.reconfirmable(index, choice):
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        span = choice["source_span"]
+        candidate = choice["candidate"]["candidate_id"] if choice["choice"] == sr.OFFICIAL_PAIR else None
+        return self.choose_term(index, span["start"], span["end"], choice["choice"], candidate)
+
+    def set_finished(self, index: int, finished: bool) -> CommandOutcome:
+        """Mark (or unmark) a segment as finished."""
+        try:
+            parts = sr.set_finished(sr.parts_of(self.payload), index, finished)
+        except ValueError:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        return self.apply_parts_edit(parts)
+
+    def remove_history_choice(self, position: int) -> CommandOutcome:
+        """Drop one entry of the choice history (the save refused it as over its cap)."""
+        parts = sr.parts_of(self.payload)
+        history = [entry for number, entry in enumerate(parts.history) if number != position]
+        return self.apply_parts_edit(parts._replace(history=history))
+
+    def remove_choice(self, index: int) -> CommandOutcome:
+        """Drop one document-mode choice (the save refused it as a conflict)."""
+        value = self.draft_snapshot()
+        value["choices"].pop(index)
+        return CommandOutcome(True, edit=self.apply_edit(value))
+
+    # Semantic decisions. The questions and the commits are separate: the view
+    # asks ``can_accept``/``can_adjust``/``can_ignore`` to enable its buttons,
+    # then asks for one of the three decisions.
+
+    def basis_holds(self, issue: sessions.LiveIssue) -> bool:
+        """The issue's semantic basis still holds; checked again right before
+        accept or adjust runs.
+
+        This is about one issue, not about reusing its segment's cache: an
+        accept elsewhere in the same segment makes the segment cache not
+        reusable, but leaves the other issues there executable. The issue's
+        own liveness (untouched by edits, spans still equal the text) is
+        checked separately by ``issue_state`` and ``span_live``.
+        """
+        if issue.basis_lost or not self.semantic_available():
+            return False
+        return any(issue in r.issues and sessions.semantic_part_valid(r) for r in self.session.results)
+
+    def can_accept(self, issue: sessions.LiveIssue | None) -> bool:
+        return (issue is not None and issue.issue["suggestion"] is not None and self.basis_holds(issue)
+                and self.issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
+                and sessions.span_live(issue.suggestion_span, self.payload["target"]))
+
+    def can_adjust(self, issue: sessions.LiveIssue | None) -> bool:
+        return (issue is not None and issue.edit_span() is not None and self.basis_holds(issue)
+                and self.issue_state(issue) in (sessions.STATE_PENDING, sessions.STATE_NEEDS_RECONFIRM)
+                and sessions.span_live(issue.edit_span(), self.payload["target"]))
+
+    def can_ignore(self, issue: sessions.LiveIssue | None) -> bool:
+        """A decision already made here stays as history; it is not decided again."""
+        return (issue is not None and self.issue_state(issue) in sessions.UNHANDLED
+                and sessions.decision_for(issue, self.decision_index()) is None)
+
+    @staticmethod
+    def selected_option(issue: sessions.LiveIssue, alternative: bool = False) -> tuple[str, str] | None:
+        """(replacement, term_effect) of the suggestion or its chosen alternative."""
+        suggestion = issue.issue["suggestion"]
+        if suggestion is None:
+            return None
+        alternatives = issue.issue["alternatives"]
+        if alternative and alternatives:
+            return alternatives[0]["replacement"], alternatives[0]["term_effect"]
+        return suggestion["replacement"], suggestion["term_effect"]
+
+    def record_decision(self, issue: sessions.LiveIssue, decision: str, *,
+                        applied_text: str | None = None, target: str | None = None,
+                        replaced: dict | None = None) -> CommandOutcome:
+        """Apply one decision as one undoable edit, after a save preflight."""
+        record = sessions.make_decision(issue, decision, applied_text)
+        decisions = sessions.with_decision(self.decisions(), issue, record)
+        value = self.draft_snapshot()
+        value["semantic_decisions"] = decisions
+        if target is not None:
+            value["target"] = target
+            if value["alignments"] is not None:
+                value["alignments"] = []
+        candidate = copy_payload(self.payload)
+        candidate.update(copy_payload(value))
+        candidate.setdefault("semantic_history", [])
+        candidate["semantic_texts"] = self.semantic_texts(candidate)
+        normalize_semantic(candidate)
+        if len(decisions) > MAX_SEMANTIC_DECISIONS or not semantic_payload_fits(candidate):
+            return CommandOutcome(reason=REASON_FULL)
+        edits = None
+        if replaced is not None:
+            edits = [("target", replaced["start"], replaced["end"], len(applied_text or ""))]
+        return CommandOutcome(True, edit=self.apply_edit(value, edits=edits, exempt=issue))
+
+    def accept_issue(self, issue: sessions.LiveIssue | None, *, can_display: Callable[[str], bool],
+                     alternative: bool = False) -> CommandOutcome:
+        """Apply the issue's suggestion (or its chosen alternative) as one decision."""
+        if issue is None:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        if not self.basis_holds(issue):
+            return CommandOutcome(reason=REASON_RECONFIRM)
+        option = self.selected_option(issue, alternative)
+        if option is None:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        replacement = option[0]
+        try:
+            # The executable range must still be exactly what was reported.
+            changed = semantic.apply_span(self.payload["target"], issue.suggestion_span, replacement)
+        except semantic.StaleSpan:
+            return CommandOutcome(reason=REASON_STALE)
+        if not can_display(changed):
+            return CommandOutcome(reason=REASON_REJECTED)
+        return self.record_decision(issue, "accepted", applied_text=replacement, target=changed,
+                                    replaced=issue.suggestion_span)
+
+    def adjust_issue(self, issue: sessions.LiveIssue | None, text: str, *,
+                     can_display: Callable[[str], bool]) -> CommandOutcome:
+        """Apply the owner's own replacement as one adjusted decision."""
+        if issue is None:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        if not self.can_adjust(issue):
+            return CommandOutcome(reason=REASON_RECONFIRM)
+        if len(text) > semantic.MAX_SIDE_SCALARS:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        try:
+            changed = semantic.apply_span(self.payload["target"], issue.edit_span(), text)
+        except semantic.StaleSpan:
+            return CommandOutcome(reason=REASON_STALE)
+        if not can_display(changed):
+            return CommandOutcome(reason=REASON_REJECTED)
+        return self.record_decision(issue, "adjusted", applied_text=text, target=changed,
+                                    replaced=issue.edit_span())
+
+    def ignore_issue(self, issue: sessions.LiveIssue | None) -> CommandOutcome:
+        """Keep the report as history without touching the text."""
+        if issue is None:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        return self.record_decision(issue, "ignored")
+
     # -- document review -----------------------------------------------------
+
     def set_review_state(self, state: str, *, detail: str = "", request_id: str | None = None) -> None:
         """Set and show the review phase: the one place it changes."""
         self.review_state, self.review_detail, self.request_id = state, detail, request_id
@@ -677,7 +1024,8 @@ class DocumentRunController:
             if self.term_mode == "segments":
                 self.host.show_segment_term_report()
 
-    def store_semantic(self, pair, pending: sessions.SegmentResult, report: dict, direction: str) -> None:
+    def store_semantic(self, pair, pending: sessions.SegmentResult, report: semantic.SemanticReviewReport,
+                       direction: str) -> None:
         """Store a semantic report for ``pair``; an incomplete one is not stored."""
         source, target = self.payload["source"], self.payload["target"]
         if report["status"] != "complete":
