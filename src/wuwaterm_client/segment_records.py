@@ -59,7 +59,7 @@ pair, in order.
 from __future__ import annotations
 
 import bisect
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -149,6 +149,11 @@ def alignment_list(alignments: Sequence[Mapping] | None, source: str, target: st
             continue
         out.append({"source": clipped_source, "target": clipped_target})
     return out
+
+
+def _overlap(a: int, b: int, c: int, d: int) -> int:
+    """Shared scalars of the spans ``[a, b)`` and ``[c, d)``; 0 when disjoint."""
+    return max(0, min(b, d) - max(a, c))
 
 
 def _digest(items: list) -> str:
@@ -779,17 +784,18 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
     """The parts mapped to ``pairs``, the current segmentation-v1 pairing of the payload.
 
     In long mode there is one record per pair, in order. Records map by position
-    when the counts and all core ranges are equal; otherwise each pair takes
-    the first unused record with both hashes equal (kept), or else with the
-    source hash equal (choices kept unconfirmed, no result), and every other
-    pair gets a new pending record. Then: a changed core, a changed direction or
-    a pair that is not ready makes a record pending; a changed alignment input,
-    or a basis that differs from ``basis`` when one is given, makes a done
-    record stale. A choice that no longer reads the same at its place, or whose
-    record found no pair, moves by absolute position into the pair whose
-    source core holds it and reads the same, unconfirmed; failing that, it goes
-    to the history. ``progress`` follows the mapping. Outside long mode, see
-    ``without_records``.
+    when the counts and all core ranges are equal; otherwise each pair takes the
+    unused record with both hashes equal (kept), or else with the source hash
+    equal (choices kept unconfirmed, no result), preferring among equally
+    hashed records the one whose own spans sit where the pair sits (see
+    ``rank`` in the body); and every other pair gets a new pending record. Then:
+    a changed core, a changed direction or a pair that is not ready makes a
+    record pending; a changed alignment input, or a basis that differs from
+    ``basis`` when one is given, makes a done record stale. A choice that no
+    longer reads the same at its place, or whose record found no pair, moves by
+    absolute position into the pair whose source core holds it and reads the
+    same, unconfirmed; failing that, it goes to the history. ``progress``
+    follows the mapping. Outside long mode, see ``without_records``.
 
     Idempotent: normalizing a normalized payload returns equal values, with the
     unchanged records shared. With ``check_limits`` (the default), more than
@@ -816,24 +822,44 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
                 return record["source_hash"], record["target_hash"]
             (a, b), (c, d) = _cores(record)
             return content_hash(source[a:b]), content_hash(target[c:d])
-        both: dict[tuple, deque] = {}
-        by_source: dict[str, deque] = {}
+        both: dict[tuple, list[int]] = {}
+        by_source: dict[str, list[int]] = {}
         for i, record in enumerate(old):
             key = keys(record)
-            both.setdefault(key, deque()).append(i)
-            by_source.setdefault(key[0], deque()).append(i)
+            both.setdefault(key, list()).append(i)
+            by_source.setdefault(key[0], list()).append(i)
         used: set[int] = set()
 
-        def take(queue: deque | None) -> int | None:
-            while queue and queue[0] in used:
-                queue.popleft()
-            return queue.popleft() if queue else None
+        def rank(i: int, core: tuple) -> tuple[int, int, int, int]:
+            """How well record ``i`` explains this pair.
+
+            Equal hashes make records interchangeable by content, so the order
+            they are stored in cannot say which one was which: paragraphs that
+            repeat the same words on both sides share every hash. Positions
+            still can. A record whose own source or target span covers where
+            this pair now sits is the one that was that pair, and the pair
+            keeps its choices and result. Only when the spans say nothing (both
+            zero) does the earliest record win, which is the plain in-order
+            pairing this replaces."""
+            (a, b), (c, d) = _cores(old[i])
+            (pa, pb), (pc, pd) = core
+            return _overlap(a, b, pa, pb), _overlap(c, d, pc, pd), -abs(a - pa), -i
+
+        def take(candidates: list[int] | None, core: tuple) -> int | None:
+            best, best_rank = None, None
+            for i in candidates or ():
+                if i in used:
+                    continue
+                value = rank(i, core)
+                if best_rank is None or value > best_rank:
+                    best, best_rank = i, value
+            return best
         # Every segment first looks for both hashes; only those still unmatched
         # then look for the source hash.
         for table, key in ((both, lambda h: h), (by_source, lambda h: h[0])):
             for j in range(count):
                 if match[j] is None:
-                    i = take(table.get(key(hashes[j])))
+                    i = take(table.get(key(hashes[j])), cores[j])
                     if i is not None:
                         used.add(i)
                         match[j] = i

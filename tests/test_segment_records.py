@@ -497,6 +497,71 @@ def test_normalize_maps_records_across_a_boundary_shift_and_is_idempotent() -> N
     assert sr.normalize(after, pairs, basis) == normalized
 
 
+def _duplicate_pairs() -> tuple[dict, dict]:
+    """Two paragraphs that read the same on both sides, each with its own choice.
+
+    Equal hashes on every record mean nothing in the file can tell the records
+    apart by content: only where their spans sit can.
+    """
+    paragraph = "甲术" + "文" * 1196
+    target = "Alpha " + "x" * 394
+    payload = {"source": "\n\n".join([paragraph] * 2), "target": "\n\n".join([target] * 2),
+               "direction": "en", "alignments": None, "choices": [], "history": []}
+    payload, basis = review_all(payload, B1)
+    payload = choose_all(payload, 0, [(0, sr.OFFICIAL_PAIR, TERMS["甲术"][0]["candidate_id"])])
+    payload = choose_all(payload, 1, [(0, sr.NOT_A_TERM, None)])
+    for index in (0, 1):
+        payload, basis, _ = check(payload, index, basis, B1)
+    assert statuses(payload) == ["done", "done"]
+    records = sr.parts_of(payload).segments
+    assert (records[0]["source_hash"], records[0]["target_hash"]) == (records[1]["source_hash"],
+                                                                     records[1]["target_hash"])
+    assert [[c["choice"] for c in r["choices"]] for r in records] == [[sr.OFFICIAL_PAIR], [sr.NOT_A_TERM]]
+    return payload, basis
+
+
+def _shifted(payload: dict) -> dict:
+    """Two scalars typed inside the first paragraph, with the records untouched.
+
+    The ranges no longer line up with the pairing, so normalizing has to match
+    by content - and both records have the same content.
+    """
+    before = payload["source"]
+    return {**payload, "source": before[:1190] + "新增" + before[1190:]}
+
+
+def test_identical_paragraphs_keep_their_own_choices_when_the_pairing_shifts() -> None:
+    payload, basis = _duplicate_pairs()
+    parts = sr.parts_of(payload)
+    edited = _shifted(payload)
+    normalized = sr.normalize(edited, pairs_of(edited), basis)
+    first, second = normalized.segments
+    # The paragraph whose text changed is the one that loses its result, and it
+    # keeps its own choice, unconfirmed, where it now sits.
+    assert (first["status"], first["result"]) == ("pending", None)
+    assert [(c["choice"], c["confirmed"]) for c in first["choices"]] == [(sr.OFFICIAL_PAIR, False)]
+    # The untouched paragraph takes back exactly its own record: same result,
+    # same confirmed choice. Taking the other one - the record that comes first
+    # in the file - would show "not_a_term" here and "official_pair" there.
+    assert second["status"] == "done" and second["result"] == parts.segments[1]["result"]
+    assert second["choices"] == parts.segments[1]["choices"]
+    assert [(c["choice"], c["confirmed"]) for c in second["choices"]] == [(sr.NOT_A_TERM, True)]
+    assert normalized.history == []
+    assert sr.normalize(sr.with_parts(edited, normalized), pairs_of(edited), basis) == normalized
+
+
+def test_a_new_direction_on_identical_paragraphs_keeps_each_choice_on_its_own_text() -> None:
+    payload, basis = _duplicate_pairs()
+    edited = {**_shifted(payload), "direction": "zh"}
+    normalized = sr.normalize(edited, pairs_of(edited), basis)
+    # A new direction ends every result; it does not move a choice to the other
+    # paragraph that happens to read the same.
+    assert [r["status"] for r in normalized.segments] == ["pending", "pending"]
+    assert [[(c["choice"], c["confirmed"]) for c in r["choices"]] for r in normalized.segments] == [
+        [(sr.OFFICIAL_PAIR, False)], [(sr.NOT_A_TERM, False)]]
+    assert normalized.history == []
+
+
 def _short_after_edit() -> tuple[dict, sr.Parts]:
     """A two-segment manuscript with a choice in each, then cut below 2,000 scalars per side."""
     payload, basis = review_all(manuscript_of([700, 700, 700], {0: "甲术", 2: "丙术"}), B1)

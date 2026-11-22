@@ -255,3 +255,85 @@ def test_empty_state_action_row_paints_the_card_not_the_canvas(qapp, preserve_th
         _assert_color(row_pixel, card_pixel)
     finally:
         card.close()
+
+
+def _spin_arrow_columns(image, widget, sub):
+    """The painted pixels of one spin button's arrow, in image coordinates."""
+    from PySide6.QtCore import QRect
+    from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox
+
+    option = QStyleOptionSpinBox()
+    widget.initStyleOption(option)
+    area = widget.style().subControlRect(QStyle.ComplexControl.CC_SpinBox, option, sub, widget)
+    side = widget.ARROW_SIZE
+    target = QRect(area.center().x() - side // 2, area.center().y() - side // 2, side, side)
+    scale = image.width() / widget.width()
+    left, top = int(target.left() * scale), int(target.top() * scale)
+    width, height = int(round(target.width() * scale)), int(round(target.height() * scale))
+    # The corners of that square are the button's own background in both
+    # schemes, so "painted" is a difference from them rather than a darkness:
+    # the dark theme's stroke is lighter than its surface.
+    background = image.pixelColor(left, top)
+    columns: dict[int, list[int]] = {}
+    for y in range(max(0, top), min(image.height(), top + height)):
+        for x in range(max(0, left), min(image.width(), left + width)):
+            pixel = image.pixelColor(x, y)
+            if max(abs(a - b) for a, b in zip(pixel.getRgb()[:3], background.getRgb()[:3])) > 25:
+                columns.setdefault(x, []).append(y)
+    return columns
+
+
+def _render_at(widget, ratio: float):
+    """Paint the widget at a chosen device pixel ratio, as a 150% screen would."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QPixmap
+
+    pixmap = QPixmap(int(round(widget.width() * ratio)), int(round(widget.height() * ratio)))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    widget.render(pixmap)
+    return pixmap.toImage()
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+@pytest.mark.parametrize("ratio", [1.0, 1.5])
+def test_a_spin_box_arrow_is_a_chevron_and_follows_the_pixel_ratio(qapp, preserve_theme, scheme, ratio):
+    """The stylesheet built these arrows from borders, and Qt painted that as a
+    solid four-pixel bar: at 150% scaling the owner saw two short dashes where
+    the spin buttons were. A chevron is a stroke, not a block, and it grows with
+    the ratio because it is painted rather than drawn from fixed border widths."""
+    from PySide6.QtWidgets import QStyle
+
+    from wuwaterm_client.ui.components import ChevronDoubleSpinBox
+
+    theme.apply_theme(qapp, scheme)
+    spin = ChevronDoubleSpinBox()
+    spin.setRange(1.0, 600.0)
+    spin.setValue(30.0)
+    spin.resize(140, 38)
+    spin.show()
+    spin.clearFocus()
+    qapp.processEvents()
+    try:
+        image = _render_at(spin, ratio)
+        for sub in (QStyle.SubControl.SC_SpinBoxUp, QStyle.SubControl.SC_SpinBoxDown):
+            columns = _spin_arrow_columns(image, spin, sub)
+            depths = [len(rows) for rows in columns.values()]
+            tops = {min(rows) for rows in columns.values()}
+            assert len(columns) >= round(6 * ratio), (sub, len(columns))
+            # A chevron is one thin stroke per column, and the stroke moves down
+            # as the columns advance. The bar this replaced was four solid
+            # pixels starting on one and the same row in every column.
+            assert max(depths) <= 4, (sub, depths)
+            assert len(tops) >= 3, (sub, tops)
+    finally:
+        spin.close()
+
+
+def test_the_arrow_keeps_its_shape_through_the_stylesheet():
+    """`image: none` in the sheet is what lets the painted chevron be the arrow."""
+    for scheme in (theme.SCHEME_LIGHT, theme.SCHEME_DARK):
+        rendered = theme.load_stylesheet(scheme)
+        assert "border-left: 4px solid transparent" not in rendered
+        for selector in ("QSpinBox::up-arrow", "QDoubleSpinBox::down-arrow"):
+            assert selector in rendered

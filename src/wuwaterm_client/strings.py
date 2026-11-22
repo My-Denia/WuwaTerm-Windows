@@ -36,6 +36,8 @@ MENU_QUIT = "退出"
 MENU_HELP = "帮助(&H)"
 MENU_ABOUT = "关于"
 ABOUT_TEXT = "WuwaTerm 桌面客户端。调用 wuwaterm 的 HTTP 接口，并展示接口返回的结果。"
+# 版本行由「关于」对话框从 wuwaterm_client.__version__ 填入：报告问题时先看它。
+ABOUT_VERSION = "客户端版本 {version}"
 
 STATUS_BAR_READY = "就绪"
 STATUS_BAR_TRANSLATING = "正在翻译…"
@@ -591,12 +593,14 @@ MANUSCRIPT_SEGMENT_STATUS = {
     "failed": "未完成",
     "not_reviewed": "模型输出无效，未审",
     "needs_manual_split": "需要手动切分",
+    "translating": "翻译中，等待配对",
     "untranslated": "尚未翻译",
     "unpaired_target": "译文多出一段",
 }
 MANUSCRIPT_SEGMENT_HARD_CUT = "，强制切分"
 MANUSCRIPT_SEGMENT_HINT = {
     "needs_manual_split": "无法可靠地配对这一段：两侧段落或句子对不上。请在原文和译文的对应位置插入空行，再重新审校。",
+    "translating": "这一段正在翻译，译文的段落还没写全。翻译结束后再判断两侧段落能否配对。",
     "untranslated": "这一段还没有译文，可以先翻译。",
     "unpaired_target": "译文多出一段，在原文里没有对应，可能是增译。这是确定性提示，没有调用模型。",
     "hard_cut": "此处为强制切分，边界附近可能误判。",

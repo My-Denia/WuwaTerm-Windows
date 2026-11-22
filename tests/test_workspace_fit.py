@@ -327,3 +327,76 @@ def test_real_windows_keep_actions_and_editors_reachable_at_client_budget(
         dialog.close()
         main.close()
         qapp.setStyleSheet(previous)
+
+
+def test_a_fractional_pixel_ratio_holds_back_a_logical_pixel(qapp, monkeypatch) -> None:
+    """150% scaling rounds in device pixels, not logical ones.
+
+    Qt reports the native decoration margins as whole logical pixels while the
+    frame it moves is made of whole device pixels, so a window placed exactly
+    against the right edge ends up two device pixels past it. The clamp reserves
+    one logical pixel at a fractional ratio - and nothing at 100%, where a
+    logical pixel already is a whole device pixel.
+    """
+    work = QRect(0, 0, 1450, 940)
+    frame = QMargins(8, 30, 8, 8)
+    monkeypatch.setattr(components, "_available_workspace", lambda _widget: work)
+    monkeypatch.setattr(components, "_frame_margins", lambda _widget: frame)
+    sizes = {}
+    for ratio in (1.0, 1.5):
+        monkeypatch.setattr(components, "_device_pixel_ratio", lambda _widget, ratio=ratio: ratio)
+        widget = QWidget()
+        components.fit_to_workspace(widget, (960, 640), (1440, 910), (640, 380))
+        widget.show()
+        qapp.processEvents()
+        try:
+            assert components.frame_overflow(work, widget.windowHandle().frameGeometry()) == (0, 0, 0, 0)
+            sizes[ratio] = widget.size().toTuple()
+        finally:
+            widget.close()
+    assert sizes[1.0] == (1434, 902)
+    assert sizes[1.5] == (1433, 901)
+
+
+def test_the_rounding_guard_is_zero_only_at_a_whole_ratio() -> None:
+    assert [components.rounding_guard(r) for r in (1.0, 2.0, 3.0)] == [0, 0, 0]
+    assert components.rounding_guard(1.5) == 1
+    assert components.rounding_guard(1.25) == 1
+    assert components.rounding_guard(0.75) == 2
+    assert components.rounding_guard(0) == 0
+
+
+def test_frame_overflow_names_each_edge() -> None:
+    work = QRect(100, 50, 200, 100)
+    inside = QRect(120, 60, 100, 50)
+    assert components.frame_overflow(work, inside) == (0, 0, 0, 0)
+    assert components.frame_overflow(work, QRect(90, 40, 100, 50)) == (10, 10, 0, 0)
+    assert components.frame_overflow(work, QRect(250, 140, 100, 50)) == (0, 0, 50, 40)
+
+
+def test_a_frame_qt_reports_too_large_is_shrunk_to_the_workspace(qapp, monkeypatch) -> None:
+    """The measured frame is the authority, not the arithmetic.
+
+    Stubbed to keep the size it was given, the clamp would leave a window
+    wider than the desktop; the first-show correction has to take the rest
+    back from the frame Qt really has.
+    """
+    work = QRect(0, 0, 400, 300)
+    monkeypatch.setattr(components, "_available_workspace", lambda _widget: work)
+    monkeypatch.setattr(components, "_frame_margins", lambda _widget: QMargins())
+    monkeypatch.setattr(
+        components,
+        "clamp_to_workspace",
+        lambda size, minimum, default, floor, margins=None, **kwargs: (minimum, default),
+    )
+    widget = QWidget()
+    components.fit_to_workspace(widget, (100, 80), (600, 500), (50, 40))
+    widget.show()
+    qapp.processEvents()
+    try:
+        # As small as its own floor allows and no wider than the desktop: the
+        # exact numbers depend on the frame this platform draws.
+        assert widget.width() < 600 and widget.height() < 500
+        assert work.contains(widget.windowHandle().frameGeometry())
+    finally:
+        widget.close()
