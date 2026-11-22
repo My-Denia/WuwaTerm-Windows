@@ -297,19 +297,27 @@ def _render_at(widget, ratio: float):
 
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 @pytest.mark.parametrize("ratio", [1.0, 1.5])
-def test_a_spin_box_arrow_is_a_chevron_and_follows_the_pixel_ratio(qapp, preserve_theme, scheme, ratio):
+@pytest.mark.parametrize("kind", ["double", "integer"])
+def test_a_spin_box_arrow_is_a_chevron_and_follows_the_pixel_ratio(
+    qapp, preserve_theme, scheme, ratio, kind
+):
     """The stylesheet built these arrows from borders, and Qt painted that as a
     solid four-pixel bar: at 150% scaling the owner saw two short dashes where
     the spin buttons were. A chevron is a stroke, not a block, and it grows with
     the ratio because it is painted rather than drawn from fixed border widths."""
     from PySide6.QtWidgets import QStyle
 
-    from wuwaterm_client.ui.components import ChevronDoubleSpinBox
+    from wuwaterm_client.ui.components import ChevronDoubleSpinBox, ChevronSpinBox
 
     theme.apply_theme(qapp, scheme)
-    spin = ChevronDoubleSpinBox()
-    spin.setRange(1.0, 600.0)
-    spin.setValue(30.0)
+    if kind == "double":
+        spin = ChevronDoubleSpinBox()
+        spin.setRange(1.0, 600.0)
+        spin.setValue(30.0)
+    else:
+        spin = ChevronSpinBox()
+        spin.setRange(1, 600)
+        spin.setValue(30)
     spin.resize(140, 38)
     spin.show()
     spin.clearFocus()
