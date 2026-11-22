@@ -345,3 +345,23 @@ def test_the_arrow_keeps_its_shape_through_the_stylesheet():
         assert "border-left: 4px solid transparent" not in rendered
         for selector in ("QSpinBox::up-arrow", "QDoubleSpinBox::down-arrow"):
             assert selector in rendered
+
+
+def test_a_spin_box_without_buttons_paints_no_arrows(qapp, preserve_theme):
+    """`NoButtons` has no arrow rect, and a negative rect must not be painted."""
+    from PySide6.QtWidgets import QAbstractSpinBox
+
+    from wuwaterm_client.ui.components import ChevronSpinBox
+
+    theme.apply_theme(qapp, theme.SCHEME_LIGHT)
+    spin = ChevronSpinBox()
+    spin.setRange(1, 600)
+    spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+    spin.resize(140, 38)
+    spin.show()
+    qapp.processEvents()
+    try:
+        image = _render_at(spin, 1.5)
+        assert image.width() > 0  # it painted at all, without raising
+    finally:
+        spin.close()

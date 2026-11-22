@@ -862,21 +862,28 @@ class _FirstShowWorkspaceFit(QObject):
         # the only authority on where the window really ends, so measure it and
         # take back anything still outside - a couple of device pixels at 150%,
         # where the arithmetic had to round them into logical pixels.
+        #
+        # The floor is the minimum the clamp just set, which is often SMALLER
+        # than the one the window arrived with: on a tight workspace the fit
+        # gives up a 960x640 preference for what is there. Resizing back up to
+        # the old minimum would undo the fit, so it is read here, after the
+        # clamp, and only a frame that really is too big for the desktop - not
+        # one that is merely in the wrong place - shrinks the client area.
+        floor = (widget.minimumWidth(), widget.minimumHeight())
         for _ in range(FRAME_FIT_ATTEMPTS):
             frame = window.frameGeometry()
             left, top, right, bottom = frame_overflow(available, frame)
             if not (left or top or right or bottom):
                 break
-            # Bigger than the desktop: there is nowhere to move it to, so the
-            # client area gives the difference back.
             excess = (max(0, frame.width() - available.width()), max(0, frame.height() - available.height()))
-            size = (max(old_minimum[0], widget.width() - excess[0]),
-                    max(old_minimum[1], widget.height() - excess[1]))
-            if size != (widget.width(), widget.height()):
-                widget.resize(*size)
-                continue
             if excess != (0, 0):
-                break  # at its own floor; only a bigger desktop would help
+                size = (max(floor[0], widget.width() - excess[0]),
+                        max(floor[1], widget.height() - excess[1]))
+                if size != (widget.width(), widget.height()):
+                    widget.resize(*size)
+                    continue
+                # Already at its floor: a bigger desktop is the only fix, but
+                # the frame can still be put against the desktop's corner.
             x = max(available.left(), min(frame.left() - left, available.right() - frame.width() + 1))
             y = max(available.top(), min(frame.top() - top, available.bottom() - frame.height() + 1))
             window.setFramePosition(QPoint(x, y))
@@ -975,6 +982,8 @@ class _ChevronSpinArrows:
             area = self.style().subControlRect(
                 QStyle.ComplexControl.CC_SpinBox, option, sub, self
             )
+            if not area.isValid():
+                continue  # a spin box with NoButtons has no arrow rect to paint in
             target = QRect(area.center().x() - side // 2, area.center().y() - side // 2, side, side)
             glyph.paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
         painter.end()

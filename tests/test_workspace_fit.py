@@ -400,3 +400,39 @@ def test_a_frame_qt_reports_too_large_is_shrunk_to_the_workspace(qapp, monkeypat
         assert work.contains(widget.windowHandle().frameGeometry())
     finally:
         widget.close()
+
+
+def test_the_correction_never_grows_back_to_the_minimum_the_fit_gave_up(
+    qapp, monkeypatch
+) -> None:
+    """A tight workspace makes the fit give up its preferred minimum.
+
+    The first-show correction clamps the minimum down to what the desktop can
+    hold; measuring the frame afterwards must use THAT floor. Using the minimum
+    the window arrived with resized it back up, which put it outside the
+    desktop again and dropped the reposition it was about to do.
+    """
+    work = QRect(0, 0, 800, 600)
+    roomy = QRect(0, 0, 2560, 1440)
+    monkeypatch.setattr(
+        components, "_available_workspace",
+        lambda widget: roomy if not widget.isVisible() else work,
+    )
+    monkeypatch.setattr(components, "_frame_margins", lambda _widget: FRAME)
+    # 150% scaling: the rounding guard is the reserved logical pixel.
+    monkeypatch.setattr(components, "_device_pixel_ratio", lambda _widget: 1.5)
+    widget = QWidget()
+    components.fit_to_workspace(
+        widget, WINDOW_PREFERRED_MINIMUM, WINDOW_DEFAULT_SIZE, WINDOW_ABSOLUTE_MINIMUM
+    )
+    assert widget.minimumSize().toTuple() == WINDOW_PREFERRED_MINIMUM
+    widget.windowHandle().setFramePosition(QPoint(50, 50))
+    widget.show()
+    qapp.processEvents()
+    try:
+        # 800-16-1 by 600-38-1: the new floor, smaller than the preference.
+        assert widget.minimumSize().toTuple() == (783, 561)
+        assert widget.size().toTuple() == (783, 561), "the frame fit grew the window back"
+        assert work.contains(widget.windowHandle().frameGeometry())
+    finally:
+        widget.close()

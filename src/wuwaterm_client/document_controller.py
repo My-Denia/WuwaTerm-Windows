@@ -1119,6 +1119,18 @@ class DocumentRunController:
             return previous
         return None
 
+    def _translation_ui(self) -> None:
+        """A translation state changed: re-render the controls, and the segment
+        list too while that is the track on screen.
+
+        The rows carry the run's own verdict for pairs it cannot have judged
+        yet, so they go stale twice per run - when it starts and when it stops -
+        and a stop that writes nothing (a pause or a failure before the first
+        finished piece) would otherwise leave "翻译中" on screen for good.
+        """
+        self.host.refresh_segments_if_shown()
+        self.host.update_controls()
+
     def start_translation(self) -> None:
         """Translate a blank translation or one untranslated segment; never
         overwrite text the owner already has. After a pause or a failure the
@@ -1152,13 +1164,13 @@ class DocumentRunController:
         self.translate_run, self.translate_state = run, "retrying" if retry else "waiting"
         self.translate_task = asyncio.ensure_future(self.run_translation(run, pair, text, pieces))
         self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
-        self.host.update_controls()
+        self._translation_ui()
 
     def translation_done(self, run: Translation) -> None:
         """A task that ended without an outcome (an unexpected error) is a failure."""
         if run.generation == self.translate_generation and self.translate_state in ("waiting", "retrying"):
             self.translation_stopped(run, "failed", strings.ERROR_MSG_UNKNOWN)
-        self.host.update_controls()
+        self._translation_ui()
 
     async def run_translation(self, run: Translation, pair, text: str, pieces: list) -> None:
         generation = run.generation
@@ -1204,16 +1216,18 @@ class DocumentRunController:
         if not self.translation_basis_unchanged(run):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE
             self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
-            self.host.update_controls()
+            self._translation_ui()
             return
         if not self.write_translation(run, "".join(run.out), pair):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE
             self.host.report_status(strings.MANUSCRIPT_EDIT_REJECTED)
-            self.host.update_controls()
+            self._translation_ui()
             return
         self.translate_run, self.translate_state = None, TRANSLATION_IDLE
         mismatched = sum(1 for p in self.current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT)
         self.host.report_translation_complete(mismatched)
+        # The rows carry the run's own verdict; it just ended.
+        self.host.refresh_segments_if_shown()
 
     def translation_basis_unchanged(self, run: Translation) -> bool:
         payload = self.payload
@@ -1250,7 +1264,7 @@ class DocumentRunController:
         if not self.translation_basis_unchanged(run):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE
             self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
-            self.host.update_controls()
+            self._translation_ui()
             return
         segment = run.segment is not None
         if not segment:
@@ -1259,7 +1273,7 @@ class DocumentRunController:
                 if not self.write_translation(run, kept):
                     self.translate_run, self.translate_state = None, TRANSLATION_IDLE
                     self.host.report_status(strings.MANUSCRIPT_EDIT_REJECTED)
-                    self.host.update_controls()
+                    self._translation_ui()
                     return
                 run.target, run.written = self.payload["target"], True
             run.out = []
@@ -1274,4 +1288,4 @@ class DocumentRunController:
             text = template.format(done=run.done, total=run.count)
         self.translate_run, self.translate_state, self.translate_status = run, state, text
         self.host.report_status(text)
-        self.host.update_controls()
+        self._translation_ui()
