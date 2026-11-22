@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import recent, strings
+from .. import __version__, recent, strings
 from ..api import ApiClient
 from ..config import (
     ClientConfig,
@@ -805,6 +805,9 @@ class MainWindow(QMainWindow):
         about = QMessageBox(self)
         about.setWindowTitle(strings.MENU_ABOUT)
         about.setText(strings.ABOUT_TEXT)
+        # Which build this is, answers "what are you running" before the owner
+        # has to open a ZIP name or a release page to say so.
+        about.setInformativeText(strings.ABOUT_VERSION.format(version=__version__))
         about.setIcon(QMessageBox.Icon.Information)
         about.setStandardButtons(QMessageBox.StandardButton.Ok)
         about.button(QMessageBox.StandardButton.Ok).setText(strings.DIALOG_OK_BUTTON)

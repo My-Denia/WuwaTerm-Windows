@@ -607,6 +607,32 @@ def test_an_editor_that_cannot_show_the_result_writes_nothing() -> None:
     asyncio.run(scenario())
 
 
+def test_a_translation_refreshes_the_segment_rows_it_makes_stale() -> None:
+    """The rows carry the run's own pairing verdict, so the list is rebuilt when
+    a run starts and when it stops - including a stop that writes nothing, which
+    is the case nothing else would rebuild."""
+    async def scenario() -> None:
+        controller, client, host = make(FakeClient(), translation_draft())
+        host.calls.clear()
+        controller.start_translation()
+        assert "refresh_segments_if_shown" in host.calls
+        await settle(controller)
+        assert host.calls.count("refresh_segments_if_shown") >= 2
+
+        gate = asyncio.Event()
+        client.hold["translate"] = (1, gate)
+        controller, client, host = make(client, translation_draft())
+        controller.start_translation()
+        await until(lambda: client.translation_calls)
+        host.calls.clear()
+        controller.cancel_review()
+        assert controller.payload["target"] == "", "nothing finished, so nothing was written"
+        assert "refresh_segments_if_shown" in host.calls
+        gate.set()
+        await settle(controller)
+    asyncio.run(scenario())
+
+
 # -- the typed client boundary ----------------------------------------------
 
 def test_the_client_protocol_names_exactly_the_calls_the_runs_make() -> None:

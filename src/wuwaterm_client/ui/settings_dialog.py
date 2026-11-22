@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -48,6 +47,7 @@ from ..credentials import (
 )
 from .components import (
     ChevronComboBox,
+    ChevronDoubleSpinBox,
     Banner,
     FieldError,
     apply_credential_backend,
@@ -134,7 +134,7 @@ class SettingsDialog(QDialog):
 
         self.base_url_error = FieldError(connection_card)
 
-        self.timeout_spin = QDoubleSpinBox(connection_card)
+        self.timeout_spin = ChevronDoubleSpinBox(connection_card)
         self.timeout_spin.setRange(1.0, 600.0)
         self.timeout_spin.setValue(config.request_timeout_seconds)
 

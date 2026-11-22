@@ -576,3 +576,31 @@ def test_the_window_minimum_fits_a_small_workspace(qapp, tmp_path, monkeypatch) 
     # 默认尺寸同样不得开出屏外。
     assert window.width() <= workspace.width()
     assert window.height() <= workspace.height()
+
+
+def test_the_about_dialog_names_the_client_version(qapp, tmp_path, monkeypatch) -> None:
+    """「关于」要说清楚在跑的是哪个版本。以前只有一句介绍:出了问题先问的是版本,
+    而它只写在 ZIP 名字和发布页上。"""
+    from PySide6 import QtWidgets
+
+    import wuwaterm_client
+    from wuwaterm_client import strings
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+    captured = {}
+
+    class _Captured(QtWidgets.QMessageBox):
+        def exec(self):
+            captured["text"] = self.text()
+            captured["informative"] = self.informativeText()
+            return QtWidgets.QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(main_window_module, "QMessageBox", _Captured)
+    window = MainWindow(config=ClientConfig())
+    window._on_about_clicked()
+
+    assert captured["text"] == strings.ABOUT_TEXT
+    assert captured["informative"] == strings.ABOUT_VERSION.format(version=wuwaterm_client.__version__)
+    assert wuwaterm_client.__version__ in captured["informative"]

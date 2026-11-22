@@ -99,6 +99,7 @@ ICON_FILES = (
     "chevron-down.svg",
     "chevron-left.svg",
     "chevron-right.svg",
+    "chevron-up.svg",
     "circle-check.svg",
     "clipboard.svg",
     "copy.svg",

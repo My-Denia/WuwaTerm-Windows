@@ -430,3 +430,96 @@ def test_my359_post_translation_mismatch_warns_and_jumps_to_first_needs_manual_s
 
     asyncio.run(scenario())
 
+
+def test_a_resumed_run_does_not_report_pairs_it_cannot_judge_yet(qapp) -> None:
+    """A whole-manuscript run writes its pieces when it ends, so a paused run
+    leaves a partly translated target: one paragraph against four. Continuing
+    it keeps that mismatch for as long as the run lasts, and every segment used
+    to read "需要手动切分" while it worked - a verdict that was about to stop
+    being true by itself. The rows are refreshed by the run, not by the test.
+    """
+    async def scenario():
+        pause, resume = asyncio.Event(), asyncio.Event()
+        transport = Transport(gate={2: pause, 3: resume})
+        view = make_view(transport)
+        view.resize(1280, 800)
+        view.show()
+        view._show_track(TRACK_SEGMENTS)
+        try:
+            view._translate()
+            await transport.reached(2)
+            view.cancel_button.click()
+            for _ in range(200):
+                if view._translate_state == "paused":
+                    break
+                await asyncio.sleep(0)
+            assert view._payload["target"] == written(1)
+            assert not view._translating()
+            # The stop wrote one piece, so the real verdict is already back.
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["needs_manual_split"] in view.segment_list.item(0).text()
+
+            view.translate_button.click()
+            await transport.reached(3)
+            assert view._translating()
+            pairs = view._current_pairs()
+            assert [pair.status for pair in pairs] == ["needs_manual_split"]
+            assert [view._segment_status(pair) for pair in pairs] == ["translating"]
+            row = view.segment_list.item(0).text()
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["translating"] in row
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["needs_manual_split"] not in row
+            view.segment_list.setCurrentRow(0)
+            qapp.processEvents()
+            assert view.segment_hint.text() == strings.MANUSCRIPT_SEGMENT_HINT["translating"]
+
+            resume.set()
+            await settle(view)
+            qapp.processEvents()
+            # The run finished, so the pairing is judged again for real.
+            pairs = view._current_pairs()
+            assert [pair.status for pair in pairs] == ["ready", "ready", "ready", "ready"]
+            assert "translating" not in [view._segment_status(pair) for pair in pairs]
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["translating"] not in view.segment_list.item(0).text()
+        finally:
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_run_that_writes_nothing_puts_the_real_verdict_back(qapp) -> None:
+    """A failure before the first finished piece writes nothing, so nothing
+    else would rebuild the rows: they used to keep "翻译中，等待配对" for good.
+    """
+    async def scenario():
+        pause = asyncio.Event()
+        transport = Transport(fail={3: failure()}, gate={2: pause})
+        view = make_view(transport)
+        view.resize(1280, 800)
+        view.show()
+        view._show_track(TRACK_SEGMENTS)
+        try:
+            view._translate()
+            await transport.reached(2)
+            view.cancel_button.click()
+            for _ in range(200):
+                if view._translate_state == "paused":
+                    break
+                await asyncio.sleep(0)
+            before = view._payload["target"]
+            assert before == written(1)
+
+            view.translate_button.click()
+            await settle(view)
+            qapp.processEvents()
+
+            assert view._translate_state == "failed"
+            assert view._payload["target"] == before, "the failed piece wrote nothing"
+            pairs = view._current_pairs()
+            assert [pair.status for pair in pairs] == ["needs_manual_split"]
+            assert [view._segment_status(pair) for pair in pairs] == ["needs_manual_split"]
+            row = view.segment_list.item(0).text()
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["needs_manual_split"] in row
+            assert strings.MANUSCRIPT_SEGMENT_STATUS["translating"] not in row
+        finally:
+            view.close()
+
+    asyncio.run(scenario())

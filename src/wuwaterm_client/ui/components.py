@@ -24,14 +24,17 @@ from PySide6.QtCore import QEvent, QMargins, QObject, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QIcon, QPainter
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QStyle,
     QStyleOptionComboBox,
+    QStyleOptionSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -43,6 +46,12 @@ from .icons import icon
 # Long enough to be noticed while looking elsewhere on screen, short enough
 # that it is over before it reads as a new permanent state.
 FLASH_MILLISECONDS = 240
+
+# How many times the first-show correction measures the frame it really has and
+# takes back what is outside the desktop. Two rounds settle the workspace case;
+# the third exists so a window that cannot shrink any further stops rather than
+# looping.
+FRAME_FIT_ATTEMPTS = 3
 
 # The severities a banner understands. A caller passing anything else gets the
 # neutral treatment rather than an exception: a mis-labelled banner is bad, a
@@ -764,6 +773,7 @@ def fit_to_workspace(
             default_size,
             absolute_minimum,
             _frame_margins(widget),
+            guard=rounding_guard(_device_pixel_ratio(widget)),
         )
         widget.setMinimumSize(*minimum)
         widget.resize(*size)
@@ -775,6 +785,33 @@ def fit_to_workspace(
 def _available_workspace(widget: QWidget) -> QRect | None:
     screen = widget.screen() or QGuiApplication.primaryScreen()
     return screen.availableGeometry() if screen is not None else None
+
+
+def _device_pixel_ratio(widget: QWidget) -> float:
+    """The ratio the window is really drawn at (a seam: one screen, one ratio)."""
+    ratio = widget.devicePixelRatioF()
+    return ratio if ratio > 0 else 1.0
+
+
+def rounding_guard(ratio: float) -> int:
+    """Logical pixels to hold back so a rounded frame stays inside the screen.
+
+    At a whole ratio a logical pixel is a whole number of device pixels and
+    Qt's integer geometry is exact. At 150% it is not: Qt reports the native
+    decoration margins as whole logical pixels while the frame it moves is
+    made of whole device pixels, so a window placed against the right edge can
+    end two device pixels past it. One logical pixel of slack covers that, and
+    costs nothing anyone can see.
+    """
+    if not ratio > 0 or abs(ratio - round(ratio)) < 1e-6:
+        return 0
+    return max(1, math.ceil(1.0 / ratio))
+
+
+def frame_overflow(available: QRect, frame: QRect) -> tuple[int, int, int, int]:
+    """How far ``frame`` sticks out of ``available``: left, top, right, bottom."""
+    return (max(0, available.left() - frame.left()), max(0, available.top() - frame.top()),
+            max(0, frame.right() - available.right()), max(0, frame.bottom() - available.bottom()))
 
 
 def _frame_margins(widget: QWidget) -> QMargins:
@@ -814,16 +851,41 @@ class _FirstShowWorkspaceFit(QObject):
             old_size,
             (0, 0),
             _frame_margins(widget),
+            guard=rounding_guard(_device_pixel_ratio(widget)),
         )
         if minimum != old_minimum:
             widget.setMinimumSize(*minimum)
         if size != old_size:
             widget.resize(*size)
 
-        frame = window.frameGeometry()
-        x = max(available.left(), min(frame.left(), available.right() - frame.width() + 1))
-        y = max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1))
-        if (x, y) != (frame.left(), frame.top()):
+        # The clamp above works on the margins Qt reports. The frame Qt has is
+        # the only authority on where the window really ends, so measure it and
+        # take back anything still outside - a couple of device pixels at 150%,
+        # where the arithmetic had to round them into logical pixels.
+        #
+        # The floor is the minimum the clamp just set, which is often SMALLER
+        # than the one the window arrived with: on a tight workspace the fit
+        # gives up a 960x640 preference for what is there. Resizing back up to
+        # the old minimum would undo the fit, so it is read here, after the
+        # clamp, and only a frame that really is too big for the desktop - not
+        # one that is merely in the wrong place - shrinks the client area.
+        floor = (widget.minimumWidth(), widget.minimumHeight())
+        for _ in range(FRAME_FIT_ATTEMPTS):
+            frame = window.frameGeometry()
+            left, top, right, bottom = frame_overflow(available, frame)
+            if not (left or top or right or bottom):
+                break
+            excess = (max(0, frame.width() - available.width()), max(0, frame.height() - available.height()))
+            if excess != (0, 0):
+                size = (max(floor[0], widget.width() - excess[0]),
+                        max(floor[1], widget.height() - excess[1]))
+                if size != (widget.width(), widget.height()):
+                    widget.resize(*size)
+                    continue
+                # Already at its floor: a bigger desktop is the only fix, but
+                # the frame can still be put against the desktop's corner.
+            x = max(available.left(), min(frame.left() - left, available.right() - frame.width() + 1))
+            y = max(available.top(), min(frame.top() - top, available.bottom() - frame.height() + 1))
             window.setFramePosition(QPoint(x, y))
 
 
@@ -833,13 +895,18 @@ def clamp_to_workspace(
     default_size: tuple[int, int],
     absolute_minimum: tuple[int, int],
     frame_margins: QMargins | None = None,
+    *,
+    guard: int = 0,
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Clamp client dimensions to the space left after window decorations."""
+    """Clamp client dimensions to the space left after window decorations.
+
+    ``guard`` holds back that many extra logical pixels per axis: see
+    `rounding_guard`."""
     if frame_margins is None:
         frame_margins = QMargins()
     budget = (
-        max(1, workspace[0] - frame_margins.left() - frame_margins.right()),
-        max(1, workspace[1] - frame_margins.top() - frame_margins.bottom()),
+        max(1, workspace[0] - frame_margins.left() - frame_margins.right() - guard),
+        max(1, workspace[1] - frame_margins.top() - frame_margins.bottom() - guard),
     )
     minimum = tuple(
         min(budget[i], max(preferred_minimum[i], absolute_minimum[i]))
@@ -881,3 +948,66 @@ class ChevronComboBox(QComboBox):
         self._arrow.paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
         painter.end()
 
+
+class _ChevronSpinArrows:
+    """The two arrows of a spin box, drawn as the themed chevrons.
+
+    Same defect, same fix as `ChevronComboBox`: the stylesheet built the arrows
+    from borders, and Qt painted that as two short bars - visible as such at
+    150% scaling, where the numbers and the box scale but the four border
+    pixels do not turn into a triangle. The vendored chevrons are painted in
+    logical pixels from the subcontrol rect, so they follow both the theme and
+    the screen's pixel ratio.
+
+    Mixed in before the spin box class, and it is the spin box's own
+    ``paintEvent`` that calls `_paint_arrows` - Qt's own arrow is switched off
+    in the stylesheet with ``image: none``.
+    """
+
+    ARROW_SIZE = 14
+
+    def _load_arrows(self) -> None:
+        # Loaded once: the icon engine picks the theme's colour at paint time.
+        self._arrow_up = icon("chevron-up", "text-secondary")
+        self._arrow_down = icon("chevron-down", "text-secondary")
+
+    def _paint_arrows(self) -> None:
+        option = QStyleOptionSpinBox()
+        self.initStyleOption(option)
+        mode = QIcon.Mode.Normal if self.isEnabled() else QIcon.Mode.Disabled
+        side = self.ARROW_SIZE
+        painter = QPainter(self)
+        for sub, glyph in ((QStyle.SubControl.SC_SpinBoxUp, self._arrow_up),
+                           (QStyle.SubControl.SC_SpinBoxDown, self._arrow_down)):
+            area = self.style().subControlRect(
+                QStyle.ComplexControl.CC_SpinBox, option, sub, self
+            )
+            if not area.isValid():
+                continue  # a spin box with NoButtons has no arrow rect to paint in
+            target = QRect(area.center().x() - side // 2, area.center().y() - side // 2, side, side)
+            glyph.paint(painter, target, Qt.AlignmentFlag.AlignCenter, mode)
+        painter.end()
+
+
+class ChevronSpinBox(_ChevronSpinArrows, QSpinBox):
+    """A spin box whose arrows are the themed chevrons."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._load_arrows()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().paintEvent(event)
+        self._paint_arrows()
+
+
+class ChevronDoubleSpinBox(_ChevronSpinArrows, QDoubleSpinBox):
+    """A decimal spin box whose arrows are the themed chevrons."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._load_arrows()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt's name
+        super().paintEvent(event)
+        self._paint_arrows()

@@ -13,8 +13,9 @@ import json
 
 import httpx
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QListView, QMessageBox
 
 from test_manuscript_semantic import issue as semantic_issue, semantic_report
 from wuwaterm_client import strings
@@ -884,3 +885,27 @@ def test_a_row_clicked_before_the_list_follows_an_edit_is_the_selected_segment_a
         assert view.save_document()
         assert load_workfile(path)["progress"]["current"] == 2
     asyncio.run(scenario())
+
+
+def test_a_segment_row_wraps_instead_of_ending_in_an_ellipsis(qapp) -> None:
+    """A row carries the segment's state and both lengths. At 150% scaling the
+    one-line form is wider than the inspector, and the list elided it - the
+    counts the owner needs were replaced by an ellipsis."""
+    view = make_view(Core())
+    try:
+        view.resize(1280, 800)
+        view.show()
+        view._show_track(TRACK_SEGMENTS)
+        view._refresh_segments()
+        qapp.processEvents()
+        listing = view.segment_list
+        assert listing.wordWrap()
+        assert listing.textElideMode() == Qt.TextElideMode.ElideNone
+        assert not listing.uniformItemSizes()
+        assert listing.resizeMode() == QListView.ResizeMode.Adjust
+        item = listing.item(0)
+        assert item is not None and "（原文" in item.text()
+        wrapped = listing.visualItemRect(item).height()
+        assert wrapped > listing.fontMetrics().height() * 2, (wrapped, item.text())
+    finally:
+        view.close()

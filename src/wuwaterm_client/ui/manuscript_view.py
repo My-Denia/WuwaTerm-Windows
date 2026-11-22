@@ -21,9 +21,9 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStackedWidget, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import markdown_report as mdr
@@ -62,6 +62,12 @@ _TERM_FILTER_KEYS = ("all", "inconsistent", "pending", "not_evaluated", "confirm
 # What a finding of a long manuscript still needs, by its record's state.
 _RECHECK_STATES = ("stale", "pending", "failed", "not_reviewed", "needs_manual_split", "untranslated",
                    "unpaired_target")
+# Pairing verdicts a translation in flight has not settled yet. While the target
+# is still being written its paragraphs are incomplete by construction, so the
+# counts cannot match and every pair reads as unalignable. That is not a finding
+# about the manuscript: reporting it mid-run made the inspector flash
+# "需要手动切分" for the length of every run and take it back at the end.
+_TRANSLATION_PENDING_STATES = (STATUS_NEEDS_MANUAL_SPLIT,)
 
 
 def _offset(span: dict | None, by: int) -> dict | None:
@@ -1470,10 +1476,16 @@ class ManuscriptView(QWidget):
         self.segments_note.setObjectName("secondaryText")
         self.segments_note.setWordWrap(True)
         layout.addWidget(self.segments_note)
-        self.segment_list = QListWidget(page)
+        self.segment_list = _WrappedListWidget(page)
         self.segment_list.setMinimumHeight(76)
         self.segment_list.setMaximumHeight(220)
+        # Rows wrap instead of eliding. A row carries the segment's state and
+        # both core lengths; at 150% scaling the single-line form is wider than
+        # the inspector, and an ellipsis hid the counts the row exists for.
         self.segment_list.setWordWrap(True)
+        self.segment_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.segment_list.setUniformItemSizes(False)
+        self.segment_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.segment_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.segment_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEGMENTS.format(count="").strip())
         self.segment_list.currentRowChanged.connect(self._select_segment)
@@ -1608,6 +1620,10 @@ class ManuscriptView(QWidget):
 
     def _segment_status(self, pair) -> str:
         if pair.status != STATUS_READY:
+            if pair.status in _TRANSLATION_PENDING_STATES and self._translating():
+                # The target is still being written: this pair's verdict says
+                # nothing yet, and the run ends by pairing it properly.
+                return "translating"
             return pair.status
         records = self._records()
         if records is None:

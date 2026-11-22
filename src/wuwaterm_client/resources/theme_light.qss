@@ -668,22 +668,16 @@ QSpinBox::down-button {
     background-color: transparent;
 }
 
+/* 箭头由 ChevronSpinBox / ChevronDoubleSpinBox 用随包的 chevron 图标绘制:用
+   边框拼的三角在 Qt 里画出来是两道短横杠(150% 缩放时最明显)。这里只把样式
+   表自己的箭头关掉。 */
 QDoubleSpinBox::up-arrow,
-QSpinBox::up-arrow {
-    width: 0px;
-    height: 0px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-bottom: 4px solid @text-secondary@;
-}
-
+QSpinBox::up-arrow,
 QDoubleSpinBox::down-arrow,
 QSpinBox::down-arrow {
+    image: none;
     width: 0px;
     height: 0px;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 4px solid @text-secondary@;
 }
 
 /* ------------------------------------------------------------ 单选钮 */
