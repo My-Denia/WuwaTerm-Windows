@@ -30,9 +30,10 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "ba8d01b26e7dd7d0ca3c1e28a61a847d5dc5a131",
+    "commit": "afd22ccce20e11430c03622af21d826b78804532",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
+      "contracts/workbench-state/duplicate-attribution.json": "9b8d6211a4bb9fc10c17b4ba0ee419397810a4410263e95f7d1e97fe9be1d2f4",
       "package.json": "a2d2e27d243c21594777d1fc64f7a7fadd710304e5f021979a791351fc81618b",
       "lib/manuscript.js": "8ea2a3550a60248076d246b3d9e1c961d5054635efe87ed65f9012594f3ed663",
       "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
@@ -46,7 +47,7 @@
       "contracts/manuscript-v2/invalid-ignored-with-text.json": "35cdecc33f5a5ff3c33a755b2381a9f4f0693e5ae77e9865b5b119188e381763",
       "contracts/manuscript-v2/invalid-unknown-key.json": "9102960ff2e071f21d3a8f230b503f85cf36d743e640a7cf5a659c5f6b90b043",
       "contracts/manuscript-v2/valid-all-parts.json": "e7de60c3e934267a9a25aa10a1144d249734f742c759493d18aa4261d3f32363",
-      "contracts/manuscript-v3/SPEC.md": "93a0df5442952890fd86ba61498f6d94b0bd98b61a87651e750e9a2507f7c1cb",
+      "contracts/manuscript-v3/SPEC.md": "7e7df710f9d9fcaa83f4db063af80607fee1415598c473e15f3d3b7f1bafa5b1",
       "contracts/manuscript-v3/cases.json": "7e0883cbb1c583d42226cd03d11c2d5687210b217661e784462f5f71336c7042",
       "contracts/manuscript-v3/invalid-v3-33-choices.json": "42b57ca834faee19701169dd7064073cac872a6ec586e7096b12852b76f980ab",
       "contracts/manuscript-v3/invalid-v3-33-fields.json": "6617e9c6dd6cc8b2866950f48ea81b76f9210bfa2655f03d122e6eee25e09513",
