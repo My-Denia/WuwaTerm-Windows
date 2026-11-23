@@ -715,3 +715,41 @@ def test_showing_a_saved_result_changes_nothing_in_the_file() -> None:
     assert json.loads(before)["format"] == manuscript.WORKFILE_FORMAT_V3
     assert statuses(payload) == ["done"] * len(pairs_of(payload))
     assert sr.parts_of(payload).segments[0]["result"] is not None
+
+
+def test_shared_duplicate_attribution_cases_match_web_contract(contract_source) -> None:
+    """Every duplicate-attribution contract case matches Web and round-trips idempotently."""
+    suite = json.loads((contract_source("web") / "contracts" / "workbench-state"
+                        / "duplicate-attribution.json").read_text(encoding="utf-8"))
+    assert suite["schema"] == "wuwaterm-duplicate-attribution-cases-v1"
+    basis = suite["basis"]
+    for case in suite["cases"]:
+        case_id = case["id"]
+        payload = manuscript.parse_workfile(json.dumps(case["workfile"]))
+        parts = sr.parts_of(payload)
+        for edit in case["edits"]:
+            if "side" in edit:
+                side = edit["side"]
+                before = payload[side]
+                start, old_end, inserted = edit["start"], edit["old_end"], edit["insert"]
+                parts = sr.apply_edit(parts, before, side, start, old_end, len(inserted))
+                payload = sr.with_parts({**payload, side: before[:start] + inserted + before[old_end:]}, parts)
+            elif "direction" in edit:
+                payload = sr.with_parts({**payload, "direction": edit["direction"]}, parts)
+            else:
+                payload = sr.with_parts({**payload, "alignments": edit["alignments"]}, parts)
+        pairs = pair_segments(payload["source"], payload["target"], alignments=payload["alignments"])
+        normalized = sr.normalize(payload, pairs, basis)
+        saved = manuscript.serialize_workfile(sr.with_parts(payload, normalized))
+        written = json.loads(saved)
+        expected = case["expected"]
+        assert [r["status"] for r in written["segments"]] == expected["statuses"], case_id
+        assert [[[c["choice"], c["confirmed"]] for c in r["choices"]] for r in written["segments"]] == expected[
+            "choices"], case_id
+        assert written["progress"]["completed"] == expected["completed"], case_id
+        assert [[h["choice"], h["source_span"]["text"]] for h in written["segment_choice_history"]] == expected[
+            "history_choices"], case_id
+        reopened = manuscript.parse_workfile(saved)
+        again = sr.normalize(reopened, pair_segments(
+            reopened["source"], reopened["target"], alignments=reopened["alignments"]), basis)
+        assert manuscript.serialize_workfile(sr.with_parts(reopened, again)) == saved, case_id

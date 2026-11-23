@@ -784,11 +784,12 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
     """The parts mapped to ``pairs``, the current segmentation-v1 pairing of the payload.
 
     In long mode there is one record per pair, in order. Records map by position
-    when the counts and all core ranges are equal; otherwise each pair takes the
-    unused record with both hashes equal (kept), or else with the source hash
-    equal (choices kept unconfirmed, no result), preferring among equally
-    hashed records the one whose own spans sit where the pair sits (see
-    ``rank`` in the body); and every other pair gets a new pending record. Then:
+    when the counts and all core ranges are equal; otherwise matching runs in
+    three passes (see ``rank`` in the body): (1) exact source occurrence
+    (``source_start``, ``source_end``, ``source_hash``), (2) globally best-ranked
+    ``(old, pair)`` pairs with both hashes equal (kept), and (3) globally
+    best-ranked pairs with only the source hash equal (choices kept unconfirmed,
+    no result); every other pair gets a new pending record. Then:
     a changed core, a changed direction or a pair that is not ready makes a
     record pending; a changed alignment input, or a basis that differs from
     ``basis`` when one is given, makes a done record stale. A choice that no
@@ -822,47 +823,44 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
                 return record["source_hash"], record["target_hash"]
             (a, b), (c, d) = _cores(record)
             return content_hash(source[a:b]), content_hash(target[c:d])
-        both: dict[tuple, list[int]] = {}
-        by_source: dict[str, list[int]] = {}
-        for i, record in enumerate(old):
-            key = keys(record)
-            both.setdefault(key, list()).append(i)
-            by_source.setdefault(key[0], list()).append(i)
+        old_keys = [keys(record) for record in old]
+        old_cores = [_cores(record) for record in old]
         used: set[int] = set()
+        # Pass 1: exact source occurrence (source_start, source_end, source_hash).
+        for j in range(count):
+            sa, sb = cores[j][0]
+            sh = hashes[j][0]
+            for i, (rc, rk) in enumerate(zip(old_cores, old_keys, strict=True)):
+                if i not in used and rc[0] == (sa, sb) and rk[0] == sh:
+                    match[j] = i
+                    used.add(i)
+                    break
 
-        def rank(i: int, core: tuple) -> tuple[int, int, int, int]:
-            """How well record ``i`` explains this pair.
+        def rank(i: int, j: int) -> tuple[int, int, int, int, int]:
+            """How well record ``i`` explains pair ``j`` (highest 5-tuple wins).
 
-            Equal hashes make records interchangeable by content, so the order
-            they are stored in cannot say which one was which: paragraphs that
-            repeat the same words on both sides share every hash. Positions
-            still can. A record whose own source or target span covers where
-            this pair now sits is the one that was that pair, and the pair
-            keeps its choices and result. Only when the spans say nothing (both
-            zero) does the earliest record win, which is the plain in-order
-            pairing this replaces."""
-            (a, b), (c, d) = _cores(old[i])
-            (pa, pb), (pc, pd) = core
-            return _overlap(a, b, pa, pb), _overlap(c, d, pc, pd), -abs(a - pa), -i
+            Equal hashes make records interchangeable by content, so stored
+            order cannot tell duplicate paragraphs apart: positions still can.
+            Pass 2 and Pass 3 rank every candidate ``(i, j)`` globally by source
+            overlap, target overlap, negative source start delta, ``-j``, and
+            ``-i``, falling back to earliest-pair / earliest-record order only
+            when all positional signals tie."""
+            (a, b), (c, d) = old_cores[i]
+            (pa, pb), (pc, pd) = cores[j]
+            return _overlap(a, b, pa, pb), _overlap(c, d, pc, pd), -abs(a - pa), -j, -i
 
-        def take(candidates: list[int] | None, core: tuple) -> int | None:
-            best, best_rank = None, None
-            for i in candidates or ():
-                if i in used:
-                    continue
-                value = rank(i, core)
-                if best_rank is None or value > best_rank:
-                    best, best_rank = i, value
-            return best
-        # Every segment first looks for both hashes; only those still unmatched
-        # then look for the source hash.
-        for table, key in ((both, lambda h: h), (by_source, lambda h: h[0])):
-            for j in range(count):
-                if match[j] is None:
-                    i = take(table.get(key(hashes[j])), cores[j])
-                    if i is not None:
-                        used.add(i)
-                        match[j] = i
+        # Pass 2: both hashes equal (global best pair); Pass 3: source hash equal only.
+        for pred in (lambda i, j: old_keys[i] == hashes[j], lambda i, j: old_keys[i][0] == hashes[j][0]):
+            candidates = [
+                (rank(i, j), j, i)
+                for j in range(count) if match[j] is None
+                for i in range(len(old)) if i not in used and pred(i, j)
+            ]
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            for _, j, i in candidates:
+                if match[j] is None and i not in used:
+                    match[j] = i
+                    used.add(i)
 
     pool: list[tuple[Mapping, dict]] = []   # (record it was in, choice), placed by absolute position below
     records: list[dict] = []
