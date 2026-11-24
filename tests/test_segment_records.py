@@ -753,3 +753,189 @@ def test_shared_duplicate_attribution_cases_match_web_contract(contract_source) 
         again = sr.normalize(reopened, pair_segments(
             reopened["source"], reopened["target"], alignments=reopened["alignments"]), basis)
         assert manuscript.serialize_workfile(sr.with_parts(reopened, again)) == saved, case_id
+
+
+def test_shared_operation_traces_match_web_contract(contract_source) -> None:
+    """Every multi-step operation trace in Web's suite settles identically with expected checkpoints."""
+    suite = json.loads((contract_source("web") / "contracts" / "workbench-state"
+                        / "operation-traces.json").read_text(encoding="utf-8"))
+    assert suite["schema"] == "wuwaterm-operation-traces-v1"
+    assert len(suite["traces"]) == 3
+    bases = suite["bases"]
+    candidates = suite["candidates"]
+
+    def build_report(step: dict, rec: dict, payload_now: dict) -> dict:
+        s_core = payload_now["source"][rec["source_start"]:rec["source_end"]]
+        t_core = payload_now["target"][rec["target_start"]:rec["target_end"]]
+        findings = []
+        for f in step["findings"]:
+            s_start = s_core.index(f["find"])
+            t_start = t_core.index(f["target_find"]) if f.get("target_find") else None
+            findings.append({
+                "verdict": f["verdict"],
+                "source": [s_start, s_start + len(f["find"])],
+                "target": None if t_start is None else [t_start, t_start + len(f["target_find"])],
+                "candidates": [candidates[cid] for cid in f["candidates"]],
+                "candidates_truncated": bool(f.get("candidates_truncated", False)),
+            })
+        evaluated = sum(1 for item in findings if item["verdict"] != "not_evaluated")
+        expanded = sr.expand_result(
+            {**rec, "basis": bases[step["basis"]],
+             "result": {"truncated": False, "evaluated": evaluated,
+                        "not_evaluated": len(findings) - evaluated, "findings": findings}},
+            payload_now["source"], payload_now["target"],
+        )
+        return {**expanded, "request_id": "trace-windows"}
+
+    def normalize_payload(payload_now: dict, basis_now: dict | None) -> dict:
+        pairs = pair_segments(payload_now["source"], payload_now["target"], alignments=payload_now["alignments"])
+        return sr.with_parts(payload_now, sr.normalize(payload_now, pairs, basis_now))
+
+    def delete_paragraph_splice(text: str, index: int) -> tuple[str, int, int]:
+        blocks = text.split("\n\n")
+        lengths = [len(block) for block in blocks]
+        start = sum(lengths[i] + 2 for i in range(index))
+        if len(blocks) == 1:
+            start, old_end = 0, len(text)
+        elif index < len(blocks) - 1:
+            old_end = start + lengths[index] + 2
+        else:
+            start -= 2
+            old_end = len(text)
+        del blocks[index]
+        return "\n\n".join(blocks), start, old_end
+
+    def minimal_splice(before: str, after: str) -> tuple[int, int, int]:
+        pref = 0
+        limit = min(len(before), len(after))
+        while pref < limit and before[pref] == after[pref]:
+            pref += 1
+        suff = 0
+        while suff < limit - pref and before[len(before) - 1 - suff] == after[len(after) - 1 - suff]:
+            suff += 1
+        return pref, len(before) - suff, len(after) - suff - pref
+
+    for trace in suite["traces"]:
+        trace_id = trace["id"]
+        initial = trace["initial"]
+        payload = {
+            "source": "\n\n".join(p["source_prefix"] + p["source_fill_char"] * p["source_fill_count"]
+                                  for p in initial["paragraphs"]),
+            "target": "\n\n".join(p["target"] for p in initial["paragraphs"]),
+            "direction": initial["direction"],
+            "alignments": initial["alignments"],
+            "choices": [], "history": [],
+            "semantic_decisions": [], "semantic_texts": [], "semantic_history": [],
+        }
+        payload = normalize_payload(payload, None)
+        basis = None
+        captured: dict[str, tuple[object, dict]] = {}
+
+        for step_idx, step in enumerate(trace["steps"]):
+            op = step["op"]
+            if op == "check":
+                for _ in range(2):
+                    req = sr.plan_request(payload, step["segment"], basis)
+                    rec = sr.parts_of(payload).segments[step["segment"]]
+                    applied = sr.apply_response(payload, req, build_report(step, rec, payload), basis)
+                    assert applied.outcome == "stored", (trace_id, step_idx)
+                    payload, basis = sr.with_parts(payload, applied.parts), applied.basis
+                    if not applied.again:
+                        break
+                else:
+                    raise AssertionError(f"{trace_id} step {step_idx}: check did not settle")
+            elif op == "capture_request":
+                req = sr.plan_request(payload, step["segment"], basis)
+                rec = sr.parts_of(payload).segments[step["segment"]]
+                captured[step["ref"]] = (req, build_report(step, rec, payload))
+            elif op == "deliver_captured":
+                req, rep = captured[step["ref"]]
+                applied = sr.apply_response(payload, req, rep, basis)
+                if step.get("expect_rejected"):
+                    assert applied.outcome == "discarded", (trace_id, step_idx)
+                else:
+                    assert applied.outcome == "stored", (trace_id, step_idx)
+                    payload, basis = sr.with_parts(payload, applied.parts), applied.basis
+            elif op == "choose":
+                rec = sr.parts_of(payload).segments[step["segment"]]
+                s_core = payload["source"][rec["source_start"]:rec["source_end"]]
+                start = s_core.index(step["find"])
+                cand_id = candidates[step["candidate"]]["candidate_id"] if step["choice"] == "official_pair" else None
+                payload = sr.with_parts(payload, sr.choose(
+                    payload, step["segment"], start, start + len(step["find"]), step["choice"], cand_id,
+                ))
+            elif op == "delete_paragraph":
+                s_before, t_before = payload["source"], payload["target"]
+                s_after, s_start, s_end = delete_paragraph_splice(s_before, step["paragraph"])
+                t_after, t_start, t_end = delete_paragraph_splice(t_before, step["paragraph"])
+                parts = sr.apply_edit(sr.parts_of(payload), s_before, "source", s_start, s_end, 0)
+                parts = sr.apply_edit(parts, t_before, "target", t_start, t_end, 0)
+                payload = normalize_payload(sr.with_parts({**payload, "source": s_after, "target": t_after}, parts), basis)
+            elif op == "replace_text":
+                side = step["side"]
+                before = payload[side]
+                after = before.replace(step["find"], step["replace"], 1)
+                start, old_end, new_len = minimal_splice(before, after)
+                parts = sr.apply_edit(sr.parts_of(payload), before, side, start, old_end, new_len)
+                payload = normalize_payload(sr.with_parts({**payload, side: after}, parts), basis)
+            elif op == "set_direction":
+                payload = normalize_payload({**payload, "direction": step["direction"]}, basis)
+            elif op == "set_progress":
+                parts = sr.parts_of(payload)
+                if "current" in step:
+                    parts = sr.set_current(parts, step["current"])
+                if "finished" in step:
+                    for i in range(len(parts.segments)):
+                        parts = sr.set_finished(parts, i, i in step["finished"])
+                payload = sr.with_parts(payload, parts)
+            elif op == "save_and_reopen":
+                raw = manuscript.serialize_workfile(payload)
+                payload = manuscript.parse_workfile(raw)
+                basis = None
+            elif op == "restore_history":
+                payload = sr.with_parts(payload, sr.restore(payload, step["position"], step["segment"]))
+            elif op == "assert":
+                parts = sr.parts_of(payload)
+                pairs = pair_segments(payload["source"], payload["target"], alignments=payload["alignments"])
+                states = [sr.record_view(r, payload, basis).state for r in parts.segments]
+                choices = [[[c["choice"], c["source_span"]["start"], c["confirmed"]] for c in r["choices"]]
+                           for r in parts.segments]
+                plan = sr.term_plan(payload, pairs, basis)
+                restorable_map: list[int | None] = [None] * len(parts.history)
+                for pos, seg_idx in sr.restorable(payload):
+                    if restorable_map[pos] is None:
+                        restorable_map[pos] = seg_idx
+                if "states" in step:
+                    assert states == step["states"], (trace_id, step_idx)
+                if "choices" in step:
+                    assert choices == step["choices"], (trace_id, step_idx)
+                if "history_count" in step:
+                    assert len(parts.history) == step["history_count"], (trace_id, step_idx)
+                if "progress" in step:
+                    assert parts.progress == step["progress"], (trace_id, step_idx)
+                if "probe" in step:
+                    assert plan.probe == step["probe"], (trace_id, step_idx)
+                if "restorable" in step:
+                    assert restorable_map == step["restorable"], (trace_id, step_idx)
+                if "recheck_plan" in step:
+                    for seg_k, expected_kind in step["recheck_plan"].items():
+                        idx_k = int(seg_k)
+                        rec_k = parts.segments[idx_k]
+                        if rec_k["status"] == "pending":
+                            prior = rec_k.get(sr.PRIOR)
+                            s_core_k = payload["source"][rec_k["source_start"]:rec_k["source_end"]]
+                            has_prior = (
+                                prior is not None and basis is not None
+                                and prior.source_hash == sr.content_hash(s_core_k)
+                                and prior.direction == payload["direction"]
+                                and sr.same_basis(prior.basis, basis)
+                            )
+                            got_kind = "with_resolutions" if has_prior else "without_resolutions"
+                        else:
+                            req_plan = sr.plan_request(payload, idx_k, basis)
+                            got_kind = "without_resolutions" if req_plan.realign else "with_resolutions"
+                        assert got_kind == expected_kind, (trace_id, step_idx, seg_k)
+                serialized = manuscript.serialize_workfile(payload)
+                assert manuscript.serialize_workfile(manuscript.parse_workfile(serialized)) == serialized, (trace_id, step_idx)
+            else:
+                raise AssertionError(f"Unknown trace step op {op}")
