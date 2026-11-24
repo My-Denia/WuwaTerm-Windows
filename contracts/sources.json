@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "9a4f680f3ec3909e23afc2394f2c7eccf00af6e3",
+    "commit": "6fb4d8a44b26f170a7b1c8e23f00f75b2bbfd2b8",
     "files": {
-      "src/wuwaterm_api/__init__.py": "e0372e6495d03878ee3c76ac87c5e0cb334d31403c776c90bac1e80687222502",
-      "docs/api/openapi.json": "85a50ec7a2585c7e2b35267408e8cd1d04e2c1b42cf0a4789a48078e1c310008",
+      "src/wuwaterm_api/__init__.py": "cf02ace4b8e3038b3e297bf6c7057541f6e67c60ad595fdcf2487240ed0c10c0",
+      "docs/api/openapi.json": "98ac59eb08f5bb6f0986272884f9816762e6bdd2de5fe3b1d492730a66cc450e",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
@@ -30,14 +30,14 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "afd22ccce20e11430c03622af21d826b78804532",
+    "commit": "d702328e4f2a6f5026504b2b0eaf331995f214be",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
       "contracts/workbench-state/duplicate-attribution.json": "9b8d6211a4bb9fc10c17b4ba0ee419397810a4410263e95f7d1e97fe9be1d2f4",
-      "package.json": "a2d2e27d243c21594777d1fc64f7a7fadd710304e5f021979a791351fc81618b",
-      "lib/manuscript.js": "8ea2a3550a60248076d246b3d9e1c961d5054635efe87ed65f9012594f3ed663",
-      "lib/review-report.js": "4cd9bacbb5dd8a9f821df6fd7c5bbd449ce85d27223258ae05e90620c1865b69",
-      "lib/semantic-review.js": "914116aedf300c8c5be2d908bdecca26855567a132863a68eb35e97db657fb4d",
+      "package.json": "536b6ced1f7d348adf6ac5de1d6280f0375718102d7ebe01f3b15adba405d2de",
+      "lib/manuscript.js": "03349d66553dbe99bdb23d0fe36e8cc0c1f1b94acef01bd9da52814160bca74c",
+      "lib/review-report.js": "a078e29b5f958d5d54007fb96af2295d2cccdf45bfd5dcc23a6cf29a9b7bf67e",
+      "lib/semantic-review.js": "be3ad1fb127ea7db13a3d0a5fa7be63a224f4b199b316dfda775d89db1f6504a",
       "docs/manuscript-v2.md": "adc03eaa25a93d6d9398d9c56ee0198e41c38d73ddb49f4bee848a78487354f4",
       "contracts/manuscript-v2/cases.json": "fb846d23f40d257b38910c0251d19c63f91469fe33b1f006733e5617b7f94886",
       "contracts/manuscript-v2/invalid-129-decisions.json": "6f597aad8f6df0bc33d6bfccce41bd572d19177c37dd1a9560a1a4831c96b80b",
@@ -47,7 +47,7 @@
       "contracts/manuscript-v2/invalid-ignored-with-text.json": "35cdecc33f5a5ff3c33a755b2381a9f4f0693e5ae77e9865b5b119188e381763",
       "contracts/manuscript-v2/invalid-unknown-key.json": "9102960ff2e071f21d3a8f230b503f85cf36d743e640a7cf5a659c5f6b90b043",
       "contracts/manuscript-v2/valid-all-parts.json": "e7de60c3e934267a9a25aa10a1144d249734f742c759493d18aa4261d3f32363",
-      "contracts/manuscript-v3/SPEC.md": "7e7df710f9d9fcaa83f4db063af80607fee1415598c473e15f3d3b7f1bafa5b1",
+      "contracts/manuscript-v3/SPEC.md": "e7d88dffba790dd42285ec3ad2ad792c9b4fd125c8395ea9c7b6f973b18484e1",
       "contracts/manuscript-v3/cases.json": "7e0883cbb1c583d42226cd03d11c2d5687210b217661e784462f5f71336c7042",
       "contracts/manuscript-v3/invalid-v3-33-choices.json": "42b57ca834faee19701169dd7064073cac872a6ec586e7096b12852b76f980ab",
       "contracts/manuscript-v3/invalid-v3-33-fields.json": "6617e9c6dd6cc8b2866950f48ea81b76f9210bfa2655f03d122e6eee25e09513",
@@ -107,7 +107,7 @@
       "contracts/manuscript-v3/valid-v3-over-1mib.json": "42cf30cec812388a19504c78502a38f96fefaa3c15aebc8eace98ec37e041cd6",
       "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
       "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
-      "lib/markdown-report.ts": "f60628edbe97e89ac39306d842b84b2889cb1c0164321637e7df5c64882e1bbb",
+      "lib/markdown-report.ts": "5dd55104dd831cff694c83e11f2eb2ce5fd3f94719e7ad6eb15062f7e761410d",
       "lib/messages.ts": "fd86e1b1865372f192305df6d8f33c8165aeebf5770882d7c4dde0e3c4afced0",
       "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
       "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
@@ -138,7 +138,9 @@
       "contracts/manuscript-v4/valid-v4-fits-v1.json": "aadcfa950b9333425d42c30b59d1d8e2813cae2e5a4d30bb71affd27287d4990",
       "contracts/manuscript-v4/valid-v4-fits-v3.json": "797c2e9dbeb048313a1538285969cbf6dd7ef8bebc1466b02ed352720e4f0c52",
       "contracts/manuscript-v4/valid-v4-segment-reason-only.json": "0fe0bc9269d6419631edaa1f74eb582c8bb242a120eb6d1c617dcb9a842907e6",
-      "contracts/manuscript-v4/valid-v4-segments-dense.json": "8d27a7bc4833c21a313d7108897637dd7404dc16780dc6c5b3b288f020f08b85"
+      "contracts/manuscript-v4/valid-v4-segments-dense.json": "8d27a7bc4833c21a313d7108897637dd7404dc16780dc6c5b3b288f020f08b85",
+      "contracts/workbench-state/operation-traces.json": "4f9a2a14de11d1c196c5e7d36c634f8e91fe1c7a5b752185fc04b0bec6d70832",
+      "contracts/generated/manuscript_contract.py": "6b8196c2ddfbd375c8d7cc6e42e18245506124572fd5ba486f8c92f8de654906"
     }
   }
 }

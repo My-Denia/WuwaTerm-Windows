@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
+import sys
+import typing
 from pathlib import Path
 
 import pytest
@@ -854,3 +857,38 @@ def test_a_group_is_never_confirmed_while_a_ready_segment_owes_a_check() -> None
     assert settled["status"] == "confirmed", settled
     assert settled["unverified_segments"] == []
     assert sr.group_matches_filter(settled, "confirmed")
+
+
+def test_generated_python_contract_dtos_load_and_resolve(contract_source) -> None:
+    """Web's generated Python contract DTOs load cleanly and preserve NotRequired union fields."""
+    contract_path = contract_source("web") / "contracts" / "generated" / "manuscript_contract.py"
+    module_name = "_wuwaterm_contract_schema_check"
+    spec = importlib.util.spec_from_file_location(module_name, contract_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        assert module.WORKFILE_FORMAT_VALUES == (
+            manuscript.WORKFILE_FORMAT,
+            manuscript.WORKFILE_FORMAT_V2,
+            manuscript.WORKFILE_FORMAT_V3,
+            manuscript.WORKFILE_FORMAT_V4,
+        )
+        for cls_name in (
+            "ContractManuscriptV4",
+            "ContractFindingV4",
+            "ContractCompactFindingV4",
+            "ContractResolution",
+            "ContractSemanticIssue",
+        ):
+            typing.get_type_hints(getattr(module, cls_name), include_extras=True)
+
+        finding_hints = typing.get_type_hints(module.ContractFindingV4, include_extras=True)
+        compact_hints = typing.get_type_hints(module.ContractCompactFindingV4, include_extras=True)
+        resolution_hints = typing.get_type_hints(module.ContractResolution, include_extras=True)
+        assert typing.get_origin(finding_hints["reason"]) is typing.NotRequired
+        assert typing.get_origin(compact_hints["reason"]) is typing.NotRequired
+        assert typing.get_origin(resolution_hints["candidate_id"]) is typing.NotRequired
+    finally:
+        sys.modules.pop(module_name, None)
