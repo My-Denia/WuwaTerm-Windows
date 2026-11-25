@@ -427,6 +427,12 @@ class TermbaseDialog(QDialog):
         self._reload_rows()
         self._show_file_state()
         self._set_mode(None)
+        # Return in a field submits the form (returnPressed) and nothing else.
+        # Every push button in a QDialog starts out auto-default, so Return
+        # would go on to press whichever one Qt had made the default.
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
 
     # -- state ------------------------------------------------------------------
 
@@ -633,7 +639,7 @@ class TermbaseDialog(QDialog):
             return False
         if len(self._store) or not self._store.usable:
             prompt = (strings.TERMBASE_REPLACE_PROMPT.format(n=len(self._store)) if self._store.usable
-                      else strings.TERMBASE_RESET_PROMPT)
+                      else strings.TERMBASE_REPLACE_UNUSABLE_PROMPT.format(n=len(incoming["entries"])))
             if not self._ask(prompt, strings.TERMBASE_REPLACE_CONFIRM, strings.TERMBASE_REPLACE_KEEP):
                 return False
         try:

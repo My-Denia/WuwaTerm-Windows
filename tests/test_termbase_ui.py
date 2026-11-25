@@ -10,8 +10,9 @@ import json
 
 import httpx
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QLabel
+from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QLabel, QPushButton
 
 from wuwaterm_client import strings
 from wuwaterm_client import termbase as tb
@@ -115,6 +116,56 @@ def test_add_edit_and_delete_save_the_local_file_each_time(qapp, store) -> None:
     assert [e["source"] for e in store.entries] == ["主C"] and asked[0] == strings.TERMBASE_REMOVE_CONFIRM.format(source="burst window")
     assert tb.TermbaseStore(store.path).entries == store.entries
     assert changes == [1, 2, 2, 1]
+
+
+def test_return_in_a_field_submits_the_form_and_presses_no_button(qapp, store) -> None:
+    dialog = TermbaseDialog(store)
+    dialog.show()
+    for edit, source in ((dialog.source_edit, "主C"), (dialog.target_edit, "副C"), (dialog.note_edit, "回能")):
+        fill(dialog, source, "rendering")
+        edit.setFocus()
+        QTest.keyClick(edit, Qt.Key.Key_Return)
+        # Added, selected in the list, and the form is ready for the next one.
+        assert store.entries[-1]["source"] == source
+        assert dialog.submit_button.text() == strings.TERMBASE_ADD and dialog.cancel_edit_button.isHidden()
+        assert dialog.source_edit.text() == "" and dialog.target_edit.text() == ""
+    assert len(store) == 3
+
+    # Updating with Return leaves edit mode.
+    dialog.table.selectRow(0)
+    dialog._edit_selected()
+    dialog.target_edit.setText("main DPS")
+    dialog.target_edit.setFocus()
+    QTest.keyClick(dialog.target_edit, Qt.Key.Key_Return)
+    assert store.entries[0]["target"] == "main DPS" and len(store) == 3
+    assert dialog.submit_button.text() == strings.TERMBASE_ADD and dialog.source_edit.text() == ""
+    dialog.close()
+
+
+def test_return_on_a_form_that_cannot_be_saved_keeps_the_message_and_the_typing(qapp, store) -> None:
+    dialog = TermbaseDialog(store)
+    dialog.show()
+    fill(dialog, "主C", "main DPS")
+    dialog._submit()
+    dialog.table.selectRow(0)  # a row is selected, so Edit is enabled
+    assert dialog.edit_button.isEnabled()
+    fill(dialog, "half typed", "")
+    dialog.source_edit.setFocus()
+    QTest.keyClick(dialog.source_edit, Qt.Key.Key_Return)
+    assert dialog.form_error.is_showing()
+    assert dialog.form_error.text() == strings.TERMBASE_FIELD_REQUIRED.format(field=strings.TERMBASE_FIELD_TARGET)
+    assert dialog.source_edit.text() == "half typed" and dialog.submit_button.text() == strings.TERMBASE_ADD
+    assert len(store) == 1 and store.entries[0]["source"] == "主C"
+    # A message on screen survives Return too: no button, the banner's included, is pressed.
+    broken = store.path.parent / "broken.json"
+    broken.write_bytes(b"{")
+    assert dialog.import_path(broken) is False and dialog.banner.is_showing()
+    dialog.source_edit.setFocus()
+    QTest.keyClick(dialog.source_edit, Qt.Key.Key_Return)
+    assert dialog.banner.is_showing() and strings.TERMBASE_IMPORT_FAILED in dialog.banner.message_text
+    assert dialog.source_edit.text() == "half typed"
+    assert not [b for b in dialog.findChildren(QPushButton) if b.autoDefault() or b.isDefault()]
+    dialog.close()
 
 
 def test_a_form_that_cannot_be_saved_says_why_and_writes_nothing(qapp, store) -> None:
@@ -229,6 +280,23 @@ def test_an_unusable_local_file_blocks_edits_and_is_only_replaced_on_purpose(qap
     dialog._reset()
     assert dialog.store.usable and dialog.source_edit.isEnabled() and dialog.reset_button.isHidden()
     assert tb.TermbaseStore(path).entries == []
+
+
+def test_importing_over_an_unusable_file_says_what_will_be_written(qapp, tmp_path) -> None:
+    path = tmp_path / "termbase.json"
+    path.write_bytes(b"{")
+    dialog = TermbaseDialog(tb.TermbaseStore(path, clock=lambda: STAMP))
+    chosen = tmp_path / "terms.json"
+    chosen.write_bytes(tb.serialize_termbase(tb.validate_termbase({
+        "format": tb.TERMBASE_FORMAT, "schema_version": 1, "updated_at": STAMP,
+        "entries": [{"id": f"tb-{i:03d}", "source": f"词{i}", "target": f"w{i}", "direction": "en",
+                     "kind": "community_term", "note": "", "updated_at": STAMP} for i in (1, 2)]})))
+    asked = answer(dialog, False, True)
+    assert dialog.import_path(chosen) is False and path.read_bytes() == b"{"
+    assert dialog.import_path(chosen) is True
+    assert asked == [strings.TERMBASE_REPLACE_UNUSABLE_PROMPT.format(n=2)] * 2
+    assert "2 条" in asked[0] and "空术语表" not in asked[0]
+    assert path.read_bytes() == chosen.read_bytes() and dialog.store.usable
 
 
 def test_every_refusal_code_has_its_own_message_and_no_file_content(qapp) -> None:
