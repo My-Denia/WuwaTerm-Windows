@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
+from PySide6.QtGui import QIcon, QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
@@ -645,8 +645,14 @@ class _WordWrapDelegate(QStyledItemDelegate):
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if not isinstance(text, str) or not text:
             return super().sizeHint(option, index)
+        # A state icon takes its width (and a gap) from the text's line.
+        decoration = index.data(Qt.ItemDataRole.DecorationRole)
+        icon_width = 0
+        if isinstance(decoration, QIcon) and not decoration.isNull():
+            size = view.iconSize() if view.iconSize().isValid() else option.decorationSize
+            icon_width = size.width() + 8
         rect = option.fontMetrics.boundingRect(
-            0, 0, width - 20, 10_000, Qt.TextFlag.TextWordWrap, text
+            0, 0, max(20, width - 20 - icon_width), 10_000, Qt.TextFlag.TextWordWrap, text
         )
         return QSize(width, rect.height() + 14)
 
@@ -887,7 +893,9 @@ class ManuscriptView(QWidget):
             editor.editRejected.connect(lambda: self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED))
             editor.cursorPositionChanged.connect(lambda e=editor: self._caret_moved(e))
         # The two editors scroll together, by segment anchors (on by default).
-        self.scroll_sync = ScrollSync(self.source_edit, self.target_edit, self._scroll_anchors, self)
+        self.scroll_sync = ScrollSync(
+            self.source_edit, self.target_edit, self._scroll_anchors, self,
+            paused=lambda: self.source_edit._ime_active or self.target_edit._ime_active)
         # A caret that stops for 300 ms is followed in the segment and issue
         # lists; following never moves the caret or takes the focus.
         self._caret_side = "source"
@@ -4381,7 +4389,8 @@ class ManuscriptView(QWidget):
 
     # -- file continuity: import, clipboard, work position -------------------
     def _guard_text_inputs(self) -> None:
-        """Inspector text fields take a dropped file as a file, not as typed text.
+        """Inspector text fields take a dropped file as a file, not as typed text,
+        and a character typed with AltGr as text, not as a Ctrl+Alt shortcut.
 
         QLineEdit and the adjust box accept drops by default and would type
         the file's path into a field that can later be written into the draft.
@@ -4390,6 +4399,9 @@ class ManuscriptView(QWidget):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.ShortcutOverride and LosslessEditor.typed_with_altgr(event):
+            event.accept()
+            return True
         if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
             files = LosslessEditor.local_files(event.mimeData())
             if files:

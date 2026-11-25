@@ -72,7 +72,7 @@ class ShortcutSheet(QDialog):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.table.resizeRowsToContents()
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
         note = QLabel(f"{strings.SHORTCUT_SHEET_NOTE}\n{strings.SHORTCUT_SHEET_NOTE_EN}", self)
         note.setObjectName("secondaryText")
@@ -85,13 +85,18 @@ class ShortcutSheet(QDialog):
         self._fit()
 
     def _fit(self) -> None:
-        """Wide enough for every row on one line, within the screen."""
+        """Every row on one line and every row in view, within the screen;
+        on a small screen the table scrolls instead of the dialog growing."""
         self.table.resizeColumnsToContents()
-        width = sum(self.table.columnWidth(column) for column in range(3)) + 48
-        height = (self.table.horizontalHeader().height()
-                  + sum(self.table.rowHeight(row) for row in range(self.table.rowCount())) + 140)
+        self.table.resizeRowsToContents()
+        metrics = self.fontMetrics()
+        frame = 2 * self.table.frameWidth()
+        width = sum(self.table.columnWidth(column) for column in range(3)) + frame + 32 + metrics.averageCharWidth() * 4
+        rows = sum(self.table.rowHeight(row) for row in range(self.table.rowCount()))
+        height = (self.table.horizontalHeader().sizeHint().height() + rows + frame
+                  + metrics.lineSpacing() * 2 + 14 + 12 + 10 * 2 + 48)
         screen = self.screen().availableGeometry() if self.screen() is not None else None
         if screen is not None:
             width = min(width, int(screen.width() * 0.9))
             height = min(height, int(screen.height() * 0.85))
-        self.resize(max(520, width), max(360, height))
+        self.resize(width, height)

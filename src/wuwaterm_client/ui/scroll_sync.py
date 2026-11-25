@@ -13,6 +13,9 @@ Three things keep it from fighting the owner:
 * ``suspended()``: commands that position both editors themselves (undo,
   selecting a finding, restoring a work position) do so without the first
   scroll dragging the second editor somewhere else;
+* ``paused``: while it says so (an input-method composition is open), neither
+  editor moves the other, so a composition and its candidate window stay put
+  and the undo step records where both editors were when it began;
 * a switch, on by default, that the owner can turn off.
 
 The editors only need two methods, ``raw_offset_at_top()`` and
@@ -70,11 +73,12 @@ class ScrollSync(QObject):
 
     def __init__(self, source: QPlainTextEdit, target: QPlainTextEdit,
                  anchors: Callable[[], Anchors | None] | None = None,
-                 parent: QObject | None = None) -> None:
+                 parent: QObject | None = None, *, paused: Callable[[], bool] | None = None) -> None:
         super().__init__(parent)
         self._source = source
         self._target = target
         self._anchors = anchors or (lambda: None)
+        self._paused = paused or (lambda: False)
         self._enabled = True
         self._lock = False
         self._suspended = 0
@@ -106,7 +110,7 @@ class ScrollSync(QObject):
 
     # -- following ---------------------------------------------------------
     def _follow(self, origin: QPlainTextEdit) -> None:
-        if not self._enabled or self._lock or self._suspended:
+        if not self._enabled or self._lock or self._suspended or self._paused():
             return
         follower = self._target if origin is self._source else self._source
         self._lock = True

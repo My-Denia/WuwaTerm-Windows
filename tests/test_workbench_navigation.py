@@ -12,7 +12,7 @@ import json
 
 import pytest
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QKeyEvent, QTextCursor
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -22,7 +22,7 @@ from wuwaterm_client.api import ApiClient
 from wuwaterm_client.manuscript import empty_workfile
 from wuwaterm_client.recovery import load_recovery, save_recovery
 from wuwaterm_client.ui import review_states
-from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_SEMANTIC, TRACK_TERMS, ManuscriptView
+from wuwaterm_client.ui.manuscript_view import TRACK_SEGMENTS, TRACK_TERMS, ManuscriptView
 from wuwaterm_client.ui.scroll_sync import map_offset, monotonic_anchors
 from wuwaterm_client.ui.shortcut_sheet import SHORTCUTS, registered_sequences
 
@@ -239,6 +239,12 @@ def test_a_character_typed_with_altgr_goes_to_the_editor_not_to_a_shortcut(qapp)
         same.ignore()
         view.source_edit.event(same)
         assert not same.isAccepted(), "the key's own digit is not AltGr text"
+        # The inspector's own text fields: "#" is AltGr+3 on a French layout.
+        for field in (view.replacement_edit, view.adjust_edit):
+            hash_key = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_3, both, "#")
+            hash_key.ignore()
+            QApplication.sendEvent(field, hash_key)
+            assert hash_key.isAccepted(), field
     finally:
         view.close()
 
@@ -325,7 +331,7 @@ def test_the_five_states_map_every_source_vocabulary() -> None:
 
 # -- the status bar and the shortcut sheet ---------------------------------------------------
 
-def test_the_status_bar_counts_the_manuscript_switches_scroll_sync_and_opens_the_sheet(qapp, monkeypatch) -> None:
+def test_the_status_bar_counts_the_manuscript_switches_scroll_sync_and_opens_the_sheet(qapp) -> None:
     from wuwaterm_client.ui import main_window as main_window_module
     from wuwaterm_client.config import ClientConfig
 

@@ -1,6 +1,6 @@
 """Capture the workbench in fixed states for visual review.
 
-    python scripts/capture_workbench.py OUT_DIR [--scale 1.5] [--size 1440x900]
+    python scripts/capture_workbench.py OUT_DIR [--scale 1.5] [--size 1440x900] [--only 07,13]
 
 Every request goes to an in-process mock transport and the configuration lives
 in a temporary directory: nothing leaves the machine, no credential store is
@@ -28,6 +28,8 @@ def _parse() -> argparse.Namespace:
     parser.add_argument("--scale", default="1")
     parser.add_argument("--size", default="1440x900")
     parser.add_argument("--themes", default="light,dark")
+    parser.add_argument("--modes", default="plain,semantic")
+    parser.add_argument("--only", default="", help="comma-separated state name prefixes, e.g. 07,13")
     return parser.parse_args()
 
 
@@ -730,8 +732,28 @@ def _states(semantic: bool):
         view.jump_mismatch_button.click()
         return window
 
+    def caret_followed():
+        # A long reviewed manuscript with the segment track open and the caret
+        # resting inside the third segment of the target: the row follows, the
+        # status bar names the segment.
+        window = quota()
+        view = window.manuscript_view
+        view._show_track(TRACK_SEGMENTS)
+        pairs = view._current_pairs()
+        view.target_edit.setFocus()
+        view.target_edit.set_raw_cursor_offset(pairs[min(2, len(pairs) - 1)].target.core_start + 4)
+        view._caret_side = "target"
+        view._follow_caret()
+        return window
+
+    def shortcut_sheet():
+        window = drafted()
+        window.show_shortcuts()
+        return window
+
+    states = []
     if not semantic:
-        return [("01-empty", lambda: _window(_Server(False))),
+        states = [("01-empty", lambda: _window(_Server(False))),
                 ("02-unconfigured", lambda: _window(_Server(False), configured=False)),
                 ("03-draft", drafted), ("04-terms", terms), ("05-long-reviewed", long_reviewed),
                 ("06-quota-paused", quota), ("07-segments", segments),
@@ -743,10 +765,15 @@ def _states(semantic: bool):
                 ("09e-term-groups-saved-reopen", term_groups_saved_reopen),
                 ("10-term-groups-tuner-reason", tuner_and_reason_groups),
                 ("11-translation-mismatch", translation_mismatch)]
-    return [("04-terms", terms), ("05-semantic-issue", semantic_issue),
-            ("06-quota-paused", quota), ("07-segments", segments),
-            ("08-short-unreviewed", short_unreviewed),
-            ("09-term-groups-homographs", homograph_groups)]
+    else:
+        states = [("04-terms", terms), ("05-semantic-issue", semantic_issue),
+                  ("06-quota-paused", quota), ("07-segments", segments),
+                  ("08-short-unreviewed", short_unreviewed),
+                  ("09-term-groups-homographs", homograph_groups)]
+    states += [("12-caret-followed", caret_followed), ("13-shortcut-sheet", shortcut_sheet)]
+    prefixes = [item for item in ARGS.only.split(",") if item]
+    return [(name, build) for name, build in states
+            if not prefixes or any(name.startswith(prefix) for prefix in prefixes)]
 
 
 def _capture(app, build, path: Path) -> bool:
@@ -756,6 +783,14 @@ def _capture(app, build, path: Path) -> bool:
     image = window.grab()
     saved = image.save(str(path))
     print(f"{path.name} {image.width()}x{image.height()} px" if saved else f"failed to save {path}")
+    sheet = getattr(window, "_shortcut_sheet", None)
+    if saved and sheet is not None and sheet.isVisible():
+        sheet_path = path.with_name(path.stem + "-sheet.png")
+        sheet_image = sheet.grab()
+        saved = sheet_image.save(str(sheet_path))
+        print(f"{sheet_path.name} {sheet_image.width()}x{sheet_image.height()} px" if saved
+              else f"failed to save {sheet_path}")
+        sheet.close()
     window.manuscript_view._saved_payload = window.manuscript_view._payload
     window.close()
     window.deleteLater()
@@ -772,7 +807,8 @@ def main() -> int:
     scale_tag = ARGS.scale.replace(".", "")
     for scheme in ARGS.themes.split(","):
         theme.apply_theme(app, scheme)
-        for mode, with_semantic in (("plain", False), ("semantic", True)):
+        modes = [item for item in (("plain", False), ("semantic", True)) if item[0] in ARGS.modes.split(",")]
+        for mode, with_semantic in modes:
             for name, build in _states(with_semantic):
                 path = ARGS.out / f"{mode}-{name}-{scheme}-{scale_tag}x.png"
                 if not _capture(app, build, path):
