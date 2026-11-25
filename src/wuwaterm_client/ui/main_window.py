@@ -12,7 +12,7 @@ import inspect
 import os
 from collections.abc import Callable
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog,
@@ -53,11 +53,12 @@ from ..errors import (
     message_for,
 )
 from . import error_presentation
-from .components import Banner, EmptyStateCard, EndpointChip, fit_to_workspace
+from .components import Banner, ElidedLabel, EmptyStateCard, EndpointChip, fit_to_workspace
 from .first_run_dialog import FirstRunDialog
 from .icons import icon
 from .manuscript_view import ManuscriptView
 from .settings_dialog import SettingsDialog
+from .shortcut_sheet import ShortcutSheet
 from .status_view import StatusView
 from .terms_view import TermsView
 from .token_dialog import TokenDialog
@@ -217,20 +218,47 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.setup_card)
         content_layout.addWidget(self.stack, 1)
 
+        # The status bar: the connection and the dictionary on the left, the
+        # open manuscript's counts and the workbench switches on the right.
+        # One line; the counts elide before anything is pushed off screen.
         footer = QFrame(content)
         footer.setObjectName("workbenchToolbar")
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(12, 2, 12, 2)
+        footer_layout.setSpacing(6)
         self.endpoint_button = QPushButton(footer)
         self.endpoint_button.setObjectName("commandButton")
         self.endpoint_button.clicked.connect(self._on_settings_clicked)
+        self.dictionary_label = ElidedLabel(footer)
+        self.dictionary_label.setObjectName("secondaryText")
+        self.dictionary_label.setMinimumWidth(48)
+        self.document_stats_label = ElidedLabel(footer)
+        self.document_stats_label.setObjectName("secondaryText")
+        self.document_stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.scroll_sync_button = QPushButton(footer)
+        self.scroll_sync_button.setObjectName("commandButton")
+        self.scroll_sync_button.setCheckable(True)
+        self.scroll_sync_button.setToolTip(strings.STATUS_BAR_SCROLL_SYNC_TOOLTIP)
+        self.scroll_sync_button.setAccessibleName(strings.STATUS_BAR_SCROLL_SYNC)
+        # A status-bar click must not end an input-method composition.
+        self.scroll_sync_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.shortcuts_button = QPushButton(strings.STATUS_BAR_SHORTCUTS, footer)
+        self.shortcuts_button.setObjectName("commandButton")
+        self.shortcuts_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.shortcuts_button.setToolTip(strings.MENU_SHORTCUTS)
+        self.shortcuts_button.clicked.connect(self.show_shortcuts)
         self.diagnostics_button = QPushButton(strings.WORKBENCH_DIAGNOSTICS, footer)
         self.diagnostics_button.setObjectName("commandButton")
         self.diagnostics_button.clicked.connect(lambda: self.show_page(PAGE_STATUS))
         footer_layout.addWidget(self.endpoint_button)
-        footer_layout.addStretch(1)
+        footer_layout.addWidget(self.dictionary_label, 1)
+        footer_layout.addWidget(self.document_stats_label, 3)
+        footer_layout.addWidget(self.scroll_sync_button)
+        footer_layout.addWidget(self.shortcuts_button)
         footer_layout.addWidget(self.diagnostics_button)
         content_layout.addWidget(footer)
+        self._meta = None
+        self._shortcut_sheet: ShortcutSheet | None = None
 
         central = QWidget(self)
         central_layout = QHBoxLayout(central)
@@ -250,6 +278,14 @@ class MainWindow(QMainWindow):
         self.manuscript_view.documentLeaving.connect(self._remember_position)
         self.manuscript_view.documentSaved.connect(self._remember_position)
         self.manuscript_view.documentOpened.connect(self._on_document_opened)
+        self.manuscript_view.documentChanged.connect(self._refresh_status_bar)
+        self.manuscript_view.workbenchStatusChanged.connect(self._refresh_status_bar)
+        self.status_view.metaChanged.connect(self._on_meta_changed)
+        sync = self.manuscript_view.scroll_sync
+        self.scroll_sync_button.setChecked(sync.is_enabled())
+        self.scroll_sync_button.toggled.connect(sync.set_enabled)
+        sync.toggled.connect(self._on_scroll_sync_toggled)
+        self._on_scroll_sync_toggled(sync.is_enabled())
         self._update_window_title()
 
         self.show_page(PAGE_MANUSCRIPT)
@@ -343,6 +379,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         help_menu = self.menuBar().addMenu(strings.MENU_HELP)
+        shortcuts_action = QAction(strings.MENU_SHORTCUTS, self)
+        shortcuts_action.setShortcut(QKeySequence("F1"))
+        shortcuts_action.triggered.connect(self.show_shortcuts)
+        help_menu.addAction(shortcuts_action)
+        self.shortcuts_action = shortcuts_action
         about_action = QAction(strings.MENU_ABOUT, self)
         about_action.triggered.connect(self._on_about_clicked)
         help_menu.addAction(about_action)
@@ -486,6 +527,68 @@ class MainWindow(QMainWindow):
         if callable(connect):
             connect(self._on_translate_requested)
 
+    # -- status bar and shortcut sheet ------------------------------------
+
+    def show_shortcuts(self) -> None:
+        """F1: the shortcut sheet, one window that stays open beside the work."""
+        if self._shortcut_sheet is None:
+            self._shortcut_sheet = ShortcutSheet(self)
+        self._shortcut_sheet.show()
+        self._shortcut_sheet.raise_()
+        self._shortcut_sheet.activateWindow()
+
+    def _on_meta_changed(self, meta) -> None:
+        self._meta = meta
+        self._refresh_status_bar()
+
+    def _on_scroll_sync_toggled(self, enabled: bool) -> None:
+        self.scroll_sync_button.blockSignals(True)
+        self.scroll_sync_button.setChecked(enabled)
+        self.scroll_sync_button.blockSignals(False)
+        self.scroll_sync_button.setText(
+            strings.STATUS_BAR_SCROLL_SYNC_ON if enabled else strings.STATUS_BAR_SCROLL_SYNC_OFF)
+
+    def _dictionary_facts(self) -> tuple[str, str]:
+        """The dictionary this window last heard of: the service's own metadata
+        (diagnostics) first, else the basis of the last term review."""
+        if self._meta is not None:
+            commit, schema, count = self._meta.source_commit, self._meta.schema_version, self._meta.term_count
+        else:
+            dictionary = self.manuscript_view.status_summary().get("dictionary") if hasattr(
+                self, "manuscript_view") else None
+            if not dictionary:
+                return strings.STATUS_BAR_DICTIONARY_UNKNOWN, strings.STATUS_BAR_DICTIONARY_UNKNOWN_TOOLTIP
+            commit, schema, count = (dictionary.get("source_commit"), dictionary.get("schema_version"),
+                                     dictionary.get("term_count"))
+        unknown = strings.STATUS_UNKNOWN_VALUE
+        short = (commit or unknown)[:12]
+        return (strings.STATUS_BAR_DICTIONARY.format(version=short),
+                strings.STATUS_BAR_DICTIONARY_TOOLTIP.format(commit=commit or unknown, schema=schema or unknown,
+                                                             count=unknown if count is None else count))
+
+    def _refresh_status_bar(self) -> None:
+        """Restate the status bar from the views; it never asks the service."""
+        if not hasattr(self, "dictionary_label"):
+            return
+        text, tooltip = self._dictionary_facts()
+        self.dictionary_label.set_full_text(text, tooltip)
+        on_manuscript = self.stack.currentIndex() == PAGE_MANUSCRIPT
+        self.document_stats_label.setVisible(on_manuscript)
+        self.scroll_sync_button.setVisible(on_manuscript)
+        if not on_manuscript:
+            return
+        summary = self.manuscript_view.status_summary()
+        parts = [strings.STATUS_BAR_CHARS.format(source=f"{summary['source_chars']:,}",
+                                                 target=f"{summary['target_chars']:,}")]
+        segments = summary["segments"]
+        if segments is None:
+            parts.append(strings.STATUS_BAR_SEGMENTS_PENDING)
+        elif summary["current_segment"] is not None and segments:
+            parts.append(strings.STATUS_BAR_SEGMENT_AT.format(current=summary["current_segment"], count=segments))
+        else:
+            parts.append(strings.STATUS_BAR_SEGMENTS.format(count=segments))
+        self.document_stats_label.set_full_text(" · ".join(parts))
+
     # -- navigation --------------------------------------------------------
 
     def show_page(self, index: int) -> None:
@@ -500,6 +603,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         for page, button in self._nav_by_page.items():
             button.setChecked(page == index)
+        self._refresh_status_bar()
         # The footer and each online page already state an unconfigured
         # service; preserve the banner space for actual refusals or errors.
         standing_notice = self.global_banner.message_text == strings.GLOBAL_BANNER_NOT_CONFIGURED
@@ -721,6 +825,8 @@ class MainWindow(QMainWindow):
         """
         for view in (self.translate_view, self.terms_view, self.status_view, self.manuscript_view):
             view.reset_for_endpoint_change()
+        self._meta = None
+        self._refresh_status_bar()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         if not self.manuscript_view.confirm_discard():

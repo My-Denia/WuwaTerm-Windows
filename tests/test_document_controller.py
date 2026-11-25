@@ -246,13 +246,15 @@ class StubHost:
     def selected_segment(self):
         return self.segment
 
-    def apply_target_write(self, changed: str, edit: tuple, *, alignments=None) -> bool:
+    def apply_target_write(self, changed: str, edit: tuple, *, remap=None) -> bool:
         if self.refuse_write:
             return False
         self.writes.append((changed, edit))
-        self.controller.payload["target"] = changed
-        if alignments is not None or self.controller.payload.get("alignments") is not None:
-            self.controller.payload["alignments"] = alignments
+        value = self.controller.draft_snapshot()
+        value["target"] = changed
+        if remap is not None:
+            value["alignments"] = remap.alignments
+        self.controller.apply_edit(value, edits=[edit], remap=remap)
         return True
 
 
@@ -1030,13 +1032,14 @@ def test_localized_decision_splice_preserves_and_shifts_explicit_alignments() ->
         assert controller.payload["target"] == target
         assert controller.payload["alignments"][1]["target"]["text"] == t2
 
-        # Unmatched fill_source_span fails closed to [], and whole blank-target write clears stale alignments.
-        unmatched = de.remap_alignments_for_target_splice(
+        # A fill whose pair region holds no untranslated entry is a plain
+        # insertion: the entry outside it keeps its source anchor, untouched.
+        unmatched = de.remap_for_target_fill(
             [{"source": {"start": 0, "end": 3, "text": "甲一。"}, "target": None}],
-            "甲一。", "[甲一。]", 0, 0, 5,
-            fill_source_span=(99, 100), fill_target_span=(0, 5),
+            "甲一。", "[甲一。]", 99, 100, 0, 0, 5, 5,
         )
-        assert unmatched == []
+        assert unmatched.alignments == [{"source": {"start": 0, "end": 3, "text": "甲一。"}, "target": None}]
+        assert not unmatched.touched
     asyncio.run(scenario())
 
 

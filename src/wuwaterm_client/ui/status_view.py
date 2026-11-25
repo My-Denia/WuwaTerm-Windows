@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
@@ -65,6 +65,10 @@ def _card(title: str, parent: QWidget) -> tuple[QFrame, QVBoxLayout]:
 
 
 class StatusView(QWidget):
+    # The service metadata this view now shows, or None once it describes no
+    # service (another address). The status bar reads its dictionary from it.
+    metaChanged = Signal(object)
+
     def __init__(
         self,
         api_client: ApiClient,
@@ -244,6 +248,7 @@ class StatusView(QWidget):
         self._endpoint_changed = True
         self._apply_empty_state()
         self._apply_endpoint_state()
+        self.metaChanged.emit(None)
 
     # -- internals ---------------------------------------------------------
 
@@ -398,6 +403,7 @@ class StatusView(QWidget):
         self._has_data = True
         self._endpoint_changed = False
         self._apply_api_version(meta)
+        self.metaChanged.emit(meta)
 
     def _apply_api_version(self, meta: MetaResult) -> None:
         """Say so when the service speaks an API version this client does not.

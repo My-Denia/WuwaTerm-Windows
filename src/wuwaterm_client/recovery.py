@@ -3,6 +3,10 @@
 Saves and reloads an in-progress manuscript workfile in the existing v1-v4
 JSON representation wrapped in a ``wuwaterm-recovery-v1`` envelope under
 ``%APPDATA%/WuwaTerm/recovery/draft.json`` (or an injected path).
+
+The envelope may also carry the session list of alignments edits invalidated
+(``alignment_invalidations``). It is session state, never part of the
+manuscript: the workfile inside the envelope holds only the kept alignments.
 """
 
 from __future__ import annotations
@@ -10,13 +14,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from wuwaterm_client import config, manuscript
+from wuwaterm_client.document_edits import MAX_SESSION_INVALIDATIONS, valid_invalidation
 
 RECOVERY_FORMAT = "wuwaterm-recovery-v1"
 RECOVERY_RELATIVE_PATH = Path("recovery") / "draft.json"
@@ -31,6 +36,7 @@ class RecoveryState:
     source_path: str | None = None
     dropped_conflicting_choices: int = 0
     error: str | None = None
+    alignment_invalidations: tuple[dict[str, Any], ...] = ()
 
 
 def default_recovery_path(base_dir: Path | None = None) -> Path:
@@ -43,8 +49,10 @@ def save_recovery(
     payload: Mapping[str, Any],
     *,
     source_path: Path | str | None = None,
+    alignment_invalidations: Sequence[Mapping[str, Any]] = (),
 ) -> None:
-    """Atomically write ``payload`` (serialized as v1-v4 workfile) to ``path``."""
+    """Atomically write ``payload`` (serialized as v1-v4 workfile) to ``path``,
+    with the session list of invalidated alignments beside it."""
     dropped_conflicts = 0
     try:
         workfile_json = manuscript.serialize_workfile(payload)
@@ -60,6 +68,9 @@ def save_recovery(
         "dropped_conflicting_choices": dropped_conflicts,
         "workfile_json": workfile_json,
     }
+    invalidations = [dict(item) for item in alignment_invalidations if valid_invalidation(item)]
+    if invalidations:
+        envelope["alignment_invalidations"] = invalidations[-MAX_SESSION_INVALIDATIONS:]
     encoded = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -99,12 +110,17 @@ def load_recovery(path: Path) -> RecoveryState:
             if isinstance(dropped_raw, int) and not isinstance(dropped_raw, bool) and dropped_raw >= 0
             else 0
         )
+        listed = data.get("alignment_invalidations", [])
+        invalidations = tuple(
+            item for item in (listed if isinstance(listed, list) else []) if valid_invalidation(item)
+        )[-MAX_SESSION_INVALIDATIONS:]
         return RecoveryState(
             status="valid",
             payload=payload,
             saved_at=saved_at if isinstance(saved_at, str) else None,
             source_path=source_path if isinstance(source_path, str) else None,
             dropped_conflicting_choices=dropped,
+            alignment_invalidations=invalidations,
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, manuscript.WorkfileError, ValueError, TypeError) as exc:
         return RecoveryState(status="corrupt", error=str(exc))

@@ -30,12 +30,12 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "6d1084fe1589854324f34b5e9501760ad670b435",
+    "commit": "c1323c6dcbdf053ff9938278ab8b64743c398adc",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
       "contracts/workbench-state/duplicate-attribution.json": "9b8d6211a4bb9fc10c17b4ba0ee419397810a4410263e95f7d1e97fe9be1d2f4",
       "package.json": "6c960836ed2411999c9e85d860442c89804f9cb136742b68ee6e2dd787f4ae90",
-      "lib/manuscript.js": "002c9cb33ae943f00f2e6dd7bcd98b3c1d2b40e538b8d29b27bf08d0aaa039ba",
+      "lib/manuscript.js": "8ab7f05769d0d65eaaaac19778c9712c2f95f4c2334c06bc690dbc2b7db9b9e5",
       "lib/review-report.js": "a078e29b5f958d5d54007fb96af2295d2cccdf45bfd5dcc23a6cf29a9b7bf67e",
       "lib/semantic-review.js": "be3ad1fb127ea7db13a3d0a5fa7be63a224f4b199b316dfda775d89db1f6504a",
       "docs/manuscript-v2.md": "adc03eaa25a93d6d9398d9c56ee0198e41c38d73ddb49f4bee848a78487354f4",
@@ -108,7 +108,7 @@
       "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
       "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
       "lib/markdown-report.ts": "5dd55104dd831cff694c83e11f2eb2ce5fd3f94719e7ad6eb15062f7e761410d",
-      "lib/messages.ts": "ae133de0be52794052b40435311406728d2fdf1d73eb09857d0524bd9555d67d",
+      "lib/messages.ts": "1cb4c5567ef7e31673bc3bd19a0e54c4ee916ff9c16d155863afae761f23280c",
       "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
       "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
       "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c",
@@ -140,7 +140,8 @@
       "contracts/manuscript-v4/valid-v4-segment-reason-only.json": "0fe0bc9269d6419631edaa1f74eb582c8bb242a120eb6d1c617dcb9a842907e6",
       "contracts/manuscript-v4/valid-v4-segments-dense.json": "8d27a7bc4833c21a313d7108897637dd7404dc16780dc6c5b3b288f020f08b85",
       "contracts/workbench-state/operation-traces.json": "4f9a2a14de11d1c196c5e7d36c634f8e91fe1c7a5b752185fc04b0bec6d70832",
-      "contracts/generated/manuscript_contract.py": "6b8196c2ddfbd375c8d7cc6e42e18245506124572fd5ba486f8c92f8de654906"
+      "contracts/generated/manuscript_contract.py": "6b8196c2ddfbd375c8d7cc6e42e18245506124572fd5ba486f8c92f8de654906",
+      "contracts/workbench-state/edit-transactions.json": "627795ea555782de0281f4049fe27a1c08a4216a64c86d4a8b5d53e14d2c5a2c"
     }
   }
 }

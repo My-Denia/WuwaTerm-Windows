@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
@@ -56,10 +57,11 @@ from typing import Any, Protocol, runtime_checkable
 from . import segment_records as sr, semantic, strings
 from . import semantic_session as sessions
 from .document_edits import (
-    HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome, PART_KEYS,
-    REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
-    REVIEW_KEYS, copy_payload, draft_of, merge_draft, normalize_semantic, remap_alignments_for_target_splice,
-    restore_draft_into,
+    TYPING_COALESCE_MS, AlignmentRemap, HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome,
+    PART_KEYS, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED,
+    REASON_STALE, REVIEW_KEYS, append_invalidations, compute_minimal_splice, copy_payload, draft_of,
+    merge_draft, narrow_splice, normalize_semantic, remap_for_edit, remap_for_free_edit, remap_for_target_fill,
+    remap_splice, restore_draft_into, valid_invalidation,
 )
 from .errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_INVALID_REQUEST,
@@ -243,25 +245,40 @@ class WorkbenchHost(Protocol):
         changed: str,
         edit: tuple,
         *,
-        alignments: list[dict[str, Any]] | None = None,
+        remap: AlignmentRemap | None = None,
     ) -> bool:
         """Write finished translation pieces as one undoable edit.
 
-        False when the editor cannot display ``changed``; nothing is committed
-        in that case (the caller has already refused the write).
+        ``remap`` is what the write does to the explicit alignments (kept,
+        resized, filled, or the entries it invalidated). False when the editor
+        cannot display ``changed``; nothing is committed in that case (the
+        caller has already refused the write).
         """
 
 
 class DocumentRunController:
     """The workbench's runs, its document commands and the state both commit to."""
 
-    def __init__(self, api_client: WorkbenchApiClient, host: WorkbenchHost) -> None:
+    def __init__(self, api_client: WorkbenchApiClient, host: WorkbenchHost,
+                 clock: Callable[[], float] | None = None) -> None:
         self.api_client = api_client
         self.host = host
         # The manuscript. Everything that commits writes it; the view reads it.
         self.payload: dict[str, Any] = empty_workfile()
         # The undo and redo steps of edits, term choices and decisions.
         self.history = EditHistory()
+        # Milliseconds, for joining a typing run into one undo step.
+        self.clock: Callable[[], float] = clock or (lambda: time.monotonic() * 1000.0)
+        # Alignments edit transactions took out of the list this session, each
+        # ``{"original_index", "reason", "entry"}``. Session state only: undo
+        # steps and the recovery draft carry it, a saved manuscript never does.
+        self.alignment_invalidations: list[dict[str, Any]] = []
+        # The typing run the newest undo step belongs to: (side, at, serial).
+        self._typing: tuple[str, float, int] | None = None
+        # An input-method composition in progress: its side, the draft before
+        # it and the session list before it. Alignments are judged against that
+        # draft, and the whole composition is one undo step.
+        self._composition: tuple[str, dict[str, Any], list[dict[str, Any]]] | None = None
         # Decisions by occurrence, rebuilt only when the decisions list is
         # replaced (every change assigns a new list: edits, undo/redo, loading).
         self.decision_cache: sessions.DecisionIndex | None = None
@@ -442,7 +459,8 @@ class DocumentRunController:
         return sessions.state_of(issue, self.decision_index(), self.payload["source"], self.payload["target"])
 
     def apply_edit(self, value: dict, *, view_state: dict | None = None, edits: list | None = None,
-                   exempt: sessions.LiveIssue | None = None) -> EditOutcome:
+                   exempt: sessions.LiveIssue | None = None, remap: AlignmentRemap | None = None,
+                   alignment_reset: bool = False) -> EditOutcome:
         """Commit one edit of the document as one undoable step.
 
         ``value`` is the draft after the change; keys it does not carry keep
@@ -452,13 +470,29 @@ class DocumentRunController:
         treated as replaced whole. ``exempt`` keeps the issue a decision was
         about alive across its own edit. ``view_state`` is the host's state to
         restore when this step is undone; without it the host is asked.
+        ``remap`` is the edit transaction that produced ``value``'s alignments:
+        the entries it invalidated join the session list. ``alignment_reset``
+        (an explicit alignment choice) and a direction change start that list
+        over; undo brings the old list back either way.
         """
         before = self.draft_snapshot()
         merged = merge_draft(before, value)
         if merged == before:
             return EditOutcome()
-        self.history.record(HistoryEntry(before, self.session.snapshot(),
-                                         self.host.editor_state() if view_state is None else view_state))
+        self._typing = None
+        self._composition = None
+        self._record_step(before, view_state)
+        return self._commit_edit(before, merged, edits, exempt, remap,
+                                 alignment_reset or before["direction"] != merged["direction"],
+                                 self.alignment_invalidations)
+
+    def _record_step(self, before: dict, view_state: dict | None) -> int:
+        return self.history.record(HistoryEntry(
+            before, self.session.snapshot(), self.host.editor_state() if view_state is None else view_state,
+            tuple(self.alignment_invalidations)))
+
+    def _commit_edit(self, before: dict, merged: dict, edits: list | None, exempt: sessions.LiveIssue | None,
+                     remap: AlignmentRemap | None, reset: bool, base_invalidations: list) -> EditOutcome:
         self.restore_draft(merged)
         self.document_revision += 1
         cleared = False
@@ -469,7 +503,101 @@ class DocumentRunController:
                 cleared = True
         elif edits is not None or before["source"] != merged["source"] or before["target"] != merged["target"]:
             self._apply_text_edits(before, merged, edits, exempt)
-        return EditOutcome(True, cleared, any(before[key] != merged[key] for key in REVIEW_KEYS))
+        if reset:
+            self.alignment_invalidations = []
+        else:
+            self.alignment_invalidations = append_invalidations(
+                base_invalidations, remap.invalidated if remap is not None else ())
+        kept = len(merged["alignments"] or ())
+        if remap is None:
+            return EditOutcome(True, cleared, any(before[key] != merged[key] for key in REVIEW_KEYS), kept=kept)
+        return EditOutcome(True, cleared, any(before[key] != merged[key] for key in REVIEW_KEYS),
+                           alignment_notice=remap.notice(before["alignments"]),
+                           invalidated=len(remap.invalidated), emptied_targets=len(remap.emptied_targets),
+                           kept=kept)
+
+    def edit_text(self, side: str, text: str, *, edit: tuple[int, int, int] | None = None,
+                  composing: bool = False, view_state: dict | None = None,
+                  exempt: sessions.LiveIssue | None = None) -> EditOutcome:
+        """One edit of ``side`` typed, pasted or composed in its editor, as an
+        edit transaction (contracts/workbench-state/edit-transactions.json).
+
+        ``edit`` is the range the editor reports, ``(start, old_end,
+        new_length)``; without it the change is the minimal splice between the
+        texts. Alignments outside the change are kept or shifted, one holding
+        it is resized, and only the entries it crosses or empties leave the
+        list; an emptied target keeps its source anchor as ``target: None``.
+
+        Undo: a one-scalar edit on the same side within ``TYPING_COALESCE_MS``
+        of the last one joins its step, unless it invalidates or empties an
+        alignment (a step of its own, so one undo restores the entries) or it
+        types or deletes a line break (a paragraph cut is its own step).
+        ``composing`` is an input-method composition update: the first opens
+        the step, later ones join it, and alignments are judged against the
+        text before the composition; the next edit of that side without
+        ``composing`` (the composition end, even with the same text) closes it.
+        """
+        if side not in ("source", "target"):
+            return EditOutcome()
+        if self._composition is not None and self._composition[0] != side:
+            self._composition = None
+        open_ = self._composition
+        current = self.payload[side]
+        if open_ is not None and not composing and text == current:
+            self._composition = None
+            self._typing = None
+            return EditOutcome()
+        if open_ is None and text == current:
+            return EditOutcome()
+        before = self.draft_snapshot()
+        base = open_[1] if open_ is not None else before
+        base_invalidations = open_[2] if open_ is not None else self.alignment_invalidations
+        next_source = text if side == "source" else before["source"]
+        next_target = text if side == "target" else before["target"]
+        if open_ is not None:
+            remap = remap_for_free_edit(base["alignments"], side, base["source"], base["target"],
+                                        next_source, next_target)
+        else:
+            remap = remap_for_edit(base["alignments"], side, base["source"], base["target"],
+                                   next_source, next_target, edit)
+        value = dict(before)
+        value[side] = text
+        value["alignments"] = remap.alignments
+        splice = (narrow_splice(current, text, *edit) if edit is not None
+                  else compute_minimal_splice(current, text))
+        if splice is None:
+            splice = compute_minimal_splice(current, text) or (0, 0, 0)
+        start, old_end, new_length = splice
+        delta = max(old_end - start, new_length)
+        line_break = "\n" in current[start:old_end] or "\n" in text[start:start + new_length]
+        now = self.clock()
+        typing = self._typing
+        can_join = (open_ is None and not composing and not remap.touched and not line_break
+                    and typing is not None and typing[0] == side and now - typing[1] <= TYPING_COALESCE_MS
+                    and delta <= 1 and self.history.top_serial() == typing[2])
+        if open_ is None and not can_join:
+            serial = self._record_step(before, view_state)
+        else:
+            serial = typing[2] if typing is not None else 0
+            self.history.drop_redo()
+        self._typing = ((side, now, serial)
+                        if not composing and open_ is None and not remap.touched and not line_break and delta <= 1
+                        else None)
+        if composing:
+            self._composition = open_ if open_ is not None else (side, before, list(base_invalidations))
+        else:
+            self._composition = None
+        edits = [(side, *edit)] if edit is not None else [(side, start, old_end, new_length)]
+        merged = merge_draft(before, value)
+        return self._commit_edit(before, merged, edits, exempt, remap, False, base_invalidations)
+
+    def set_direction(self, direction: str, *, view_state: dict | None = None) -> EditOutcome:
+        """A new translation direction: every explicit alignment is cleared (R7)."""
+        value = self.draft_snapshot()
+        value["direction"] = direction
+        if value["alignments"] is not None:
+            value["alignments"] = []
+        return self.apply_edit(value, view_state=view_state)
 
     def _apply_text_edits(self, before: dict, after: dict, edits: list | None,
                           exempt: sessions.LiveIssue | None) -> None:
@@ -506,6 +634,14 @@ class DocumentRunController:
     def clear_history(self) -> None:
         """A new document: nothing before it is undoable."""
         self.history.clear()
+        self.translation_withdrawn = False
+        self.alignment_invalidations = []
+        self._typing = None
+        self._composition = None
+
+    def restore_invalidations(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """The session list a recovery draft carried (malformed entries dropped)."""
+        self.alignment_invalidations = [copy.deepcopy(dict(item)) for item in items if valid_invalidation(item)][-64:]
 
     def undo(self, *, view_state: dict | None = None) -> HistoryOutcome | None:
         """Take back the last edit, its choices, decisions and positions."""
@@ -519,11 +655,15 @@ class DocumentRunController:
         """Undo and redo restore text, decisions and the semantic positions together."""
         before = self.draft_snapshot()
         entry = self.history.step(undo=undo, current=HistoryEntry(
-            before, self.session.snapshot(), self.host.editor_state() if view_state is None else view_state))
+            before, self.session.snapshot(), self.host.editor_state() if view_state is None else view_state,
+            tuple(self.alignment_invalidations)))
         if entry is None:
             return None
+        self._typing = None
+        self._composition = None
         later = sr.parts_of(self.payload)
         self.restore_draft(entry.value)
+        self.alignment_invalidations = [copy.deepcopy(item) for item in entry.invalidations]
         if "segments" in self.payload:
             # Checks made after the snapshot stay where the content is the same.
             self.put_parts(sr.carry_results(sr.parts_of(self.payload), later))
@@ -653,15 +793,17 @@ class DocumentRunController:
         decisions = sessions.with_decision(self.decisions(), issue, record)
         value = self.draft_snapshot()
         value["semantic_decisions"] = decisions
+        remap = None
         if target is not None:
+            before_target = value["target"]
             value["target"] = target
             if replaced is not None:
-                value["alignments"] = remap_alignments_for_target_splice(
-                    value["alignments"], value["source"], target,
-                    replaced["start"], replaced["end"], len(applied_text or ""),
-                )
-            elif value["alignments"] is not None:
-                value["alignments"] = []
+                remap = remap_splice(value["alignments"], "target", value["source"], target,
+                                     replaced["start"], replaced["end"], len(applied_text or ""))
+            else:
+                remap = remap_for_free_edit(value["alignments"], "target", value["source"], before_target,
+                                            value["source"], target)
+            value["alignments"] = remap.alignments
         candidate = copy_payload(self.payload)
         candidate.update(copy_payload(value))
         candidate.setdefault("semantic_history", [])
@@ -672,7 +814,7 @@ class DocumentRunController:
         edits = None
         if replaced is not None:
             edits = [("target", replaced["start"], replaced["end"], len(applied_text or ""))]
-        return CommandOutcome(True, edit=self.apply_edit(value, edits=edits, exempt=issue))
+        return CommandOutcome(True, edit=self.apply_edit(value, edits=edits, exempt=issue, remap=remap))
 
     def accept_issue(self, issue: sessions.LiveIssue | None, *, can_display: Callable[[str], bool],
                      alternative: bool = False) -> CommandOutcome:
@@ -1134,10 +1276,6 @@ class DocumentRunController:
                 and payload["target"] == run.target)
         return run if same else None
 
-    def clear_history(self) -> None:
-        self.history.clear()
-        self.translation_withdrawn = False
-
     def resumable_partial_prefix(self) -> tuple[int, str, int, str, tuple[str, str]] | None:
         """For an unaligned, multi-segment partial-prefix manuscript, return
         ``(tail_start, tail_text, append_start, append_prefix, before_pair)``."""
@@ -1550,7 +1688,7 @@ class DocumentRunController:
         cannot show the result."""
         target = run.target
         current_alignments = self.payload["alignments"]
-        remapped = current_alignments
+        source = self.payload["source"]
         if pair is None:
             if run.append_start is not None and not run.written:
                 inserted = run.append_prefix + added
@@ -1560,14 +1698,14 @@ class DocumentRunController:
                 start = len(target) if run.written else 0
                 changed = (target if run.written else "") + added
                 edit = ("target", start, len(target), len(added))
-            remapped = None if current_alignments is None else []
+            # A new whole translation leaves no explicit alignment confirmed
+            # (the Web's whole-text writes do the same).
+            remap = AlignmentRemap(None if current_alignments is None else [])
         elif run.retranslate:
             start, end = pair.target.core_start, pair.target.core_end
             changed = target[:start] + added + target[end:]
             edit = ("target", start, end, len(added))
-            remapped = remap_alignments_for_target_splice(
-                current_alignments, self.payload["source"], changed, start, end, len(added),
-            )
+            remap = remap_splice(current_alignments, "target", source, changed, start, end, len(added))
         else:
             position = pair.target.core_start
             left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
@@ -1577,18 +1715,13 @@ class DocumentRunController:
             edit = ("target", position, position, len(inserted))
             fill_start = position + len(left)
             fill_end = fill_start + len(added)
-            remapped = remap_alignments_for_target_splice(
-                current_alignments,
-                self.payload["source"],
-                changed,
-                position,
-                position,
-                len(inserted),
-                fill_source_span=(pair.source.core_start, pair.source.core_end),
-                fill_target_span=(fill_start, fill_end),
-                fill_pair_source_span=(pair.source.start, pair.source.end),
-            )
-        return self.host.apply_target_write(changed, edit, alignments=remapped)
+            if fill_end > fill_start:
+                remap = remap_for_target_fill(current_alignments, source, changed, pair.source.start,
+                                              pair.source.end, position, fill_start, fill_end, len(inserted))
+            else:
+                remap = remap_splice(current_alignments, "target", source, changed, position, position,
+                                     len(inserted))
+        return self.host.apply_target_write(changed, edit, remap=remap)
 
     def translation_stopped(self, run: Translation, state: str, reason: str = "", *,
                             quota: bool = False) -> None:
