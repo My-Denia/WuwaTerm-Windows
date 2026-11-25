@@ -48,10 +48,12 @@ from ..manuscript import (
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
+from ..termbase import TermbaseStore
 from . import review_states
 from .components import Banner, ChevronComboBox
 from .icons import icon
 from .scroll_sync import ScrollSync
+from .termbase_dialog import MyTermsPanel, TermbaseDialog
 
 # Precedents (the owner's earlier choices in this manuscript) go with both
 # translation and semantic review by default, as on the Web, because the
@@ -810,9 +812,18 @@ class ManuscriptView(QWidget):
         parent: QWidget | None = None,
         *,
         recovery_path: Path | None = None,
+        termbase_store: TermbaseStore | None = None,
     ) -> None:
         super().__init__(parent)
         self._recovery_path = recovery_path
+        # The person's own terms: a local reference list. It is read for the
+        # source text on screen and never reaches a request, a review or a
+        # manuscript file.
+        self._termbase_store = termbase_store if termbase_store is not None else TermbaseStore()
+        self._my_terms_timer = QTimer(self)
+        self._my_terms_timer.setSingleShot(True)
+        self._my_terms_timer.setInterval(300)
+        self._my_terms_timer.timeout.connect(self._refresh_my_terms)
         self._recovery_pending = False
         self._recovery_timer = QTimer(self)
         self._recovery_timer.setSingleShot(True)
@@ -1143,6 +1154,12 @@ class ManuscriptView(QWidget):
         self.review_progress.hide()
         status_layout.addWidget(self.review_progress)
         details.addWidget(self.review_status)
+        # The person's own terms found in the source text: under the header,
+        # where a hit is seen without scrolling past the review tracks.
+        self.my_terms = MyTermsPanel(self._termbase_store, inspector_body)
+        self.my_terms.manage_requested.connect(self.show_termbase_dialog)
+        details.addWidget(self.my_terms)
+        self._refresh_my_terms()
         tracks = QHBoxLayout()
         tracks.setSpacing(4)
         for button in (self.terms_track_button, self.semantic_track_button, self.segments_track_button):
@@ -3406,6 +3423,7 @@ class ManuscriptView(QWidget):
         self._update_controls()
         # The status bar's counts follow on the next pause, not every keystroke.
         self._caret_timer.start()
+        self._my_terms_timer.start()
 
     def _alignment_notice_text(self, outcome: EditOutcome) -> str:
         """What an edit did to the explicit alignments, in the workbench's words.
@@ -3992,6 +4010,19 @@ class ManuscriptView(QWidget):
             self._updating = False
         # The status bar's counts follow a replaced text after the same pause.
         self._caret_timer.start()
+        self._my_terms_timer.start()
+
+    def _refresh_my_terms(self) -> None:
+        """The person's own terms found in the source text now on screen."""
+        self._my_terms_timer.stop()
+        self.my_terms.set_context(self._payload["source"], self._payload["direction"])
+
+    def show_termbase_dialog(self) -> None:
+        """Manage the termbase; the list of hits follows every change."""
+        dialog = TermbaseDialog(self._termbase_store, self)
+        dialog.changed.connect(self._refresh_my_terms)
+        dialog.exec()
+        self._refresh_my_terms()
 
     def _refresh_conflicts(self) -> None:
         history = sr.parts_of(self._payload).history if self._history_removal else []
