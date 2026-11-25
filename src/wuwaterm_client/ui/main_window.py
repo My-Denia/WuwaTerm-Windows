@@ -366,6 +366,8 @@ class MainWindow(QMainWindow):
         add(edit_menu, strings.EDIT_PASTE_TARGET, None, lambda: view.paste_as("target"))
         # Ctrl+Shift+C is free (the manuscript uses Ctrl+Shift+E/I/R/T/S).
         add(edit_menu, strings.EDIT_COPY_TARGET, "Ctrl+Shift+C", view.copy_target)
+        edit_menu.addSeparator()
+        add(edit_menu, strings.TERMBASE_MENU, None, view.show_termbase_dialog)
         file_menu.addSeparator()
         settings_action = QAction(strings.SETTINGS_MENU_LABEL, self)
         settings_action.triggered.connect(self._on_settings_clicked)

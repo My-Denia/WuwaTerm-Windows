@@ -747,6 +747,18 @@ QCheckBox::indicator:checked {
     border: 1px solid @accent@;
 }
 
+/* ------------------------------------------------ 我的术语（参考）命中 */
+
+#termbaseHit {
+    background-color: @bg-sunken@;
+    border: 1px solid @border-subtle@;
+    border-radius: 8px;
+}
+
+#termbaseHit QLabel {
+    background-color: transparent;
+}
+
 /* -------------------------------------------------------------- 表格 */
 
 QTableView,
