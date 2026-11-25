@@ -43,7 +43,7 @@ from ..document_edits import (
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
-    parse_workfile, save_workfile, serialize_workfile,
+    parse_workfile, sanitize_duplicate_choices, save_workfile, serialize_workfile,
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
@@ -840,7 +840,18 @@ class ManuscriptView(QWidget):
         self.conflict_list.currentRowChanged.connect(self._update_controls)
         self.remove_choice_button = QPushButton(strings.MANUSCRIPT_REMOVE_CHOICE, self)
         self.remove_choice_button.clicked.connect(self._remove_conflicting_choice)
-        for widget in (self.conflict_label, self.conflict_list, self.remove_choice_button):
+        self.resolve_conflicts_save_button = QPushButton(strings.MANUSCRIPT_RESOLVE_CONFLICTS_SAVE, self)
+        self.resolve_conflicts_save_button.setObjectName("primaryButton")
+        self.resolve_conflicts_save_button.clicked.connect(self._resolve_conflicting_choices_and_save)
+        self.export_prose_button = QPushButton(strings.MANUSCRIPT_EXPORT_PROSE, self)
+        self.export_prose_button.clicked.connect(self.export_prose)
+        for widget in (
+            self.conflict_label,
+            self.conflict_list,
+            self.remove_choice_button,
+            self.resolve_conflicts_save_button,
+            self.export_prose_button,
+        ):
             widget.setVisible(False)
         self.translate_button = QPushButton(self)
         self.translate_button.clicked.connect(self._translate)
@@ -1175,6 +1186,8 @@ class ManuscriptView(QWidget):
         details.addWidget(self.conflict_label)
         details.addWidget(self.conflict_list)
         details.addWidget(self.remove_choice_button)
+        details.addWidget(self.resolve_conflicts_save_button)
+        details.addWidget(self.export_prose_button)
         self.details_button = QPushButton(strings.MANUSCRIPT_DETAILS, inspector_body)
         self.details_button.setObjectName("commandButton")
         self.details_button.setCheckable(True)
@@ -2889,6 +2902,8 @@ class ManuscriptView(QWidget):
         self.undo_button.setEnabled(self._controller.can_undo() and not composing)
         self.redo_button.setEnabled(self._controller.can_redo() and not composing)
         self.remove_choice_button.setEnabled(0 <= self.conflict_list.currentRow() < len(self._conflict_indexes))
+        self.resolve_conflicts_save_button.setEnabled(not composing and not self._busy())
+        self.export_prose_button.setEnabled(not composing)
         self._update_choice_actions()
         self._update_segment_actions()
         self.save_label.setText(strings.MANUSCRIPT_SAVED if self._payload == self._saved_payload else strings.MANUSCRIPT_UNSAVED)
@@ -3054,6 +3069,10 @@ class ManuscriptView(QWidget):
                 if state.saved_at
                 else strings.RECOVERY_DRAFT_BANNER_NO_TIME
             )
+            if state.dropped_conflicting_choices > 0:
+                message += strings.RECOVERY_DROPPED_CONFLICTS_NOTE.format(
+                    count=state.dropped_conflicting_choices
+                )
             self.recovery_banner.show_message(
                 message,
                 SEVERITY_INFO,
@@ -3550,6 +3569,8 @@ class ManuscriptView(QWidget):
                     number=number, text=entry["source_span"]["text"], choice=self._describe_choice(entry)))
             for widget in (self.conflict_label, self.conflict_list, self.remove_choice_button):
                 widget.setVisible(True)
+            self.resolve_conflicts_save_button.setVisible(False)
+            self.export_prose_button.setVisible(False)
             self._inspector_requested = True
             self.inspector.show()
             self._update_inspector_button()
@@ -3558,6 +3579,12 @@ class ManuscriptView(QWidget):
         self.conflict_label.setText(strings.MANUSCRIPT_CHOICES_CONFLICT)
         self.remove_choice_button.setText(strings.MANUSCRIPT_REMOVE_CHOICE)
         groups = choice_conflict_groups(self._payload) if self._conflict_mode else []
+        remaining_duplicates = 0
+        if self._conflict_mode and not groups:
+            _, remaining_duplicates = sanitize_duplicate_choices(self._payload)
+        has_conflicts = self._conflict_mode and (bool(groups) or remaining_duplicates > 0)
+        if not has_conflicts:
+            self._conflict_mode = False
         self._conflict_indexes = [index for group in groups for index in group]
         self.conflict_list.clear()
         for group_number, group in enumerate(groups, 1):
@@ -3573,9 +3600,12 @@ class ManuscriptView(QWidget):
                 self.conflict_list.addItem(strings.MANUSCRIPT_CHOICE_ITEM.format(
                     group=group_number, number=index + 1, decision=decision, context=context,
                     start=start + 1, end=end))
-        for widget in (self.conflict_label, self.conflict_list, self.remove_choice_button):
-            widget.setVisible(bool(groups))
-        if groups:
+        self.conflict_label.setVisible(has_conflicts)
+        self.conflict_list.setVisible(bool(groups))
+        self.remove_choice_button.setVisible(bool(groups))
+        self.resolve_conflicts_save_button.setVisible(has_conflicts)
+        self.export_prose_button.setVisible(has_conflicts)
+        if has_conflicts:
             self._inspector_requested = True
             self.inspector.show()
             self._update_inspector_button()
@@ -3595,6 +3625,57 @@ class ManuscriptView(QWidget):
             return
         self._commit(self._controller.remove_choice(self._conflict_indexes[row]), editors=True)
         self.status_label.setText(strings.MANUSCRIPT_CHOICE_REMOVED)
+
+    def _resolve_conflicting_choices_and_save(self, _checked: bool = False) -> bool:
+        """Undoably drop colliding historical choices and save the manuscript."""
+        if not self._input_ready():
+            return False
+        outcome = self._controller.resolve_conflicting_choices_for_save()
+        self._conflict_mode = False
+        if outcome.committed:
+            self._commit(outcome, editors=False)
+        self._refresh_conflicts()
+        saved = self.save_document()
+        if saved and outcome.committed:
+            self.status_label.setText(strings.MANUSCRIPT_CONFLICTS_RESOLVED_SAVED)
+        return saved
+
+    def export_prose(self, _checked: bool = False) -> bool:
+        """Export current source and target prose as plain UTF-8 text (.txt)."""
+        if not self._input_ready():
+            return False
+        name, _ = QFileDialog.getSaveFileName(
+            self, strings.MANUSCRIPT_EXPORT_PROSE, "wuwaterm-prose.txt", strings.MANUSCRIPT_PROSE_FILTER
+        )
+        if not name:
+            return False
+        destination = Path(name)
+        if self._path is not None and destination.resolve() == self._path.resolve():
+            self.status_label.setText(strings.MANUSCRIPT_EXPORT_PROSE_OVER_MANUSCRIPT)
+            return False
+        source_text = self._payload["source"]
+        target_text = self._payload["target"]
+        sections = [source_text]
+        if target_text:
+            sections.append(f"---\n\n{target_text}")
+        content = ("\n\n".join(sections)).encode("utf-8")
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+            try:
+                with os.fdopen(fd, "wb") as file:
+                    file.write(content)
+                os.replace(temporary, destination)
+            except BaseException:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+        except OSError as exc:
+            self.status_label.setText(strings.MANUSCRIPT_EXPORT_PROSE_FAILED.format(reason=str(exc)))
+            return False
+        self.status_label.setText(strings.MANUSCRIPT_EXPORT_PROSE_DONE)
+        return True
 
     def confirm_discard(self) -> bool:
         if not self._input_ready():
@@ -3658,6 +3739,8 @@ class ManuscriptView(QWidget):
                 self._payload[key] = written[key]
             else:
                 self._payload.pop(key, None)
+        self._conflict_mode = False
+        self._refresh_conflicts()
         self._path = path
         self._saved_payload = _copy_payload(self._payload)
         self._recovery_pending = False

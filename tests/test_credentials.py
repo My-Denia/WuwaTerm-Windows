@@ -168,3 +168,34 @@ def test_a_native_backend_failure_is_normalized_too(monkeypatch) -> None:
     monkeypatch.setattr(keyring, "set_password", explode)
     with pytest.raises(credentials.CredentialStoreUnavailable):
         credentials.store_token("wtd1.device.secret")
+
+
+def test_origin_normalization_and_strict_isolation(fake_keyring) -> None:
+    assert credentials.credential_origin("HTTPS://Example.COM:443/wuwaterm-api/?a=1#f") == "https://example.com"
+    assert credentials.credential_origin("http://127.0.0.1:80/api") == "http://127.0.0.1"
+    assert credentials.credential_origin("https://[::1]:8443/root") == "https://[::1]:8443"
+    assert credentials.credential_origin("https://user:pass@example.com") is None
+    assert credentials.credential_origin(None) is None
+    assert credentials.credential_origin("   ") is None
+
+    credentials.store_token("wtd1.legacy.secret")
+    credentials.store_token("wtd1.serverA.secret", origin="https://server-a.example/api")
+
+    assert credentials.read_token(origin="HTTPS://server-a.example:443/other/") == "wtd1.serverA.secret"
+    assert credentials.has_token(origin="https://server-a.example") is True
+    assert credentials.read_token(origin="https://server-b.example") is None
+    assert credentials.has_token(origin="https://server-b.example") is False
+    assert credentials.read_token(origin=None) is None
+    assert credentials.has_token(origin=None) is False
+
+    with pytest.raises(ValueError):
+        credentials.store_token("wtd1.unscoped", origin=None)
+
+
+def test_migrate_legacy_token_once_per_origin(fake_keyring) -> None:
+    credentials.store_token("wtd1.old.secret")
+    assert credentials.migrate_legacy_token("https://server-a.example/api") is True
+    assert credentials.read_token(origin="https://server-a.example") == "wtd1.old.secret"
+    assert credentials.read_token() is None
+    assert credentials.read_token(origin="https://server-b.example") is None
+    assert credentials.migrate_legacy_token("https://server-a.example") is False

@@ -781,3 +781,45 @@ def test_a_base_address_with_a_path_prefix_keeps_it_on_every_route() -> None:
         "https://site.example/wuwaterm-api/v1/terms?q=x",
         "https://site.example/wuwaterm-api/v1/meta",
     ] * 2, sent
+
+
+def test_default_token_provider_isolates_credentials_by_origin(monkeypatch) -> None:
+    """Switching server origin must never send Server A's token to Server B."""
+    from wuwaterm_client import credentials
+
+    vault: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(credentials.keyring, "set_password", lambda s, u, p: vault.__setitem__((s, u), p))
+    monkeypatch.setattr(credentials.keyring, "get_password", lambda s, u: vault.get((s, u)))
+    monkeypatch.setattr(credentials.keyring, "delete_password", lambda s, u: vault.pop((s, u), None))
+
+    credentials.store_token("wtd1.legacy.should-not-leak")
+    credentials.store_token("wtd1.serverA.token", origin="https://a.example")
+    credentials.store_token("wtd1.serverB.token", origin="https://b.example:8443")
+
+    seen_auth: list[tuple[str, str | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append((str(request.url), request.headers.get("authorization")))
+        return httpx.Response(200, json=_translation_payload())
+
+    client = ApiClient("https://a.example/wuwaterm-api", _test_transport=httpx.MockTransport(handler))
+
+    async def scenario() -> str | None:
+        await client.translate("test text")
+        client.update_base_url("https://c.example/wuwaterm-api")
+        missing_code = None
+        try:
+            await client.translate("test text")
+        except ClientError as exc:
+            missing_code = exc.code
+        client.update_base_url("https://b.example:8443/v1root")
+        await client.translate("test text")
+        await client.aclose()
+        return missing_code
+
+    missing_code = asyncio.run(scenario())
+    assert missing_code == errors.ERROR_UNAUTHORIZED
+    assert seen_auth == [
+        ("https://a.example/wuwaterm-api/v1/translations", "Bearer wtd1.serverA.token"),
+        ("https://b.example:8443/v1root/v1/translations", "Bearer wtd1.serverB.token"),
+    ]

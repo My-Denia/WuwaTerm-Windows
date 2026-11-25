@@ -426,3 +426,56 @@ def test_the_settings_dialog_opens_empty_when_nothing_is_configured(qapp) -> Non
     # The example still exists - as a placeholder, which is not a value.
     assert dialog.base_url_edit.placeholderText()
     assert dialog.result_config().base_url is None
+
+
+def test_settings_and_main_window_scope_credentials_by_origin(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    """Legacy token migrates to active origin once; switching origins never reuses A's token."""
+    from wuwaterm_client import config as config_module, credentials
+    from wuwaterm_client.ui.settings_dialog import SettingsDialog
+
+    vault: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(credentials.keyring, "set_password", lambda s, u, p: vault.__setitem__((s, u), p))
+    monkeypatch.setattr(credentials.keyring, "get_password", lambda s, u: vault.get((s, u)))
+    monkeypatch.setattr(credentials.keyring, "delete_password", lambda s, u: vault.pop((s, u), None))
+    monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+
+    credentials.store_token("wtd1.legacy.secret")
+
+    window = MainWindow(ClientConfig(base_url="https://a.example/api"))
+    assert vault == {(credentials.SERVICE_NAME, "device-token@https://a.example"): "wtd1.legacy.secret"}
+    assert window.status_view.credential_status_value.text() == strings.SETTINGS_TOKEN_STATUS_STORED
+
+    dialog = SettingsDialog(ClientConfig(base_url="https://a.example/api"))
+    assert dialog.credential_status_label.text() == strings.SETTINGS_TOKEN_STATUS_STORED
+
+    dialog.base_url_edit.setText("https://b.example/api")
+    assert dialog.credential_status_label.text() == strings.SETTINGS_TOKEN_STATUS_MISSING
+    assert dialog.enter_token_button.text() == strings.SETTINGS_ENTER_TOKEN_BUTTON
+
+    dialog.base_url_edit.setText("http://198.51.100.7:8787")
+    assert dialog.credential_status_label.text() == strings.SETTINGS_TOKEN_STATUS_MISSING
+    dialog._on_enter_token_clicked()
+    assert dialog.base_url_error.is_showing()
+    dialog._clear_base_url_error()
+    dialog._on_forget_token_clicked()
+    assert dialog.base_url_error.is_showing()
+    assert vault == {(credentials.SERVICE_NAME, "device-token@https://a.example"): "wtd1.legacy.secret"}
+
+    dialog.base_url_edit.setText("")
+    dialog._on_enter_token_clicked()
+    assert dialog.base_url_error.is_showing()
+    dialog._clear_base_url_error()
+    dialog._on_forget_token_clicked()
+    assert dialog.base_url_error.is_showing()
+    assert vault == {(credentials.SERVICE_NAME, "device-token@https://a.example"): "wtd1.legacy.secret"}
+
+    dialog.base_url_edit.setText("HTTPS://A.EXAMPLE:443/other/")
+    assert not dialog.base_url_error.is_showing()
+    assert dialog.credential_status_label.text() == strings.SETTINGS_TOKEN_STATUS_STORED
+
+    monkeypatch.setattr(ClientConfig, "save", lambda self: None)
+    window._apply_settings(ClientConfig(base_url="https://b.example/api"))
+    assert window.status_view.credential_status_value.text() == strings.SETTINGS_TOKEN_STATUS_MISSING
+    window.close()

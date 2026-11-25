@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wuwaterm_client import manuscript, recovery
 
 
@@ -87,3 +89,49 @@ def test_large_v3_v4_recovery_round_trip_beyond_v1_v2_cap(tmp_path: Path) -> Non
     assert loaded.payload is not None
     assert loaded.payload["source"] == large_source
     assert loaded.payload["target"] == large_target
+
+
+def test_save_recovery_preserves_prose_when_choices_conflict(tmp_path: Path) -> None:
+    path = tmp_path / "recovery" / "draft.json"
+    basis = {
+        "rule_version": "review-v2",
+        "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 1, "revision": "a" * 64},
+        "matcher_revision": "a" * 64,
+    }
+    first = {
+        "source": "term",
+        "direction": "zh",
+        "source_span": {"start": 0, "end": 4, "text": "term"},
+        "scope": "positional",
+        "choice": "not_a_term",
+        "candidate": None,
+        "basis": basis,
+    }
+    second = {
+        "source": "another block\nterm",
+        "direction": "zh",
+        "source_span": {"start": 14, "end": 18, "text": "term"},
+        "scope": "positional",
+        "choice": "not_a_term",
+        "candidate": None,
+        "basis": basis,
+    }
+    payload = manuscript.empty_workfile()
+    payload.update({
+        "source": "term",
+        "target": "当前译文",
+        "direction": "zh",
+        "choices": [first, second],
+    })
+    with pytest.raises(manuscript.WorkfileError) as exc:
+        manuscript.serialize_workfile(payload)
+    assert exc.value.code == "workfile_duplicate_choices"
+
+    recovery.save_recovery(path, payload, source_path="/tmp/work.json")
+    loaded = recovery.load_recovery(path)
+    assert loaded.status == "valid"
+    assert loaded.dropped_conflicting_choices == 2
+    assert loaded.payload is not None
+    assert loaded.payload["source"] == "term"
+    assert loaded.payload["target"] == "当前译文"
+    assert loaded.payload["choices"] == []

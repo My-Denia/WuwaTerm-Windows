@@ -1913,3 +1913,94 @@ def test_a_saved_not_a_term_choice_is_recorded_but_never_已核_before_the_check
     finally:
         view.close()
         asyncio.run(client.aclose())
+
+
+def test_conflicting_choices_have_undoable_resolve_and_save_plus_txt_export(
+    qapp, tmp_path: Path, monkeypatch
+) -> None:
+    """Conflict save refusal offers one-click undoable resolution+save and plain-text export."""
+    from wuwaterm_client import strings
+    from wuwaterm_client.manuscript import parse_workfile
+
+    source, target = "term", "词"
+    prior = report(source, target)
+    first = {
+        "source": source,
+        "direction": "zh",
+        "source_span": prior["findings"][0]["source_span"],
+        "scope": "positional",
+        "choice": "not_a_term",
+        "candidate": None,
+        "basis": {
+            "rule_version": "review-v2",
+            "dictionary": prior["dictionary"],
+            "matcher_revision": prior["matcher_revision"],
+        },
+    }
+    second = copy.deepcopy(first)
+    second["source"] = "another block\n" + source
+    second["source_span"]["start"] += len("another block\n")
+    second["source_span"]["end"] += len("another block\n")
+    workfile_path = tmp_path / "conflict.json"
+    txt_path = tmp_path / "prose.txt"
+    payload = empty_workfile()
+    payload.update({
+        "source": source + "\n" + source,
+        "target": target,
+        "direction": "zh",
+        "choices": [first, second],
+    })
+    save_workfile(workfile_path, payload)
+    original_bytes = workfile_path.read_bytes()
+
+    view = ManuscriptView(ApiClient(None))
+    try:
+        assert view.open_path(workfile_path)
+        cursor = view.source_edit.textCursor()
+        cursor.setPosition(len(source))
+        cursor.setPosition(len(payload["source"]), QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+
+        assert not view.save_document()
+        assert view.status_label.text() == strings.MANUSCRIPT_CHOICES_CONFLICT
+        assert view.resolve_conflicts_save_button.isVisibleTo(view)
+        assert view.export_prose_button.isVisibleTo(view)
+        assert workfile_path.read_bytes() == original_bytes
+
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: (str(workfile_path), ""))
+        assert not view.export_prose()
+        assert view.status_label.text() == strings.MANUSCRIPT_EXPORT_PROSE_OVER_MANUSCRIPT
+        assert workfile_path.read_bytes() == original_bytes
+
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: (str(txt_path), ""))
+        assert view.export_prose()
+        assert txt_path.read_text(encoding="utf-8") == "term\n\n---\n\n词"
+        assert workfile_path.read_bytes() == original_bytes
+
+        view.resolve_conflicts_save_button.click()
+        qapp.processEvents()
+        assert not view.conflict_label.isVisibleTo(view)
+        saved = parse_workfile(workfile_path.read_text(encoding="utf-8"))
+        assert saved["source"] == "term"
+        assert saved["choices"] == []
+
+        view.undo_button.click()
+        qapp.processEvents()
+        assert len(view._payload["choices"]) == 2
+        assert view._payload["source"] == "term"
+
+        # Cancelling save after one-click resolution must clear conflict list & indexes so
+        # stale UI state cannot trigger an IndexError in _remove_conflicting_choice.
+        view._path = None
+        assert not view.save_document()
+        assert view.conflict_list.count() > 0
+        view.conflict_list.setCurrentRow(0)
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: ("", ""))
+        assert not view._resolve_conflicting_choices_and_save()
+        assert not view.conflict_label.isVisibleTo(view)
+        assert not view.conflict_list.isVisibleTo(view)
+        assert view.conflict_list.count() == 0
+        assert view._conflict_indexes == []
+        view._remove_conflicting_choice()
+    finally:
+        view.close()
