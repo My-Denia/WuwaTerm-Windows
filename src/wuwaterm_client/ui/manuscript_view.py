@@ -3583,8 +3583,6 @@ class ManuscriptView(QWidget):
         if self._conflict_mode and not groups:
             _, remaining_duplicates = sanitize_duplicate_choices(self._payload)
         has_conflicts = self._conflict_mode and (bool(groups) or remaining_duplicates > 0)
-        if not has_conflicts:
-            self._conflict_mode = False
         self._conflict_indexes = [index for group in groups for index in group]
         self.conflict_list.clear()
         for group_number, group in enumerate(groups, 1):
