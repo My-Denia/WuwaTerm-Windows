@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "6fb4d8a44b26f170a7b1c8e23f00f75b2bbfd2b8",
+    "commit": "e5b7f1a84d04deb5795296b1a652e13c4e9fd1a8",
     "files": {
       "src/wuwaterm_api/__init__.py": "cf02ace4b8e3038b3e297bf6c7057541f6e67c60ad595fdcf2487240ed0c10c0",
-      "docs/api/openapi.json": "98ac59eb08f5bb6f0986272884f9816762e6bdd2de5fe3b1d492730a66cc450e",
+      "docs/api/openapi.json": "3f4cd1eb591e2a9fe66c936d00e62a1f2aea0f275266c491cb881bfd2190e031",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
@@ -30,12 +30,12 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "d702328e4f2a6f5026504b2b0eaf331995f214be",
+    "commit": "6d1084fe1589854324f34b5e9501760ad670b435",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
       "contracts/workbench-state/duplicate-attribution.json": "9b8d6211a4bb9fc10c17b4ba0ee419397810a4410263e95f7d1e97fe9be1d2f4",
-      "package.json": "536b6ced1f7d348adf6ac5de1d6280f0375718102d7ebe01f3b15adba405d2de",
-      "lib/manuscript.js": "03349d66553dbe99bdb23d0fe36e8cc0c1f1b94acef01bd9da52814160bca74c",
+      "package.json": "6c960836ed2411999c9e85d860442c89804f9cb136742b68ee6e2dd787f4ae90",
+      "lib/manuscript.js": "002c9cb33ae943f00f2e6dd7bcd98b3c1d2b40e538b8d29b27bf08d0aaa039ba",
       "lib/review-report.js": "a078e29b5f958d5d54007fb96af2295d2cccdf45bfd5dcc23a6cf29a9b7bf67e",
       "lib/semantic-review.js": "be3ad1fb127ea7db13a3d0a5fa7be63a224f4b199b316dfda775d89db1f6504a",
       "docs/manuscript-v2.md": "adc03eaa25a93d6d9398d9c56ee0198e41c38d73ddb49f4bee848a78487354f4",
@@ -108,7 +108,7 @@
       "contracts/manuscript-v3/valid-v3-with-semantic.json": "3e5c22a125fa57a2c718117fbb4f55ea78679854c838f6d7e2c02b11ad3e67ae",
       "contracts/manuscript-v3/invalid-v3-129-decisions.json": "e7d5b83839aa9d268ea93cf1ed513a0ebe09404acb2b031d6b052e3062d688b0",
       "lib/markdown-report.ts": "5dd55104dd831cff694c83e11f2eb2ce5fd3f94719e7ad6eb15062f7e761410d",
-      "lib/messages.ts": "fd86e1b1865372f192305df6d8f33c8165aeebf5770882d7c4dde0e3c4afced0",
+      "lib/messages.ts": "ae133de0be52794052b40435311406728d2fdf1d73eb09857d0524bd9555d67d",
       "lib/dictionary-labels.ts": "5164d195ac1cacadef7e9f27df3704181fd3dbc3e57adb39afea1962b8feea7b",
       "lib/review-navigation.js": "f255338b16f25075aae072f4ee295f68cdc3ad2815945d7e8284d34434f2e14d",
       "lib/ui-runtime.ts": "71baff38978600c68127079c056bcd5b88a0a69e6025562d395129bbc26a165c",
