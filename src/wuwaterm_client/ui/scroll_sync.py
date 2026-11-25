@@ -110,9 +110,14 @@ class ScrollSync(QObject):
 
     # -- following ---------------------------------------------------------
     def _follow(self, origin: QPlainTextEdit) -> None:
-        if not self._enabled or self._lock or self._suspended or self._paused():
+        if not self._enabled or self._lock or self._suspended:
             return
         follower = self._target if origin is self._source else self._source
+        # Only editors on screen follow each other. A closed window's scroll
+        # bars still change while it is torn down, and its editors must not
+        # be asked for positions then.
+        if not (origin.isVisible() and follower.isVisible()) or self._paused():
+            return
         self._lock = True
         try:
             if not self._by_anchor(origin, follower):

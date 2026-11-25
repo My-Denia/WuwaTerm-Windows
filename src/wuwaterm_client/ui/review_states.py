@@ -165,16 +165,17 @@ def icon(state: str) -> QIcon:
     return _icon(state if state in STATES else UNEVALUATED, theme.current_scheme())
 
 
-def mark(item, state: str, *, tooltip_prefix: bool = True) -> None:
+def mark(item, state: str, *, label: str | None = None) -> None:
     """Give a list row its state's icon, its state data and a tooltip naming it.
 
     The row text is left alone: the icon and the tooltip carry the state, so
-    the words the row already says are not repeated.
+    the words the row already says are not repeated. ``label`` names the
+    state in the row's own vocabulary when that is more precise (an ignored
+    semantic issue is 已忽略, not 未评估).
     """
     state = state if state in STATES else UNEVALUATED
     item.setIcon(icon(state))
     item.setData(STATE_ROLE, state)
-    if tooltip_prefix:
-        existing = item.toolTip()
-        label = LABELS[state]
-        item.setToolTip(f"{label}\n{existing}" if existing else label)
+    existing = item.toolTip()
+    name = label or LABELS[state]
+    item.setToolTip(f"{name}\n{existing}" if existing else name)

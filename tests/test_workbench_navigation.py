@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import time
 
 import pytest
 from PySide6.QtCore import QEvent, Qt
@@ -61,6 +62,15 @@ def _view(source: str = SOURCE, target: str = TARGET, *, alignments=None) -> Man
 
 def _caret(editor) -> int:
     return editor.raw_offset_at_position(editor.textCursor().position())
+
+
+def _pause(ms: int) -> None:
+    """Let timers fire for ``ms`` without a nested event loop: QTest.qWait would
+    also run every deferred deletion other test modules left queued."""
+    deadline = time.monotonic() + ms / 1000
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
 
 
 # -- scroll sync ----------------------------------------------------------------
@@ -261,7 +271,7 @@ def test_a_resting_caret_selects_its_segment_row_without_moving_the_caret_or_the
         view.target_edit.set_raw_cursor_offset(pairs[5].target.core_start + 5)
         caret = view.target_edit.textCursor().position()
         assert view._caret_timer.isActive() and view._caret_timer.interval() == 300
-        QTest.qWait(400)
+        _pause(400)
         assert view.segment_list.currentRow() == 5
         assert view.target_edit.textCursor().position() == caret
         assert QApplication.focusWidget() is view.target_edit
@@ -286,6 +296,53 @@ def test_a_resting_caret_inside_a_finding_makes_it_current_without_selecting_tex
         assert view.source_edit.textCursor().position() == cursor.position()
         assert not view.source_edit.textCursor().hasSelection()
         assert QApplication.focusWidget() is view.source_edit
+    finally:
+        view.close()
+
+
+def _adjacent_report(source: str, target: str) -> dict:
+    """Two findings that touch: A ends where B starts, on both sides."""
+    def finding(n: int, zh: str, en: str) -> dict:
+        return {"id": f"adj{n}", "rule_id": "term", "verdict": "needs_review",
+                "source_span": {"start": n, "end": n + 1, "text": source[n]},
+                "target_span": {"start": n, "end": n + 1, "text": target[n]},
+                "candidates": [{"zh": zh, "en": en, "category": "example", "sources": [],
+                                "candidate_id": hashlib.sha256(en.encode()).hexdigest()}],
+                "candidates_truncated": False}
+    digest = hashlib.sha256(b"adj").hexdigest()
+    return {"request_id": "adj", "source_revision": digest, "target_revision": digest,
+            "rule_version": "review-v2", "matcher_revision": "a" * 64,
+            "dictionary": {"schema_version": "1", "source_commit": "b" * 40, "term_count": 2, "revision": "a" * 64},
+            "coverage": {"evaluated": 2, "not_evaluated": 0, "rules": ["term"]},
+            "findings": [finding(0, "甲", "Alpha"), finding(1, "乙", "Beta")], "truncated": False}
+
+
+def test_a_chosen_finding_stays_current_when_its_start_touches_the_previous_one(qapp) -> None:
+    view = _view("甲乙 rest of the source", "甲乙 rest of the target")
+    try:
+        view._show_term_report(_adjacent_report(view._payload["source"], view._payload["target"]))
+        view.findings.setCurrentRow(1)
+        assert view.replacement_edit.text() == "Beta"
+        _pause(400)
+        assert view.findings.currentRow() == 1, "the caret at B's start is inside B, not at A's end"
+        assert view.replacement_edit.text() == "Beta"
+    finally:
+        view.close()
+
+
+def test_following_the_caret_into_another_finding_offers_that_findings_replacement(qapp) -> None:
+    view = _view("甲乙 rest of the source", "甲乙 rest of the target")
+    try:
+        view._show_term_report(_adjacent_report(view._payload["source"], view._payload["target"]))
+        view.findings.setCurrentRow(0)
+        assert view.replacement_edit.text() == "Alpha"
+        view.source_edit.setFocus()
+        view.source_edit.set_raw_cursor_offset(1)
+        view._caret_side = "source"
+        view._follow_caret()
+        assert view.findings.currentRow() == 1
+        assert view.replacement_edit.text() == "Beta", "never the previous finding's candidate"
+        assert _caret(view.source_edit) == 1
     finally:
         view.close()
 

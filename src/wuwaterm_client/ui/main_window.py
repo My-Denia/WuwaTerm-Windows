@@ -278,7 +278,7 @@ class MainWindow(QMainWindow):
         self.manuscript_view.documentLeaving.connect(self._remember_position)
         self.manuscript_view.documentSaved.connect(self._remember_position)
         self.manuscript_view.documentOpened.connect(self._on_document_opened)
-        self.manuscript_view.documentChanged.connect(self._refresh_status_bar)
+        # Only the debounced signal: documentChanged fires on every keystroke.
         self.manuscript_view.workbenchStatusChanged.connect(self._refresh_status_bar)
         self.status_view.metaChanged.connect(self._on_meta_changed)
         sync = self.manuscript_view.scroll_sync

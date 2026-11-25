@@ -1765,7 +1765,8 @@ class ManuscriptView(QWidget):
         return editor.raw_offset_at_position(editor.textCursor().position())
 
     def _caret_moved(self, editor: LosslessEditor) -> None:
-        if self._updating:
+        # A closed view (or one being torn down) has nothing to follow.
+        if self._updating or not editor.isVisible():
             return
         self._caret_side = editor.side
         self._caret_timer.start()
@@ -1803,17 +1804,23 @@ class ManuscriptView(QWidget):
 
     @staticmethod
     def _span_holds(span: object, offset: int) -> bool:
+        """Whether ``offset`` lies inside ``span`` (half-open, so the end of one
+        finding and the start of the next never both hold it)."""
         return isinstance(span, dict) and isinstance(span.get("start"), int) and isinstance(span.get("end"), int) \
-            and span["start"] <= offset <= span["end"]
+            and span["start"] <= offset < span["end"]
 
     def _highlight_finding_at(self, side: str, offset: int) -> None:
         report = self._report
         if report is None:
             return
         key = f"{side}_span"
-        index = next((i for i, finding in enumerate(report["findings"])
+        findings = report["findings"]
+        current = self.findings.currentRow()
+        if 0 <= current < len(findings) and self._span_holds(findings[current].get(key), offset):
+            return  # the caret is still in the finding the owner chose
+        index = next((i for i, finding in enumerate(findings)
                       if self._span_holds(finding.get(key), offset) and not self.findings.isRowHidden(i)), -1)
-        if index < 0 or index == self.findings.currentRow():
+        if index < 0:
             return
         self.findings.blockSignals(True)
         self.findings.setCurrentRow(index)
@@ -1821,13 +1828,23 @@ class ManuscriptView(QWidget):
         self.findings.scrollToItem(self.findings.item(index))
         self._sync_group_row_to_finding(index)
         self._render_finding(index)
+        # What _select_finding does besides locating: the replacement offered
+        # is this finding's own, never the previous one's.
+        candidates = findings[index]["candidates"]
+        if len(candidates) == 1:
+            self.replacement_edit.setText(candidates[0][self._payload["direction"]])
+        else:
+            self.replacement_edit.clear()
         self._update_controls()
 
     def _highlight_issue_at(self, side: str, offset: int) -> None:
         key = "source_span" if side == "source" else "target_span"
+        current = self._current_issue()
+        if current is not None and self._span_holds(getattr(current, key), offset):
+            return
         row = next((i for i, issue in enumerate(self._issue_rows)
                     if self._span_holds(getattr(issue, key), offset)), -1)
-        if row < 0 or row == self.semantic_list.currentRow() or row >= self.semantic_list.count():
+        if row < 0 or row >= self.semantic_list.count():
             return
         self._refreshing_lists = True
         try:
@@ -1835,7 +1852,16 @@ class ManuscriptView(QWidget):
         finally:
             self._refreshing_lists = False
         self.semantic_list.scrollToItem(self.semantic_list.item(row))
-        self._render_issue(self._current_issue())
+        issue = self._current_issue()
+        if issue is not None:
+            self._pending_issue_id = None
+        # What _select_issue does besides locating: the alternative and the
+        # adjustment typed for the previous issue never carry over.
+        self.issue_alternative_button.blockSignals(True)
+        self.issue_alternative_button.setChecked(False)
+        self.issue_alternative_button.blockSignals(False)
+        self.adjust_area.hide()
+        self._render_issue(issue)
         self._update_tracks()
 
     def _jump_segment(self, step: int) -> None:
@@ -2057,8 +2083,9 @@ class ManuscriptView(QWidget):
                 self.semantic_list.clear()
                 self.semantic_list.addItems(self._row_texts)
                 for row, issue in enumerate(rows):
-                    review_states.mark(self.semantic_list.item(row),
-                                       review_states.for_issue(self._issue_state(issue)))
+                    state = self._issue_state(issue)
+                    review_states.mark(self.semantic_list.item(row), review_states.for_issue(state),
+                                       label=strings.MANUSCRIPT_ISSUE_STATE[state])
                 self.semantic_list.setCurrentRow(rows.index(current) if current in rows else -1)
                 self._rows_dirty = False
             elif not visible:
@@ -2071,7 +2098,9 @@ class ManuscriptView(QWidget):
                         item = self.semantic_list.item(row)
                         item.setText(text)
                         item.setToolTip("")
-                        review_states.mark(item, review_states.for_issue(self._issue_state(issue)))
+                        state = self._issue_state(issue)
+                        review_states.mark(item, review_states.for_issue(state),
+                                           label=strings.MANUSCRIPT_ISSUE_STATE[state])
                 self._rows_dirty = False
         finally:
             self._refreshing_lists = False
@@ -3961,6 +3990,8 @@ class ManuscriptView(QWidget):
             self._document_revision += 1
         finally:
             self._updating = False
+        # The status bar's counts follow a replaced text after the same pause.
+        self._caret_timer.start()
 
     def _refresh_conflicts(self) -> None:
         history = sr.parts_of(self._payload).history if self._history_removal else []
