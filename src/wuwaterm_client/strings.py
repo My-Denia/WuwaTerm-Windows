@@ -138,7 +138,14 @@ MANUSCRIPT_EXPORT_PROSE_OVER_MANUSCRIPT = "不能把纯文本正文覆盖保存�
 MANUSCRIPT_EXPORT_PROSE_FAILED = "无法导出正文：{reason}"
 RECOVERY_DROPPED_CONFLICTS_NOTE = "（自动恢复时已移除 {count} 条位置冲突的历史选择以保全当前正文。）"
 CREDENTIAL_NEEDS_SERVER_MESSAGE = "尚未配置服务器地址，请先在设置中填写服务器地址，再保存设备令牌。"
-MANUSCRIPT_ALIGNMENTS_CLEARED = "正文已修改，旧的段落对应已清除。"
+MANUSCRIPT_ALIGNMENTS_CLEARED = "正文已修改，旧的段落对应已清除；撤销修订可恢复。"
+# Only the alignments an edit crossed, or whose source it deleted, leave the list.
+MANUSCRIPT_ALIGNMENTS_PARTIAL = (
+    "正文已修改：受这次编辑影响的 {invalidated} 条段落对应已取消，其余 {kept} 条已保留并随文本平移；"
+    "撤销修订可恢复，或为受影响的部分重新选择范围。"
+)
+# A deleted translation keeps its source anchor (target: null) for re-translation.
+MANUSCRIPT_ALIGNMENTS_TARGET_EMPTIED = "{count} 条段落对应的译文已删空，原文位置保留，可重新翻译这一段。"
 MANUSCRIPT_AUTO_ALIGN = "使用自动对应"
 MANUSCRIPT_AUTO_ALIGN_SET = "已选择自动对应；请重新审校。"
 MANUSCRIPT_ENDPOINT_CHANGED = "服务器地址已更改；稿件保留，报告需重新审校。"
@@ -171,6 +178,7 @@ INPUT_PLACEHOLDER = "输入要翻译的文本…"
 DIRECTION_LABEL = "方向"
 TRANSLATE_BUTTON = "翻译"
 CANCEL_BUTTON = "取消"
+CLOSE_BUTTON = "关闭"
 RESULT_LABEL = "译文"
 RESULT_PLACEHOLDER = "翻译结果会显示在这里。"
 
@@ -646,7 +654,7 @@ RECOVERY_DISCARD_BUTTON = "丢弃"
 RECOVERY_RESTORED_STATUS = "已恢复上次未保存的草稿。请检查后再保存或继续处理。"
 MANUSCRIPT_TRANSLATE_ONLY_BLANK = "只翻译空白的译文或尚未翻译的段落，不会覆盖已有译文。"
 MANUSCRIPT_TRANSLATE_CHANGED = "翻译期间正文已更改，没有写入译文。"
-MANUSCRIPT_SHORTCUTS = "快捷键：F8 / Shift+F8 下一条/上一条，Ctrl+Enter 采纳，Ctrl+Shift+E 调整，Ctrl+Shift+I 忽略，Ctrl+Shift+R 审校，Ctrl+Shift+T 翻译。"
+MANUSCRIPT_SHORTCUTS = "快捷键：F8 / Shift+F8 下一条/上一条，Ctrl+Enter 采纳，Ctrl+Shift+E 调整，Ctrl+Shift+I 忽略，Ctrl+Shift+R 审校，Ctrl+Shift+T 翻译；按 F1 查看全部快捷键。"
 
 
 # -- N2 file continuity --
@@ -786,3 +794,41 @@ MANUSCRIPT_TERM_TARGET_MISS = "未命中"
 MANUSCRIPT_TERM_DISTRIBUTION_ITEM = "{label} ×{count}"
 MANUSCRIPT_TERM_FILTER_EMPTY = "当前筛选条件下没有匹配的术语条目。"
 
+# -- The five review states (ui/review_states.py) -----------------------
+REVIEW_STATE_VERIFIED = "已核"
+REVIEW_STATE_CONFLICT = "冲突"
+REVIEW_STATE_NEEDS_CHECK = "需核对"
+REVIEW_STATE_STALE = "待复核"
+REVIEW_STATE_UNEVALUATED = "未评估"
+
+# -- Keyboard navigation in the workbench -------------------------------
+MANUSCRIPT_SEGMENT_FIRST = "已经是第一段。"
+MANUSCRIPT_SEGMENT_LAST = "已经是最后一段。"
+MANUSCRIPT_NO_SEGMENTS = "还没有可以跳转的段落。"
+MANUSCRIPT_NO_TERM_PROBLEMS = "没有冲突或需要核对的术语。"
+MANUSCRIPT_TERM_PROBLEM_AT = "术语问题 {current}/{count}"
+MANUSCRIPT_SEMANTIC_TRACK_UNAVAILABLE = "当前服务没有提供语义审校。"
+
+# -- Status bar ------------------------------------------------------------
+STATUS_BAR_CHARS = "原文 {source} 字 · 译文 {target} 字"
+STATUS_BAR_SEGMENTS = "{count} 段"
+STATUS_BAR_SEGMENT_AT = "第 {current}/{count} 段"
+STATUS_BAR_SEGMENTS_PENDING = "分段计算中"
+STATUS_BAR_DICTIONARY = "词典 {version}"
+STATUS_BAR_DICTIONARY_UNKNOWN = "词典 未读取"
+STATUS_BAR_DICTIONARY_TOOLTIP = "词典数据提交：{commit}\n结构版本：{schema}\n术语数：{count}"
+STATUS_BAR_DICTIONARY_UNKNOWN_TOOLTIP = "审校一次或在「服务诊断」中刷新后显示词典版本。"
+STATUS_BAR_SCROLL_SYNC = "同步滚动"
+STATUS_BAR_SCROLL_SYNC_ON = "同步滚动 开"
+STATUS_BAR_SCROLL_SYNC_OFF = "同步滚动 关"
+STATUS_BAR_SCROLL_SYNC_TOOLTIP = "原文与译文编辑器同步滚动（点按开关）"
+STATUS_BAR_SHORTCUTS = "F1 快捷键"
+
+# -- Keyboard shortcut sheet (F1) -------------------------------------------
+MENU_SHORTCUTS = "快捷键速查表"
+SHORTCUT_SHEET_TITLE = "快捷键 · Keyboard shortcuts"
+SHORTCUT_SHEET_KEYS = "按键 Keys"
+SHORTCUT_SHEET_ACTION_ZH = "操作"
+SHORTCUT_SHEET_ACTION_EN = "Action"
+SHORTCUT_SHEET_NOTE = "快捷键不会改动输入法的组字；输入法正在组字时，切换编辑器和跳段要等这次输入完成。"
+SHORTCUT_SHEET_NOTE_EN = "Shortcuts never touch an input-method composition; finish it before switching editors or segments."

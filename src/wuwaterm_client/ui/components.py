@@ -547,6 +547,42 @@ class StatusStrip(QLabel):
         self.setText("")
 
 
+class ElidedLabel(QLabel):
+    """One line of text that elides at the right instead of widening its row.
+
+    The full text stays available as the tooltip and to screen readers, so a
+    narrow window loses only the end of the line, never the fact itself.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def set_full_text(self, text: str, tooltip: str | None = None) -> None:
+        self._full_text = text
+        self.setToolTip(tooltip if tooltip is not None else text)
+        self.setAccessibleName(text)
+        self._elide()
+
+    def _elide(self) -> None:
+        width = max(0, self.contentsRect().width())
+        self.setText(self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, width))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange) and hasattr(self, "_full_text"):
+            self._elide()
+
+
 class EndpointChip(QFrame):
     """Which server this client talks to, or that it has none.
 

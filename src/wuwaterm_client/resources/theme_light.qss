@@ -1151,25 +1151,31 @@ QDialogButtonBox {
     font-size: @font-size-caption@;
 }
 
-#findingVerdict[verdict="verified_constraint"] {
-    background-color: @accent-soft-bg@;
-    color: @accent-soft-fg@;
-    border: 1px solid @accent@;
+#findingVerdict[reviewState="verified"] {
+    background-color: @success-soft@;
+    color: @success@;
+    border: 1px solid @success@;
 }
 
-#findingVerdict[verdict="confirmed_conflict"] {
+#findingVerdict[reviewState="conflict"] {
     background-color: @danger-soft@;
     color: @danger@;
     border: 1px solid @danger@;
 }
 
-#findingVerdict[verdict="needs_review"] {
+#findingVerdict[reviewState="needs_check"] {
     background-color: @warn-soft@;
     color: @warn@;
     border: 1px solid @warn@;
 }
 
-#findingVerdict[verdict="not_evaluated"] {
+#findingVerdict[reviewState="stale"] {
+    background-color: @info-soft@;
+    color: @info@;
+    border: 1px solid @info@;
+}
+
+#findingVerdict[reviewState="unevaluated"] {
     background-color: @bg-sunken@;
     color: @text-secondary@;
     border: 1px solid @border-subtle@;

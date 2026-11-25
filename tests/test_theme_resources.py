@@ -89,7 +89,7 @@ PROPERTY_VALUES = (
     ("state", ("ok", "missing")),
     ("invalid", ("true", "false")),
     ("done", ("true", "false")),
-    ("verdict", ("verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated")),
+    ("reviewState", ("verified", "conflict", "needs_check", "stale", "unevaluated")),
     ("tone", ("neutral", "busy", "paused", "warn", "danger")),
 )
 

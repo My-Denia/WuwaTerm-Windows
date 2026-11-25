@@ -282,8 +282,11 @@ def test_reopening_from_recent_restores_cursor_scroll_and_panel_width(qapp, tmp_
     offset = len("\r\n".join(f"line {n} 词" for n in range(250))) + 3
     view.source_edit.set_raw_cursor_offset(offset)
     view.source_edit.setFocus()
-    view.source_edit.verticalScrollBar().setValue(120)
-    view.target_edit.verticalScrollBar().setValue(60)
+    # Two independent positions (as after the owner turned scroll sync off);
+    # the restore below has to bring both back with sync on.
+    with view.scroll_sync.suspended():
+        view.source_edit.verticalScrollBar().setValue(120)
+        view.target_edit.verticalScrollBar().setValue(60)
     view.work_splitter.setSizes([700, 290])
     QCoreApplication.processEvents()
     view.open_path(b)

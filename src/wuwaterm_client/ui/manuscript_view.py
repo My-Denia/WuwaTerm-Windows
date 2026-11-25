@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import bisect
 import os
+import re
 import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QKeySequence, QPalette, QShortcut, QTextCursor
+from PySide6.QtGui import QIcon, QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
@@ -37,9 +38,9 @@ from ..document_controller import (
     DocumentRunController, WorkbenchHost, blank as _blank,
 )
 from ..document_edits import (
-    REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
-    CommandOutcome, EditOutcome, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
-    remap_alignments_for_side_edit, remap_alignments_for_target_splice,
+    NOTICE_ALL, NOTICE_PARTIAL, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM,
+    REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome, copy_payload as _copy_payload,
+    normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
@@ -47,8 +48,10 @@ from ..manuscript import (
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
+from . import review_states
 from .components import Banner, ChevronComboBox
 from .icons import icon
+from .scroll_sync import ScrollSync
 
 # Precedents (the owner's earlier choices in this manuscript) go with both
 # translation and semantic review by default, as on the Web, because the
@@ -109,6 +112,17 @@ def _scalar_boundary(text: str, position: int) -> int | None:
         if units > position:
             return None
     return len(text) if units == position else None
+
+
+_ASTRAL = re.compile("[\U00010000-\U0010FFFF]")
+# Whitespace, which the status bar's character counts leave out.
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _astral_indexes(text: str) -> list[int]:
+    """Scalar indexes of the characters UTF-16 stores as two units (a regex
+    scan, so a long manuscript costs C time, not a Python loop)."""
+    return [match.start() for match in _ASTRAL.finditer(text)]
 
 
 def _splice_raw(prefix: str, inserted: str, suffix: str) -> str:
@@ -246,6 +260,74 @@ class LosslessEditor(QPlainTextEdit):
         index = _scalar_boundary(self._shown, self.textCursor().position())
         return self._bounds[index] if index is not None else 0
 
+    # -- positions for scroll sync and navigation (cheap on long texts) ------
+    def _astral(self) -> list[int]:
+        cached = getattr(self, "_astral_cache", None)
+        if cached is None or cached[0] is not self._shown:
+            cached = (self._shown, _astral_indexes(self._shown))
+            self._astral_cache = cached
+        return cached[1]
+
+    def _scalar_index_at(self, position: int) -> int:
+        """The shown-text scalar index at a UTF-16 position (rounded down
+        inside a surrogate pair)."""
+        astral = self._astral()
+        if not astral:
+            return max(0, min(position, len(self._shown)))
+        low, high = 0, len(self._shown)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if middle + bisect.bisect_left(astral, middle) <= position:
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def _position_of(self, index: int) -> int:
+        """The UTF-16 position of a shown-text scalar index."""
+        index = max(0, min(index, len(self._shown)))
+        astral = self._astral()
+        return index + (bisect.bisect_left(astral, index) if astral else 0)
+
+    def raw_offset_at_position(self, position: int) -> int:
+        """The raw scalar offset at a Qt (UTF-16) document position."""
+        return self._bounds[self._scalar_index_at(position)]
+
+    def position_of_raw_offset(self, offset: int) -> int:
+        """The Qt (UTF-16) document position of a raw scalar offset; one inside
+        a CRLF goes before it."""
+        offset = max(0, min(offset, len(self._raw)))
+        return self._position_of(max(0, bisect.bisect_right(self._bounds, offset) - 1))
+
+    def raw_offset_at_top(self) -> int | None:
+        """The raw offset of the first visible line."""
+        document = self.document()
+        value = self.verticalScrollBar().value()
+        block = document.findBlockByLineNumber(value)
+        if not block.isValid():
+            return len(self._raw)
+        position = block.position()
+        layout = block.layout()
+        line = value - block.firstLineNumber()
+        if layout is not None and 0 <= line < layout.lineCount():
+            position += layout.lineAt(line).textStart()
+        return self.raw_offset_at_position(position)
+
+    def scroll_to_raw_offset(self, offset: int) -> None:
+        """Scroll so the line holding a raw offset is the first visible one."""
+        document = self.document()
+        position = self.position_of_raw_offset(offset)
+        block = document.findBlock(position)
+        if not block.isValid():
+            return
+        value = block.firstLineNumber()
+        layout = block.layout()
+        if layout is not None and layout.lineCount() > 0:
+            line = layout.lineForTextPosition(position - block.position())
+            if line.isValid():
+                value += line.lineNumber()
+        self.verticalScrollBar().setValue(value)
+
     def set_raw_cursor_offset(self, offset: int) -> None:
         """Caret at a raw scalar offset, clamped; one inside a CRLF goes before it."""
         offset = max(0, min(offset, len(self._raw)))
@@ -286,6 +368,29 @@ class LosslessEditor(QPlainTextEdit):
         data = QMimeData()
         data.setText(self._raw[self._bounds[start]:self._bounds[end]])
         return data
+
+    @staticmethod
+    def typed_with_altgr(event) -> bool:
+        """Whether a Ctrl+Alt key event types a character.
+
+        Windows reports AltGr as Ctrl+Alt, so on many layouts Ctrl+Alt+digit
+        is how a character such as "²" or "@" is typed. When the event carries
+        a printable character other than the key's own, it is text, and the
+        workbench's Ctrl+Alt shortcuts must leave it to the editor.
+        """
+        both = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+        text = event.text()
+        if (event.modifiers() & both) != both or not text or not text.isprintable() or text.isspace():
+            return False
+        key = event.key()
+        own = chr(key) if 0x20 < key < 0x7F else ""
+        return text.casefold() != own.casefold()
+
+    def event(self, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.ShortcutOverride and self.typed_with_altgr(event):
+            event.accept()
+            return True
+        return super().event(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if self._ime_active and (event.matches(QKeySequence.StandardKey.Undo) or event.matches(QKeySequence.StandardKey.Redo)):
@@ -540,8 +645,14 @@ class _WordWrapDelegate(QStyledItemDelegate):
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if not isinstance(text, str) or not text:
             return super().sizeHint(option, index)
+        # A state icon takes its width (and a gap) from the text's line.
+        decoration = index.data(Qt.ItemDataRole.DecorationRole)
+        icon_width = 0
+        if isinstance(decoration, QIcon) and not decoration.isNull():
+            size = view.iconSize() if view.iconSize().isValid() else option.decorationSize
+            icon_width = size.width() + 8
         rect = option.fontMetrics.boundingRect(
-            0, 0, width - 20, 10_000, Qt.TextFlag.TextWordWrap, text
+            0, 0, max(20, width - 20 - icon_width), 10_000, Qt.TextFlag.TextWordWrap, text
         )
         return QSize(width, rect.height() + 14)
 
@@ -665,7 +776,7 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         changed: str,
         edit: tuple,
         *,
-        alignments: list[dict] | None = None,
+        remap: AlignmentRemap | None = None,
     ) -> bool:
         view = self._view
         if not view.target_edit.can_display(changed):
@@ -673,8 +784,8 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         value = view._draft_snapshot()
         value["target"] = changed
         if value["alignments"] is not None:
-            value["alignments"] = [] if alignments is None else alignments
-        view._apply_edit(value, edits=[edit])
+            value["alignments"] = [] if remap is None else remap.alignments
+        view._apply_edit(value, edits=[edit], remap=remap)
         view._save_recovery_snapshot()
         return True
 
@@ -689,6 +800,9 @@ class ManuscriptView(QWidget):
     documentLeaving = Signal()
     documentSaved = Signal()
     documentOpened = Signal(str)
+    # The status bar's facts (counts, the caret's segment, the dictionary)
+    # changed; sent at most once per caret or typing pause.
+    workbenchStatusChanged = Signal()
 
     def __init__(
         self,
@@ -777,6 +891,18 @@ class ManuscriptView(QWidget):
             editor.redoRequested.connect(self._redo_edit)
             editor.compositionChanged.connect(self._on_composition_changed)
             editor.editRejected.connect(lambda: self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED))
+            editor.cursorPositionChanged.connect(lambda e=editor: self._caret_moved(e))
+        # The two editors scroll together, by segment anchors (on by default).
+        self.scroll_sync = ScrollSync(
+            self.source_edit, self.target_edit, self._scroll_anchors, self,
+            paused=lambda: self.source_edit._ime_active or self.target_edit._ime_active)
+        # A caret that stops for 300 ms is followed in the segment and issue
+        # lists; following never moves the caret or takes the focus.
+        self._caret_side = "source"
+        self._caret_timer = QTimer(self)
+        self._caret_timer.setSingleShot(True)
+        self._caret_timer.setInterval(300)
+        self._caret_timer.timeout.connect(self._follow_caret)
         self.direction_combo = ChevronComboBox(self)
         self.direction_combo.addItem(strings.DIRECTION_TO_EN, "en")
         self.direction_combo.addItem(strings.DIRECTION_TO_ZH, "zh")
@@ -1430,7 +1556,7 @@ class ManuscriptView(QWidget):
         heading.addWidget(self.issue_title, 1)
         self.issue_state = QLabel(page)
         self.issue_state.setObjectName("findingVerdict")
-        self.issue_state.setProperty("verdict", "not_evaluated")
+        self.issue_state.setProperty("reviewState", review_states.UNEVALUATED)
         heading.addWidget(self.issue_state, 0, Qt.AlignmentFlag.AlignTop)
         layout.addLayout(heading)
         self.issue_confidence = QLabel(page)
@@ -1586,6 +1712,15 @@ class ManuscriptView(QWidget):
             ("Ctrl+Shift+R", self._start_review),
             ("Ctrl+Shift+T", self._translate),
             ("Ctrl+Shift+M", self._jump_first_mismatch),
+            ("Alt+Up", lambda: self._jump_segment(-1)),
+            ("Alt+Down", lambda: self._jump_segment(1)),
+            ("Alt+Left", lambda: self._focus_editor("source")),
+            ("Alt+Right", lambda: self._focus_editor("target")),
+            ("F7", lambda: self._step_term_problem(1)),
+            ("Shift+F7", lambda: self._step_term_problem(-1)),
+            ("Ctrl+Alt+1", lambda: self._shortcut_track(TRACK_TERMS)),
+            ("Ctrl+Alt+2", lambda: self._shortcut_track(TRACK_SEMANTIC)),
+            ("Ctrl+Alt+3", lambda: self._shortcut_track(TRACK_SEGMENTS)),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -1602,6 +1737,223 @@ class ManuscriptView(QWidget):
         if index == TRACK_SEMANTIC and self._rows_dirty:
             self._refresh_semantic()
         self._update_tracks()
+
+    # -- keyboard navigation, scroll sync and caret following ----------------
+    def _scroll_anchors(self) -> list[tuple[int, int]] | None:
+        """Where the two texts correspond: the start of every paired segment
+        and both ends. None until the pairing of the current text exists
+        (pairing is never forced from a scroll)."""
+        pairs = self._cached_pairs()
+        if not pairs:
+            return None
+        points = [(0, 0)]
+        points.extend((pair.source.start, pair.target.start) for pair in pairs)
+        points.append((len(self._payload["source"]), len(self._payload["target"])))
+        return points
+
+    @staticmethod
+    def _pair_index_at(pairs: list, side: str, offset: int) -> int:
+        """The index of the pair whose region on ``side`` holds ``offset``."""
+        starts = [getattr(pair, side).start for pair in pairs]
+        return max(0, min(len(pairs) - 1, bisect.bisect_right(starts, offset) - 1))
+
+    def _editor(self, side: str) -> LosslessEditor:
+        return self.source_edit if side == "source" else self.target_edit
+
+    def _caret_offset(self, side: str) -> int:
+        editor = self._editor(side)
+        return editor.raw_offset_at_position(editor.textCursor().position())
+
+    def _caret_moved(self, editor: LosslessEditor) -> None:
+        # A closed view (or one being torn down) has nothing to follow.
+        if self._updating or not editor.isVisible():
+            return
+        self._caret_side = editor.side
+        self._caret_timer.start()
+
+    def _follow_caret(self) -> None:
+        """Show where the caret is, in the lists beside the editors.
+
+        The segment row, the term finding and the semantic issue at the caret
+        become the current rows, and their details are shown. Nothing here
+        selects text, moves a caret or takes the focus: the owner keeps typing.
+        """
+        if not (self.source_edit._ime_active or self.target_edit._ime_active):
+            side = self._caret_side
+            offset = self._caret_offset(side)
+            pairs = self._cached_pairs()
+            if pairs:
+                self._highlight_segment_row(pairs, self._pair_index_at(pairs, side, offset))
+            self._highlight_finding_at(side, offset)
+            self._highlight_issue_at(side, offset)
+        self.workbenchStatusChanged.emit()
+
+    def _highlight_segment_row(self, pairs: list, index: int) -> None:
+        if pairs is not self._segment_rows_from or not 0 <= index < self.segment_list.count():
+            return
+        if self.segment_list.currentRow() == index:
+            return
+        self._refreshing_lists = True
+        try:
+            self.segment_list.setCurrentRow(index)
+        finally:
+            self._refreshing_lists = False
+        self.segment_list.scrollToItem(self.segment_list.item(index))
+        self._render_segment(self._current_segment())
+        self._update_tracks()
+
+    @staticmethod
+    def _span_holds(span: object, offset: int) -> bool:
+        """Whether ``offset`` lies inside ``span`` (half-open, so the end of one
+        finding and the start of the next never both hold it)."""
+        return isinstance(span, dict) and isinstance(span.get("start"), int) and isinstance(span.get("end"), int) \
+            and span["start"] <= offset < span["end"]
+
+    def _highlight_finding_at(self, side: str, offset: int) -> None:
+        report = self._report
+        if report is None:
+            return
+        key = f"{side}_span"
+        findings = report["findings"]
+        current = self.findings.currentRow()
+        if 0 <= current < len(findings) and self._span_holds(findings[current].get(key), offset):
+            return  # the caret is still in the finding the owner chose
+        index = next((i for i, finding in enumerate(findings)
+                      if self._span_holds(finding.get(key), offset) and not self.findings.isRowHidden(i)), -1)
+        if index < 0:
+            return
+        self.findings.blockSignals(True)
+        self.findings.setCurrentRow(index)
+        self.findings.blockSignals(False)
+        self.findings.scrollToItem(self.findings.item(index))
+        self._sync_group_row_to_finding(index)
+        self._render_finding(index)
+        # What _select_finding does besides locating: the replacement offered
+        # is this finding's own, never the previous one's.
+        candidates = findings[index]["candidates"]
+        if len(candidates) == 1:
+            self.replacement_edit.setText(candidates[0][self._payload["direction"]])
+        else:
+            self.replacement_edit.clear()
+        self._update_controls()
+
+    def _highlight_issue_at(self, side: str, offset: int) -> None:
+        key = "source_span" if side == "source" else "target_span"
+        current = self._current_issue()
+        if current is not None and self._span_holds(getattr(current, key), offset):
+            return
+        row = next((i for i, issue in enumerate(self._issue_rows)
+                    if self._span_holds(getattr(issue, key), offset)), -1)
+        if row < 0 or row >= self.semantic_list.count():
+            return
+        self._refreshing_lists = True
+        try:
+            self.semantic_list.setCurrentRow(row)
+        finally:
+            self._refreshing_lists = False
+        self.semantic_list.scrollToItem(self.semantic_list.item(row))
+        issue = self._current_issue()
+        if issue is not None:
+            self._pending_issue_id = None
+        # What _select_issue does besides locating: the alternative and the
+        # adjustment typed for the previous issue never carry over.
+        self.issue_alternative_button.blockSignals(True)
+        self.issue_alternative_button.setChecked(False)
+        self.issue_alternative_button.blockSignals(False)
+        self.adjust_area.hide()
+        self._render_issue(issue)
+        self._update_tracks()
+
+    def _jump_segment(self, step: int) -> None:
+        """Alt+Up / Alt+Down: the caret to the start of the previous or next
+        segment in the same editor; the other editor follows by scroll sync."""
+        if not self._input_ready():
+            return
+        pairs = self._current_pairs()
+        if not pairs:
+            self.status_label.setText(strings.MANUSCRIPT_NO_SEGMENTS)
+            return
+        side = self._last_side
+        offset = self._caret_offset(side)
+        index = self._pair_index_at(pairs, side, offset)
+        here = getattr(pairs[index], side)
+        # Alt+Up inside a segment goes to its own start first, as a text editor does.
+        target = index if step < 0 and offset > here.core_start else index + step
+        if not 0 <= target < len(pairs):
+            self.status_label.setText(strings.MANUSCRIPT_SEGMENT_FIRST if step < 0 else strings.MANUSCRIPT_SEGMENT_LAST)
+            return
+        editor = self._editor(side)
+        editor.set_raw_cursor_offset(getattr(pairs[target], side).core_start)
+        editor.ensureCursorVisible()
+        self._caret_side = side
+        self._caret_timer.stop()
+        self._follow_caret()
+
+    def _focus_editor(self, side: str) -> None:
+        """Alt+Left / Alt+Right: the source or the target editor, caret kept."""
+        if not self._input_ready():
+            return
+        self._editor(side).setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _step_term_problem(self, step: int) -> None:
+        """F7 / Shift+F7: the next or previous term finding that is a conflict
+        or needs a check, located in both editors."""
+        if not self._input_ready():
+            return
+        findings = self._report["findings"] if self._report is not None else []
+        problems = [i for i, finding in enumerate(findings)
+                    if finding["verdict"] in ("confirmed_conflict", "needs_review")]
+        if not problems:
+            self.status_label.setText(strings.MANUSCRIPT_NO_TERM_PROBLEMS)
+            return
+        self._show_track(TRACK_TERMS)
+        current = self.findings.currentRow()
+        if step > 0:
+            row = next((i for i in problems if i > current), problems[0])
+        else:
+            row = next((i for i in reversed(problems) if i < current), problems[-1])
+        if self.findings.isRowHidden(row):
+            # A filter hides it: show every state rather than skip a problem.
+            self.term_filter_combo.setCurrentIndex(max(0, self.term_filter_combo.findData("all")))
+        if self.findings.currentRow() == row:
+            self._select_finding(row)
+        else:
+            self.findings.setCurrentRow(row)
+        located = self.status_label.text()
+        self.status_label.setText(strings.MANUSCRIPT_TERM_PROBLEM_AT.format(
+            current=problems.index(row) + 1, count=len(problems)) + " · " + located)
+
+    def _shortcut_track(self, index: int) -> None:
+        """Ctrl+Alt+1/2/3: the terms, semantic or segments track, with the
+        inspector shown; a track the service does not offer stays closed."""
+        button = self.track_group.button(index)
+        if button is None or button.isHidden():
+            if index == TRACK_SEMANTIC:
+                self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_TRACK_UNAVAILABLE)
+            return
+        if self.inspector.isHidden():
+            self._toggle_inspector()
+        self._show_track(index)
+
+    def status_summary(self) -> dict:
+        """What the status bar shows about the open manuscript."""
+        payload = self._payload
+        pairs = self._cached_pairs()
+        if pairs is None:
+            # Pairing waits for a pause like the segment track's count does.
+            self._derived_timer.start()
+        current = None
+        if pairs:
+            current = self._pair_index_at(pairs, self._caret_side, self._caret_offset(self._caret_side)) + 1
+        basis = self._term_basis
+        return {
+            "source_chars": len(_WHITESPACE_RUN.sub("", payload["source"])),
+            "target_chars": len(_WHITESPACE_RUN.sub("", payload["target"])),
+            "segments": None if pairs is None else len(pairs),
+            "current_segment": current,
+            "dictionary": dict(basis["dictionary"]) if isinstance(basis, dict) and isinstance(
+                basis.get("dictionary"), dict) else None,
+        }
 
     # -- semantic review: derived state --------------------------------------
     def _decisions(self) -> list[dict]:
@@ -1626,6 +1978,7 @@ class ManuscriptView(QWidget):
         self._render_mismatch_prompt()
         self._update_tracks()
         self._render_semantic_progress()
+        self.workbenchStatusChanged.emit()
 
     def _current_pairs(self) -> list:
         """The segmentation-v1 pairing of the current text (controller state)."""
@@ -1729,6 +2082,10 @@ class ManuscriptView(QWidget):
                 self._row_texts = [self._issue_row_text(issue) for issue in rows]
                 self.semantic_list.clear()
                 self.semantic_list.addItems(self._row_texts)
+                for row, issue in enumerate(rows):
+                    state = self._issue_state(issue)
+                    review_states.mark(self.semantic_list.item(row), review_states.for_issue(state),
+                                       label=strings.MANUSCRIPT_ISSUE_STATE[state])
                 self.semantic_list.setCurrentRow(rows.index(current) if current in rows else -1)
                 self._rows_dirty = False
             elif not visible:
@@ -1738,7 +2095,12 @@ class ManuscriptView(QWidget):
                     text = self._issue_row_text(issue)
                     if text != self._row_texts[row]:
                         self._row_texts[row] = text
-                        self.semantic_list.item(row).setText(text)
+                        item = self.semantic_list.item(row)
+                        item.setText(text)
+                        item.setToolTip("")
+                        state = self._issue_state(issue)
+                        review_states.mark(item, review_states.for_issue(state),
+                                           label=strings.MANUSCRIPT_ISSUE_STATE[state])
                 self._rows_dirty = False
         finally:
             self._refreshing_lists = False
@@ -1857,6 +2219,9 @@ class ManuscriptView(QWidget):
         state = self._issue_state(issue)
         self.issue_title.setText(strings.MANUSCRIPT_CATEGORY.get(record["category"], record["category"]))
         self.issue_state.setText(strings.MANUSCRIPT_ISSUE_STATE[state])
+        self.issue_state.setProperty("reviewState", review_states.for_issue(state))
+        self.issue_state.style().unpolish(self.issue_state)
+        self.issue_state.style().polish(self.issue_state)
         self.issue_state.show()
         self.issue_confidence.setText(strings.MANUSCRIPT_CONFIDENCE.get(record["confidence"], record["confidence"]))
         self.issue_excerpts.setText(f'{record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE}\n'
@@ -1941,8 +2306,9 @@ class ManuscriptView(QWidget):
         self._update_tracks()
         if issue is None:
             return
-        source_ok = self.source_edit.select_raw_span(issue.source_span) if issue.source_span else False
-        target_ok = self.target_edit.select_raw_span(issue.target_span) if issue.target_span else False
+        with self.scroll_sync.suspended():
+            source_ok = self.source_edit.select_raw_span(issue.source_span) if issue.source_span else False
+            target_ok = self.target_edit.select_raw_span(issue.target_span) if issue.target_span else False
         if issue.source_span is None:
             self.source_edit.setExtraSelections([])
         if issue.target_span is None:
@@ -2066,6 +2432,8 @@ class ManuscriptView(QWidget):
                     number=pair.index + 1, status=self._segment_row_status(pair, records),
                     source=pair.source.core_end - pair.source.core_start,
                     target=pair.target.core_end - pair.target.core_start))
+                review_states.mark(self.segment_list.item(self.segment_list.count() - 1),
+                                   review_states.for_segment(self._segment_status(pair)))
             self.segment_list.setCurrentRow(row if row < len(pairs) else -1)
         finally:
             self._refreshing_lists = False
@@ -2273,12 +2641,14 @@ class ManuscriptView(QWidget):
     def _select_cores(self, pair) -> None:
         """Select the pair's source and target cores in the editors."""
         source, target = self._payload["source"], self._payload["target"]
-        for editor, text, region in ((self.source_edit, source, pair.source), (self.target_edit, target, pair.target)):
-            if region.core_end > region.core_start:
-                editor.select_raw_span({"start": region.core_start, "end": region.core_end,
-                                        "text": text[region.core_start:region.core_end]})
-            else:
-                editor.setExtraSelections([])
+        with self.scroll_sync.suspended():
+            for editor, text, region in ((self.source_edit, source, pair.source),
+                                         (self.target_edit, target, pair.target)):
+                if region.core_end > region.core_start:
+                    editor.select_raw_span({"start": region.core_start, "end": region.core_end,
+                                            "text": text[region.core_start:region.core_end]})
+                else:
+                    editor.setExtraSelections([])
 
     def _segments_track_text(self) -> str:
         pairs = self._cached_pairs()
@@ -2564,6 +2934,8 @@ class ManuscriptView(QWidget):
                             segments="、".join(f"#{n}" for n in group["unverified_segments"]),
                         )
                     header_item = QListWidgetItem(header_text)
+                    review_states.mark(header_item, review_states.for_group(
+                        group["status"], saved=bool(group.get("saved_count"))))
                     header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                     header_item.setData(Qt.ItemDataRole.UserRole, None)
                     first_occ_row = self.term_groups.count() + 1
@@ -2605,6 +2977,8 @@ class ManuscriptView(QWidget):
                                 target_context=occ["target_context"],
                             )
                         )
+                        review_states.mark(occ_item, review_states.for_verdict(
+                            occ["verdict"], saved=occ["freshness"] == "saved", recheck=occ["freshness"] == "stale"))
                         self.term_groups.addItem(occ_item)
             self.term_groups.blockSignals(False)
 
@@ -2695,7 +3069,9 @@ class ManuscriptView(QWidget):
         saved_result = 0 <= index < len(self._finding_saved) and self._finding_saved[index]
         self.finding_verdict.setText(strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED if saved_result
                                      else sr.localized_verdict_label(verdict, reason))
-        self.finding_verdict.setProperty("verdict", verdict)
+        recheck = 0 <= index < len(self._finding_recheck) and self._finding_recheck[index]
+        self.finding_verdict.setProperty("reviewState", review_states.for_verdict(
+            verdict, saved=saved_result, recheck=recheck))
         self.finding_verdict.style().unpolish(self.finding_verdict)
         self.finding_verdict.style().polish(self.finding_verdict)
         self.finding_pair.setText(target["text"] if isinstance(target, dict) and isinstance(target.get("text"), str) else "")
@@ -2984,8 +3360,9 @@ class ManuscriptView(QWidget):
     def _restore_editor_state(self, state: dict) -> None:
         editor = self.source_edit if state["side"] == "source" else self.target_edit
         editor.setFocus(Qt.FocusReason.OtherFocusReason)
-        for side, widget in (("source", self.source_edit), ("target", self.target_edit)):
-            widget.restore_view_state(state[side])
+        with self.scroll_sync.suspended():
+            for side, widget in (("source", self.source_edit), ("target", self.target_edit)):
+                widget.restore_view_state(state[side])
 
     def _commit(self, outcome: CommandOutcome, *, editors: bool) -> bool:
         """The host's side of a committed command: the editors, then the refresh.
@@ -3018,22 +3395,51 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.MANUSCRIPT_SEMANTIC_DIRECTION_CHANGED)
         if outcome.review_inputs_changed:
             self._invalidate_report()
+        notice = self._alignment_notice_text(outcome)
+        if notice:
+            self.status_label.setText(notice)
         if self._conflict_mode:
             self._refresh_conflicts()
         self._refresh_semantic()
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._derived_timer.start()
         self._update_controls()
+        # The status bar's counts follow on the next pause, not every keystroke.
+        self._caret_timer.start()
+
+    def _alignment_notice_text(self, outcome: EditOutcome) -> str:
+        """What an edit did to the explicit alignments, in the workbench's words.
+
+        Only the entries an edit crossed or whose source it deleted are
+        invalidated; an entry whose translation it deleted keeps its source
+        anchor so the segment can be translated again. Undo restores both.
+        """
+        parts = []
+        if outcome.alignment_notice == NOTICE_ALL:
+            parts.append(strings.MANUSCRIPT_ALIGNMENTS_CLEARED)
+        elif outcome.alignment_notice == NOTICE_PARTIAL:
+            parts.append(strings.MANUSCRIPT_ALIGNMENTS_PARTIAL.format(invalidated=outcome.invalidated,
+                                                                      kept=outcome.kept))
+        if outcome.emptied_targets:
+            parts.append(strings.MANUSCRIPT_ALIGNMENTS_TARGET_EMPTIED.format(count=outcome.emptied_targets))
+        if not parts:
+            return ""
+        recheck = self._records_with_input_change(self._payload["alignments"])
+        if recheck:
+            parts.append(strings.MANUSCRIPT_TERM_RECHECK_COUNT.format(count=recheck))
+        return "".join(parts)
 
     def _apply_edit(self, value: dict, *, editors_already_updated: bool = False, edits: list | None = None,
-                    exempt: sessions.LiveIssue | None = None) -> None:
+                    exempt: sessions.LiveIssue | None = None, remap: AlignmentRemap | None = None,
+                    alignment_reset: bool = False) -> None:
         editor_state = self._editor_state()
         if editors_already_updated:
             for side, *_range in edits or []:
                 editor = self.source_edit if side == "source" else self.target_edit
                 if editor.last_edit_view is not None:
                     editor_state[side] = editor.last_edit_view
-        outcome = self._controller.apply_edit(value, view_state=editor_state, edits=edits, exempt=exempt)
+        outcome = self._controller.apply_edit(value, view_state=editor_state, edits=edits, exempt=exempt,
+                                              remap=remap, alignment_reset=alignment_reset)
         self._finish(outcome, editors=not editors_already_updated)
 
     def _apply_endpoint_state(self) -> None:
@@ -3122,6 +3528,7 @@ class ManuscriptView(QWidget):
         self.recovery_banner.clear()
         self._replace_document(payload, (payload.get("progress") or {}).get("current"))
         self._controller.reset_known_texts(payload)
+        self._controller.restore_invalidations(state.alignment_invalidations)
         self._path = Path(state.source_path) if state.source_path else None
         self._records()
         self._saved_payload = empty_workfile()
@@ -3164,7 +3571,8 @@ class ManuscriptView(QWidget):
                     snapshot.setdefault("semantic_history", [])
                     snapshot["semantic_texts"] = self._controller.semantic_texts(snapshot)
                     _normalize_semantic(snapshot)
-                save_recovery(self._recovery_path, snapshot, source_path=self._path)
+                save_recovery(self._recovery_path, snapshot, source_path=self._path,
+                              alignment_invalidations=self._controller.alignment_invalidations)
             except (OSError, WorkfileError):
                 pass
 
@@ -3211,47 +3619,29 @@ class ManuscriptView(QWidget):
         if self._updating:
             return
         before = self._draft_snapshot()
-        value = self._draft_snapshot()
-        value["source"] = self.source_edit.raw_text()
-        value["target"] = self.target_edit.raw_text()
-        value["direction"] = self.direction_combo.currentData()
-        if value == before:
+        direction = self.direction_combo.currentData()
+        if direction != before["direction"]:
+            # A new direction clears every explicit alignment (R7).
+            self._finish(self._controller.set_direction(direction, view_state=self._editor_state()),
+                         editors=False)
+            return
+        texts = {"source": self.source_edit.raw_text(), "target": self.target_edit.raw_text()}
+        if texts["source"] == before["source"] and texts["target"] == before["target"]:
             if edit is not None:
                 # Text rewritten with identical text: still an edit of that range.
                 self._controller.note_edit(edit)
                 self._refresh_semantic()
                 self._update_controls()
             return
-        if value["alignments"] is not None:
-            before_alignments = value["alignments"]
-            if edit is not None and edit[0] in ("source", "target"):
-                remapped = remap_alignments_for_side_edit(
-                    before_alignments,
-                    edit[0],
-                    before["source"],
-                    before["target"],
-                    value["source"],
-                    value["target"],
-                    edit=edit[1:],
-                )
-            elif value["source"] != before["source"] or value["target"] != before["target"]:
-                remapped = before_alignments
-                if value["source"] != before["source"]:
-                    remapped = remap_alignments_for_side_edit(
-                        remapped, "source", before["source"], before["target"], value["source"], before["target"]
-                    )
-                if value["target"] != before["target"]:
-                    remapped = remap_alignments_for_side_edit(
-                        remapped, "target", value["source"], before["target"], value["source"], value["target"]
-                    )
-            else:
-                remapped = []
-            value["alignments"] = remapped
-            if before_alignments and not remapped:
-                recheck = self._records_with_input_change(remapped)
-                self.status_label.setText(strings.MANUSCRIPT_ALIGNMENTS_CLEARED + (
-                    strings.MANUSCRIPT_TERM_RECHECK_COUNT.format(count=recheck) if recheck else ""))
-        self._apply_edit(value, editors_already_updated=True, edits=[edit] if edit is not None else None)
+        for side, editor in (("source", self.source_edit), ("target", self.target_edit)):
+            if texts[side] == self._payload[side]:
+                continue
+            reported = tuple(edit[1:]) if edit is not None and edit[0] == side else None
+            view_state = self._editor_state()
+            if reported is not None and editor.last_edit_view is not None:
+                view_state[side] = editor.last_edit_view
+            outcome = self._controller.edit_text(side, texts[side], edit=reported, view_state=view_state)
+            self._finish(outcome, editors=False)
 
     def _start_review(self) -> None:
         """Start the document review from the text as it is now."""
@@ -3265,7 +3655,7 @@ class ManuscriptView(QWidget):
         recheck = self._records_with_input_change(None)
         value = self._draft_snapshot()
         value["alignments"] = None
-        self._apply_edit(value, editors_already_updated=True)
+        self._apply_edit(value, editors_already_updated=True, alignment_reset=True)
         self.status_label.setText(strings.MANUSCRIPT_AUTO_ALIGN_RECHECK.format(count=recheck) if recheck
                                   else strings.MANUSCRIPT_AUTO_ALIGN_SET)
         self._update_controls()
@@ -3322,6 +3712,8 @@ class ManuscriptView(QWidget):
             if self._finding_recheck[index]:
                 second_line += " · " + strings.MANUSCRIPT_FINDING_RECHECK
             self.findings.addItem(f'{source_span.get("text", "")}\n{second_line}')
+            review_states.mark(self.findings.item(index), review_states.for_verdict(
+                finding["verdict"], saved=self._finding_saved[index], recheck=self._finding_recheck[index]))
         self.findings.blockSignals(False)
 
         if refs is not None:
@@ -3529,8 +3921,9 @@ class ManuscriptView(QWidget):
             self._update_controls()
             return
         finding = self._report["findings"][index]
-        source_ok = self.source_edit.select_raw_span(finding.get("source_span"))
-        target_ok = self.target_edit.select_raw_span(finding.get("target_span"))
+        with self.scroll_sync.suspended():
+            source_ok = self.source_edit.select_raw_span(finding.get("source_span"))
+            target_ok = self.target_edit.select_raw_span(finding.get("target_span"))
         self.status_label.setText(strings.MANUSCRIPT_LOCATED if source_ok and target_ok else strings.MANUSCRIPT_PARTIAL_LOCATION)
         candidates = finding["candidates"]
         if len(candidates) == 1:
@@ -3559,10 +3952,10 @@ class ManuscriptView(QWidget):
             return
         value = self._draft_snapshot()
         value["target"] = changed
-        value["alignments"] = remap_alignments_for_target_splice(
-            value["alignments"], value["source"], changed, span["start"], span["end"], len(replacement)
-        )
-        self._apply_edit(value, edits=[("target", span["start"], span["end"], len(replacement))])
+        remap = remap_splice(value["alignments"], "target", value["source"], changed,
+                             span["start"], span["end"], len(replacement))
+        value["alignments"] = remap.alignments
+        self._apply_edit(value, edits=[("target", span["start"], span["end"], len(replacement))], remap=remap)
         self.status_label.setText(strings.MANUSCRIPT_REPLACED)
         self._update_controls()
 
@@ -3589,13 +3982,16 @@ class ManuscriptView(QWidget):
     def _set_payload(self, value: dict) -> None:
         self._updating = True
         try:
-            self.source_edit.set_raw_text(value["source"])
-            self.target_edit.set_raw_text(value["target"])
+            with self.scroll_sync.suspended():
+                self.source_edit.set_raw_text(value["source"])
+                self.target_edit.set_raw_text(value["target"])
             self.direction_combo.setCurrentIndex(self.direction_combo.findData(value["direction"]))
             self._payload = _normalize_semantic(_copy_payload(value))
             self._document_revision += 1
         finally:
             self._updating = False
+        # The status bar's counts follow a replaced text after the same pause.
+        self._caret_timer.start()
 
     def _refresh_conflicts(self) -> None:
         history = sr.parts_of(self._payload).history if self._history_removal else []
@@ -4024,7 +4420,8 @@ class ManuscriptView(QWidget):
 
     # -- file continuity: import, clipboard, work position -------------------
     def _guard_text_inputs(self) -> None:
-        """Inspector text fields take a dropped file as a file, not as typed text.
+        """Inspector text fields take a dropped file as a file, not as typed text,
+        and a character typed with AltGr as text, not as a Ctrl+Alt shortcut.
 
         QLineEdit and the adjust box accept drops by default and would type
         the file's path into a field that can later be written into the draft.
@@ -4033,6 +4430,9 @@ class ManuscriptView(QWidget):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.ShortcutOverride and LosslessEditor.typed_with_altgr(event):
+            event.accept()
+            return True
         if event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop):
             files = LosslessEditor.local_files(event.mimeData())
             if files:
@@ -4125,11 +4525,10 @@ class ManuscriptView(QWidget):
             return False
         before_source, before_target = value["source"], value["target"]
         value[side] = text
-        if value["alignments"] is not None:
-            value["alignments"] = remap_alignments_for_side_edit(
-                value["alignments"], side, before_source, before_target, value["source"], value["target"]
-            )
-        self._apply_edit(value)
+        remap = remap_for_free_edit(value["alignments"], side, before_source, before_target,
+                                    value["source"], value["target"])
+        value["alignments"] = remap.alignments
+        self._apply_edit(value, remap=remap)
         self.status_label.setText(strings.IMPORT_REPLACED[side])
         return True
 
@@ -4241,10 +4640,11 @@ class ManuscriptView(QWidget):
     def _restore_scroll(self, serial: int, scroll: dict) -> None:
         if serial != self._restore_serial:
             return
-        for side, editor in (("source", self.source_edit), ("target", self.target_edit)):
-            value = scroll.get(side)
-            if isinstance(value, int) and not isinstance(value, bool):
-                editor.verticalScrollBar().setValue(value)
+        with self.scroll_sync.suspended():
+            for side, editor in (("source", self.source_edit), ("target", self.target_edit)):
+                value = scroll.get(side)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    editor.verticalScrollBar().setValue(value)
 
     def _texts_tag(self) -> str:
         return sessions.revision(self._payload["source"] + "\0" + self._payload["target"])[:16]

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import itertools
 import json
 from pathlib import Path
 
@@ -870,6 +871,8 @@ def test_current_report_survives_preedit_cancel_with_correct_locations(qapp, sid
         view = ManuscriptView(client)
         view.show()
         install(view, source[:-1], target)
+        # Each keystroke past the typing pause, so "x" is its own undo step.
+        view._controller.clock = itertools.count(0, 5000).__next__
         cursor = view.source_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText("m")

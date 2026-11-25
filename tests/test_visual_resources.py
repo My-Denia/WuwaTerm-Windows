@@ -201,18 +201,21 @@ def test_inspector_body_and_selected_finding_use_theme(qapp, preserve_theme, sch
         for y in range(image.height()) for x in range(image.width())
     )
     assert _contrast(QColor(tokens["accent-soft-fg"]), selected_background) >= 4.5
+    # The five review states: each badge is its token pair, readable at 4.5:1.
     for value, foreground, background in (
-        ("verified_constraint", "accent-soft-fg", "accent-soft-bg"),
-        ("confirmed_conflict", "danger", "danger-soft"),
-        ("needs_review", "warn", "warn-soft"),
-        ("not_evaluated", "text-secondary", "bg-sunken"),
+        ("verified", "success", "success-soft"),
+        ("conflict", "danger", "danger-soft"),
+        ("needs_check", "warn", "warn-soft"),
+        ("stale", "info", "info-soft"),
+        ("unevaluated", "text-secondary", "bg-sunken"),
     ):
-        verdict.setProperty("verdict", value)
+        verdict.setProperty("reviewState", value)
         verdict.style().unpolish(verdict)
         verdict.style().polish(verdict)
         palette = verdict.palette()
         _assert_color(palette.color(QPalette.ColorRole.WindowText), QColor(tokens[foreground]))
         _assert_color(palette.color(QPalette.ColorRole.Window), QColor(tokens[background]))
+        assert _contrast(QColor(tokens[foreground]), QColor(tokens[background])) >= 4.5, value
         assert _contrast(palette.color(QPalette.ColorRole.WindowText), palette.color(QPalette.ColorRole.Window)) >= 4.5
     inspector.close()
 
