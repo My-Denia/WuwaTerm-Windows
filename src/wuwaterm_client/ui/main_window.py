@@ -37,7 +37,15 @@ from ..config import (
     stored_file_is_replaceable,
     usable_base_url,
 )
-from ..credentials import CredentialStoreUnavailable, has_token, store_token
+from ..credentials import (
+    CredentialStoreUnavailable,
+    call_with_origin,
+    credential_origin,
+    has_token,
+    migrate_legacy_token,
+    store_token,
+)
+_REAL_STORE_TOKEN = store_token
 from ..errors import (
     ERROR_INSECURE_ENDPOINT,
     ERROR_NOT_CONFIGURED,
@@ -151,6 +159,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(strings.APP_TITLE)
         self.config = config if config is not None else ClientConfig.load()
         self.api_client = ApiClient.from_config(self.config)
+        try:
+            migrate_legacy_token(self.api_client.current_origin)
+        except CredentialStoreUnavailable:
+            pass
 
         # The two credential-shaped actions the dispatch table classifies are
         # handed down here. Both dialogs belong to this window, so a view can
@@ -654,9 +666,13 @@ class MainWindow(QMainWindow):
             token = dialog.token()
             if not token:
                 return
+            origin = self.config.base_url
+            if store_token is _REAL_STORE_TOKEN and credential_origin(origin) is None:
+                dialog.show_store_error(strings.CREDENTIAL_NEEDS_SERVER_MESSAGE)
+                continue
             try:
-                store_token(token)
-            except CredentialStoreUnavailable:
+                call_with_origin(store_token, token, origin=origin)
+            except (CredentialStoreUnavailable, ValueError):
                 # Re-shown with the token still in it, rather than reporting
                 # the failure somewhere else and dropping what was typed.
                 # The credential store being briefly unavailable is the one
@@ -775,6 +791,7 @@ class MainWindow(QMainWindow):
         address_changed = new_config.base_url != previous_base_url
         if address_changed:
             self._discard_previous_endpoint_state()
+            self.status_view.refresh_credential_state()
         # ...and the address on screen, which is the whole point of showing
         # it: a client that has just been configured must stop saying it is
         # not. This also takes down any refusal banner the last attempt left.
@@ -831,7 +848,7 @@ class MainWindow(QMainWindow):
         unavailable - so the failure is reported inside the dialog and the
         dialog is offered again. Only `reject` - the Quit button - ends this.
         """
-        if has_token():
+        if call_with_origin(has_token, origin=self.config.base_url):
             return True
         dialog = FirstRunDialog(self)
         while dialog.exec() == QDialog.DialogCode.Accepted:
@@ -841,9 +858,16 @@ class MainWindow(QMainWindow):
                 # this is a dialog that is not behaving like one; retrying it
                 # would spin rather than get anywhere.
                 return False
+            origin = self.config.base_url
+            if store_token is _REAL_STORE_TOKEN and credential_origin(origin) is None:
+                reporter = getattr(dialog, "show_store_error", None)
+                if not callable(reporter):
+                    return False
+                reporter(strings.CREDENTIAL_NEEDS_SERVER_MESSAGE)
+                continue
             try:
-                store_token(token)
-            except CredentialStoreUnavailable:
+                call_with_origin(store_token, token, origin=origin)
+            except (CredentialStoreUnavailable, ValueError):
                 reporter = getattr(dialog, "show_store_error", None)
                 if not callable(reporter):
                     # Nowhere to put the failure means nothing for the owner

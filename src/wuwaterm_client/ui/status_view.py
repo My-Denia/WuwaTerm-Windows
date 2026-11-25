@@ -28,7 +28,12 @@ from PySide6.QtWidgets import (
 
 from .. import strings
 from ..api import SUPPORTED_API_VERSIONS, ApiClient, MetaResult
-from ..credentials import CredentialStoreUnavailable, active_backend_name, read_token
+from ..credentials import (
+    CredentialStoreUnavailable,
+    active_backend_name,
+    call_with_origin,
+    read_token,
+)
 from ..errors import ClientError
 from . import error_presentation
 from .components import (
@@ -253,7 +258,7 @@ class StatusView(QWidget):
         else:
             apply_credential_backend(self.keyring_backend_value, backend)
         try:
-            stored = read_token() is not None
+            stored = call_with_origin(read_token, origin=self._api_client.current_origin) is not None
         except CredentialStoreUnavailable:
             credential_status = strings.SETTINGS_TOKEN_STATUS_UNKNOWN
         else:

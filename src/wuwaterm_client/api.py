@@ -17,7 +17,12 @@ from typing import Any, Callable
 import httpx
 
 from .config import ClientConfig, usable_base_url
-from .credentials import CredentialStoreUnavailable, read_token
+from .credentials import (
+    CredentialStoreUnavailable,
+    call_with_origin,
+    credential_origin,
+    read_token,
+)
 from .errors import (
     ERROR_CANCELLED,
     ERROR_INSECURE_ENDPOINT,
@@ -31,7 +36,7 @@ from .errors import (
 from .manuscript import ReviewReport, valid_report
 from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
 
-TokenProvider = Callable[[], "str | None"]
+TokenProvider = Callable[..., "str | None"]
 
 _BEARER_PREFIX = "Bearer "
 
@@ -56,8 +61,8 @@ SUPPORTED_API_VERSIONS: tuple[str, ...] = ("v1",)
 REVIEW_FEATURES_V2 = "dense-128,reason-v1"
 
 
-def default_token_provider() -> str | None:
-    return read_token()
+def default_token_provider(origin: str | None = None) -> str | None:
+    return read_token(origin=origin)
 
 
 # -- Wire-type checks ------------------------------------------------------
@@ -318,6 +323,13 @@ class ApiClient:
         """Whether this client has a server address it may send requests to."""
         return self._configured
 
+    @property
+    def current_origin(self) -> str | None:
+        """Normalized origin for credential scoping, or ``None`` while unconfigured."""
+        if not self._configured:
+            return None
+        return credential_origin(str(self._client.base_url))
+
     @classmethod
     def from_config(cls, config: ClientConfig) -> "ApiClient":
         """Build a client for a stored configuration.
@@ -373,7 +385,7 @@ class ApiClient:
 
     def _headers(self) -> dict[str, str]:
         try:
-            token = self._token_provider()
+            token = call_with_origin(self._token_provider, origin=self.current_origin)
         except CredentialStoreUnavailable:
             # Reported like any other unusable credential rather than escaping
             # into whichever view happens to be running, which would leave its

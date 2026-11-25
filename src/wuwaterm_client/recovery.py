@@ -29,6 +29,7 @@ class RecoveryState:
     payload: dict[str, Any] | None = None
     saved_at: str | None = None
     source_path: str | None = None
+    dropped_conflicting_choices: int = 0
     error: str | None = None
 
 
@@ -44,11 +45,19 @@ def save_recovery(
     source_path: Path | str | None = None,
 ) -> None:
     """Atomically write ``payload`` (serialized as v1-v4 workfile) to ``path``."""
-    workfile_json = manuscript.serialize_workfile(payload)
+    dropped_conflicts = 0
+    try:
+        workfile_json = manuscript.serialize_workfile(payload)
+    except manuscript.WorkfileError as exc:
+        if exc.code != "workfile_duplicate_choices":
+            raise
+        sanitized, dropped_conflicts = manuscript.sanitize_duplicate_choices(payload)
+        workfile_json = manuscript.serialize_workfile(sanitized)
     envelope = {
         "format": RECOVERY_FORMAT,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_path": None if source_path is None else str(source_path),
+        "dropped_conflicting_choices": dropped_conflicts,
         "workfile_json": workfile_json,
     }
     encoded = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
@@ -84,11 +93,18 @@ def load_recovery(path: Path) -> RecoveryState:
         payload = manuscript.parse_workfile(workfile_json)
         saved_at = data.get("saved_at")
         source_path = data.get("source_path")
+        dropped_raw = data.get("dropped_conflicting_choices", 0)
+        dropped = (
+            dropped_raw
+            if isinstance(dropped_raw, int) and not isinstance(dropped_raw, bool) and dropped_raw >= 0
+            else 0
+        )
         return RecoveryState(
             status="valid",
             payload=payload,
             saved_at=saved_at if isinstance(saved_at, str) else None,
             source_path=source_path if isinstance(source_path, str) else None,
+            dropped_conflicting_choices=dropped,
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, manuscript.WorkfileError, ValueError, TypeError) as exc:
         return RecoveryState(status="corrupt", error=str(exc))

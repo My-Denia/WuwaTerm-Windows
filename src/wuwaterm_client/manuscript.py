@@ -544,6 +544,102 @@ def _check_legacy_parts(value: dict[str, Any], v2: bool, text_limit: int, *, v4:
             raise WorkfileError("workfile_duplicate_choices", _MSG_DUPLICATE_CHOICES)
 
 
+def sanitize_duplicate_choices(payload: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+    """Return a copy of ``payload`` with colliding duplicate choices removed.
+
+    Preserves all prose (``source`` and ``target``), manual alignments, and
+    non-conflicting records so crash recovery and safe-save can exit a
+    ``workfile_duplicate_choices`` trap without losing current text.
+    """
+    import copy
+
+    cleaned = copy.deepcopy(dict(payload))
+    dropped = 0
+    choices = cleaned.get("choices")
+    if isinstance(choices, list):
+        kept_exact: list[Any] = []
+        seen_exact: set[tuple[str, str, str]] = set()
+        for choice in reversed(choices):
+            if (
+                isinstance(choice, Mapping)
+                and isinstance(choice.get("source"), str)
+                and isinstance(choice.get("direction"), str)
+                and isinstance(choice.get("source_span"), Mapping)
+            ):
+                key = (choice["source"], choice["direction"], _mention(choice["source_span"]))
+                if key in seen_exact:
+                    dropped += 1
+                    continue
+                seen_exact.add(key)
+            kept_exact.append(choice)
+        kept_exact.reverse()
+        cleaned["choices"] = kept_exact
+        if isinstance(cleaned.get("source"), str) and all(
+            isinstance(choice, Mapping)
+            and isinstance(choice.get("source"), str)
+            and isinstance(choice.get("source_span"), Mapping)
+            for choice in kept_exact
+        ):
+            try:
+                groups = choice_conflict_groups(cleaned)
+            except (KeyError, TypeError, ValueError):
+                groups = []
+            conflict_indices = {idx for group in groups for idx in group}
+            if conflict_indices:
+                dropped += len(conflict_indices)
+                cleaned["choices"] = [
+                    choice
+                    for idx, choice in enumerate(kept_exact)
+                    if idx not in conflict_indices
+                ]
+    decisions = cleaned.get("semantic_decisions")
+    if isinstance(decisions, list):
+        kept_decisions: list[Any] = []
+        seen_keys: set[str] = set()
+        for decision in reversed(decisions):
+            if isinstance(decision, Mapping):
+                try:
+                    key = occurrence_key(decision)
+                except (KeyError, TypeError, ValueError):
+                    kept_decisions.append(decision)
+                    continue
+                if key in seen_keys:
+                    dropped += 1
+                    continue
+                seen_keys.add(key)
+            kept_decisions.append(decision)
+        kept_decisions.reverse()
+        cleaned["semantic_decisions"] = kept_decisions
+    segments = cleaned.get("segments")
+    if isinstance(segments, list):
+        for record in segments:
+            if not isinstance(record, dict):
+                continue
+            seg_choices = record.get("choices")
+            if not isinstance(seg_choices, list):
+                continue
+            kept_seg: list[Any] = []
+            seen_places: set[tuple[int, int]] = set()
+            for choice in reversed(seg_choices):
+                span = choice.get("source_span") if isinstance(choice, Mapping) else None
+                if (
+                    isinstance(span, Mapping)
+                    and isinstance(span.get("start"), int)
+                    and not isinstance(span.get("start"), bool)
+                    and isinstance(span.get("end"), int)
+                    and not isinstance(span.get("end"), bool)
+                ):
+                    place = (int(span["start"]), int(span["end"]))
+                    if place in seen_places:
+                        dropped += 1
+                        continue
+                    seen_places.add(place)
+                kept_seg.append(choice)
+            kept_seg.reverse()
+            record["choices"] = kept_seg
+    return cleaned, dropped
+
+
 def _normalize_integral_numbers(root: Any) -> None:
     """Integral JSON numbers such as 3.0 read as 3, as they do in JavaScript."""
     stack = [root]

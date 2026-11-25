@@ -68,7 +68,7 @@ from .errors import (
 )
 from .manuscript import (
     MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, ReviewReport, WorkfileError,
-    empty_workfile, semantic_payload_fits, serialize_workfile,
+    empty_workfile, sanitize_duplicate_choices, semantic_payload_fits, serialize_workfile,
 )
 from .segmentation import (
     SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
@@ -593,6 +593,13 @@ class DocumentRunController:
         value = self.draft_snapshot()
         value["choices"].pop(index)
         return CommandOutcome(True, edit=self.apply_edit(value))
+
+    def resolve_conflicting_choices_for_save(self) -> CommandOutcome:
+        """Drop colliding duplicate historical choices as one undoable edit."""
+        cleaned, dropped = sanitize_duplicate_choices(self.payload)
+        if dropped <= 0:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        return CommandOutcome(True, edit=self.apply_edit(draft_of(cleaned)))
 
     # Semantic decisions. The questions and the commits are separate: the view
     # asks ``can_accept``/``can_adjust``/``can_ignore`` to enable its buttons,

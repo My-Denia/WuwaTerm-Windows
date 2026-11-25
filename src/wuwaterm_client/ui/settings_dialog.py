@@ -41,6 +41,8 @@ from ..config import (
 from ..credentials import (
     CredentialStoreUnavailable,
     active_backend_name,
+    call_with_origin,
+    credential_origin,
     delete_token,
     read_token,
     store_token,
@@ -432,9 +434,15 @@ class SettingsDialog(QDialog):
 
     # -- internals ---------------------------------------------------------
 
+    def _credential_origin(self) -> str | None:
+        candidate = self.base_url_edit.text().strip()
+        if not candidate or not usable_base_url(candidate):
+            return None
+        return credential_origin(candidate)
+
     def _refresh_credential_status(self) -> None:
         try:
-            stored = read_token() is not None
+            stored = call_with_origin(read_token, origin=self._credential_origin()) is not None
         except CredentialStoreUnavailable:
             self.credential_status_label.setText(strings.SETTINGS_TOKEN_STATUS_UNKNOWN)
             self.enter_token_button.setText(strings.SETTINGS_ENTER_TOKEN_BUTTON)
@@ -452,6 +460,7 @@ class SettingsDialog(QDialog):
         # The complaint is about the text that was there when OK was pressed.
         # Leaving it up while the owner edits marks a value nobody has judged.
         self._clear_base_url_error()
+        self._refresh_credential_status()
 
     def _clear_base_url_error(self) -> None:
         self.base_url_error.clear()
@@ -472,6 +481,10 @@ class SettingsDialog(QDialog):
         theme.apply_theme(QApplication.instance(), self._initial_appearance)
 
     def _on_enter_token_clicked(self) -> None:
+        origin = self._credential_origin()
+        if origin is None:
+            self.show_base_url_error(strings.SETTINGS_INVALID_BASE_URL_MESSAGE)
+            return
         dialog = TokenDialog(self)
         while True:
             if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -480,8 +493,8 @@ class SettingsDialog(QDialog):
             if not token:
                 return
             try:
-                store_token(token)
-            except CredentialStoreUnavailable:
+                call_with_origin(store_token, token, origin=origin)
+            except (CredentialStoreUnavailable, ValueError):
                 # Kept open with the token still in the field. Reporting this
                 # on the card behind a closed dialog threw away what had just
                 # been pasted, and a temporarily unavailable credential store
@@ -493,6 +506,10 @@ class SettingsDialog(QDialog):
         self._refresh_credential_status()
 
     def _on_forget_token_clicked(self) -> None:
+        origin = self._credential_origin()
+        if origin is None:
+            self.show_base_url_error(strings.SETTINGS_INVALID_BASE_URL_MESSAGE)
+            return
         # The one modal left in this dialog, deliberately: deleting the
         # credential cannot be undone from here, and a confirmation the owner
         # can dismiss by looking away is not a decision.
@@ -517,7 +534,7 @@ class SettingsDialog(QDialog):
         confirm = question.exec()
         if confirm == QMessageBox.StandardButton.Yes:
             try:
-                delete_token()
+                call_with_origin(delete_token, origin=origin)
             except CredentialStoreUnavailable:
                 self.credential_banner.show_message(
                     strings.CREDENTIAL_STORE_FORGET_ERROR_MESSAGE, SEVERITY_DANGER
