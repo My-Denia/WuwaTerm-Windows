@@ -1,6 +1,6 @@
 """Atomic local crash-recovery draft storage for the Windows desktop workbench.
 
-Saves and reloads an in-progress manuscript workfile in the existing v1-v4
+Saves and reloads an in-progress manuscript workfile in the existing v1-v5
 JSON representation wrapped in a ``wuwaterm-recovery-v1`` envelope under
 ``%APPDATA%/WuwaTerm/recovery/draft.json`` (or an injected path).
 
@@ -51,7 +51,7 @@ def save_recovery(
     source_path: Path | str | None = None,
     alignment_invalidations: Sequence[Mapping[str, Any]] = (),
 ) -> None:
-    """Atomically write ``payload`` (serialized as v1-v4 workfile) to ``path``,
+    """Atomically write ``payload`` (serialized as v1-v5 workfile) to ``path``,
     with the session list of invalidated alignments beside it."""
     dropped_conflicts = 0
     try:

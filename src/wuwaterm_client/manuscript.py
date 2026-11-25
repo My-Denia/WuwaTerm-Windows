@@ -1,17 +1,25 @@
-"""Read and safely save the public Web's manuscript workfiles (v1, v2, v3 and v4).
+"""Read and safely save the public Web's manuscript workfiles (v1 to v5).
 
 Reports and decisions in v1/v2 files, and the document-mode choices in them, stay
 historical data (Core ADR 0015, unchanged): this module does not grant them runtime
 trust, and a presentation layer must request a new review.
 
-v3/v4 segment records are the one exception.  A saved segment result is reused only
+v3 to v5 segment records are the one exception.  A saved segment result is reused only
 when the content hashes, the request inputs and the live basis all match (public
 Web ``contracts/manuscript-v3/SPEC.md``, "Design note").  v4 extends v3 with dense
 caps (128 findings, choices and submitted decisions, document-mode choices
 included) and structured ``not_evaluated`` ``reason`` codes while keeping v1, v2
-and v3 byte-identical when their tighter caps suffice.  This module only parses
-and writes: it computes no hashes or digests, so whether a record is current is
-decided by the caller.
+and v3 byte-identical when their tighter caps suffice.  v5 (public Web
+``contracts/manuscript-v5/SPEC.md``) adds three things v4 cannot hold: the
+``review_features`` a file's results were made with, the ``ambiguous_mention``
+reason, and gap-tolerant segment records (``segmentation-v1-gaps``).  A
+manuscript that needs none of them keeps its lower format.  This module only
+parses and writes: it computes no hashes or digests, so whether a record is
+current is decided by the caller.
+
+Layer 1 structure checks (Core ``POST /v1/structure-checks``, ADR 0022) never
+reach this module: a manuscript of any version holds no structure finding, and
+the same manuscript state is written to the same bytes with or without them.
 """
 
 from __future__ import annotations
@@ -31,9 +39,10 @@ WORKFILE_FORMAT = "wuwaterm-manuscript-v1"
 WORKFILE_FORMAT_V2 = "wuwaterm-manuscript-v2"
 WORKFILE_FORMAT_V3 = "wuwaterm-manuscript-v3"
 WORKFILE_FORMAT_V4 = "wuwaterm-manuscript-v4"
+WORKFILE_FORMAT_V5 = "wuwaterm-manuscript-v5"
 MAX_WORKFILE_BYTES = 1_048_576  # v1 and v2
-MAX_V3_BYTES = 46_137_344  # 44 MiB (v3 and v4)
-MAX_V3_TEXT_SCALARS = 46_137_344  # source, target and the semantic texts of a v3/v4 file
+MAX_V3_BYTES = 46_137_344  # 44 MiB (v3, v4 and v5)
+MAX_V3_TEXT_SCALARS = 46_137_344  # source, target and the semantic texts of a v3 to v5 file
 MAX_CHOICES = 32
 MAX_V4_CHOICES = 128
 MAX_HISTORY = 2
@@ -41,7 +50,7 @@ MAX_SEMANTIC_DECISIONS = 128
 MAX_SEMANTIC_HISTORY = 2
 MAX_SEMANTIC_TEXTS = 16
 MAX_HISTORY_SEGMENTS = 64
-MAX_V3_ITEMS = 512  # array items, any array of a v3/v4 file (v1/v2: 128)
+MAX_V3_ITEMS = 512  # array items, any array of a v3 to v5 file (v1/v2: 128)
 MAX_SEGMENTS = 512
 MAX_SEGMENT_CHOICE_HISTORY = 512
 MAX_SEGMENT_CHOICES = 32  # per segment record in v3
@@ -57,7 +66,22 @@ REASON_VALUES = (
     "found_outside_region",
     "ambiguous_repeat",
 )
+# A one-character name Core could not settle (review-v2 feature
+# ``ambiguous-mention-v1``). Only a v5 file, and only one that records that
+# feature, may hold it.
+REASON_AMBIGUOUS_MENTION = "ambiguous_mention"
+REASON_VALUES_V5 = (*REASON_VALUES, REASON_AMBIGUOUS_MENTION)
+# The review features a v5 file records: the ones that change which findings a
+# result holds. ``dense-128`` and ``reason-v1`` change the page size and add a
+# key, so they are not recorded.
+REVIEW_FEATURE_AMBIGUOUS_MENTION = "ambiguous-mention-v1"
+REVIEW_FEATURE_VALUES = (REVIEW_FEATURE_AMBIGUOUS_MENTION,)
+MAX_REVIEW_FEATURES = 8
 SEGMENTATION_VERSION = "segmentation-v1"
+# segmentation-v1 with gap regions (``segmentation.pair_segments_with_gaps``);
+# only v5 records may carry it, and one manuscript carries one label.
+GAP_SEGMENTATION_VERSION = "segmentation-v1-gaps"
+SEGMENTATION_VERSIONS_V5 = (SEGMENTATION_VERSION, GAP_SEGMENTATION_VERSION)
 ALIGNMENT_AUTOMATIC = "automatic"
 _HEX = re.compile(r"^[a-f0-9]{64}$")
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
@@ -66,6 +90,7 @@ _TOP_V2 = _TOP | {"semantic_decisions", "semantic_texts", "semantic_history"}
 _V2_PART = ("source", "target", "direction", "alignments", "choices", "history",
             "semantic_decisions", "semantic_texts", "semantic_history")
 _TOP_V3 = _TOP_V2 | {"segments", "segment_choice_history", "progress"}
+_TOP_V5 = _TOP_V3 | {"review_features"}
 _RECORD_KEYS = {"index", "segmentation_version", "source_start", "source_end", "target_start", "target_end",
                 "source_hash", "target_hash", "status", "direction", "alignment_input", "basis", "result", "choices"}
 _RESULT_KEYS = {"truncated", "evaluated", "not_evaluated", "findings"}
@@ -152,7 +177,7 @@ class ReviewFinding(TypedDict):
     target_span: ReviewSpan | None
     candidates: list[ReviewCandidate]
     candidates_truncated: bool
-    reason: NotRequired[str]  # review-v4 only
+    reason: NotRequired[str]  # reason-v1 only (v4 and v5 files)
 
 
 class ReviewReport(TypedDict):
@@ -252,8 +277,16 @@ def _mention(span: dict[str, Any]) -> str:
     return f'{int(span["start"])}:{int(span["end"])}:{span["text"]}'
 
 
-def valid_report(value: Any, source: str, target: str, *, v4: bool = False) -> bool:
-    """Match the public Web's serializable report schema, not its trust state."""
+def _reasons(v4: bool, v5: bool) -> tuple[str, ...]:
+    """The ``reason`` values a list may carry: none before v4, five in v4, six in v5."""
+    return REASON_VALUES_V5 if v5 else REASON_VALUES if v4 else ()
+
+
+def valid_report(value: Any, source: str, target: str, *, v4: bool = False, v5: bool = False) -> bool:
+    """Match the public Web's serializable report schema, not its trust state.
+
+    ``v4``: the dense caps and the five ``reason`` values. ``v5``: the same caps
+    and also ``ambiguous_mention`` (a report sent with ``ambiguous-mention-v1``)."""
     if not isinstance(value, dict):
         return False
     fields = {"request_id", "source_revision", "target_revision", "rule_version", "dictionary",
@@ -263,7 +296,8 @@ def valid_report(value: Any, source: str, target: str, *, v4: bool = False) -> b
     if not _keys(value, fields):
         return False
     version, coverage, findings = value["rule_version"], value["coverage"], value["findings"]
-    max_findings = MAX_V4_FINDINGS if v4 else MAX_RESULT_FINDINGS
+    max_findings = MAX_V4_FINDINGS if v4 or v5 else MAX_RESULT_FINDINGS
+    reasons = _reasons(v4, v5)
     if (not _text(value["request_id"], 256, False) or not _hex(value["source_revision"])
             or not _hex(value["target_revision"]) or version not in ("review-v1", "review-v2")
             or not _dictionary(value["dictionary"], version)
@@ -280,11 +314,11 @@ def valid_report(value: Any, source: str, target: str, *, v4: bool = False) -> b
                          "candidates", "candidates_truncated"}
     ids: set[str] = set()
     for finding in findings:
-        if v4 and isinstance(finding, dict) and "reason" in finding:
+        if reasons and isinstance(finding, dict) and "reason" in finding:
             if (not _keys(finding, base_finding_keys | {"reason"})
                     or finding["verdict"] != "not_evaluated"
                     or not isinstance(finding["reason"], str)
-                    or finding["reason"] not in REASON_VALUES):
+                    or finding["reason"] not in reasons):
                 return False
         elif not _keys(finding, base_finding_keys):
             return False
@@ -346,16 +380,16 @@ def _resolutions(value: Any, *, max_choices: int = MAX_CHOICES) -> bool:
     return True
 
 
-def _snapshot(value: Any, *, v4: bool = False) -> bool:
+def _snapshot(value: Any, *, v4: bool = False, v5: bool = False) -> bool:
     if not isinstance(value, dict):
         return False
     fields = {"source", "target", "direction", "alignments", "report"}
     if "resolutions" in value:
         fields.add("resolutions")
-    max_choices = MAX_V4_CHOICES if v4 else MAX_CHOICES
+    max_choices = MAX_V4_CHOICES if v4 or v5 else MAX_CHOICES
     return (_keys(value, fields) and _text(value["source"]) and _text(value["target"])
             and _direction(value["direction"]) and _alignments(value["alignments"], value["source"], value["target"])
-            and valid_report(value["report"], value["source"], value["target"], v4=v4)
+            and valid_report(value["report"], value["source"], value["target"], v4=v4, v5=v5)
             and ("resolutions" not in value or _resolutions(value["resolutions"], max_choices=max_choices)))
 
 
@@ -516,15 +550,16 @@ def _segment_invalid() -> WorkfileError:
     return WorkfileError("workfile_segment_invalid", _MSG_SEGMENT_INVALID)
 
 
-def _check_legacy_parts(value: dict[str, Any], v2: bool, text_limit: int, *, v4: bool = False) -> None:
-    """The v1 part, and the v2 part when ``v2``, with the v2/v4 checks and codes."""
+def _check_legacy_parts(value: dict[str, Any], v2: bool, text_limit: int, *, v4: bool = False,
+                        v5: bool = False) -> None:
+    """The v1 part, and the v2 part when ``v2``, with the v2/v4/v5 checks and codes."""
     source, target, choices, history = value["source"], value["target"], value["choices"], value["history"]
-    max_choices = MAX_V4_CHOICES if v4 else MAX_CHOICES
+    max_choices = MAX_V4_CHOICES if v4 or v5 else MAX_CHOICES
     if (not _text(source, text_limit) or not _text(target, text_limit)
             or not _direction(value["direction"]) or not _alignments(value["alignments"], source, target)
             or not isinstance(choices, list) or len(choices) > max_choices or not all(_choice(c) for c in choices)
             or not isinstance(history, list) or len(history) > MAX_HISTORY
-            or not all(_snapshot(h, v4=v4) for h in history)):
+            or not all(_snapshot(h, v4=v4, v5=v5) for h in history)):
         raise WorkfileError("workfile_invalid_content", _MSG_INVALID_CONTENT)
     original = [(c["source"], c["direction"], _mention(c["source_span"])) for c in choices]
     if len(set(original)) != len(original) or choice_conflict_groups(value):
@@ -684,22 +719,23 @@ def _basis_v3(value: Any) -> bool:
             and _hex(dictionary["revision"]) and _hex(value["matcher_revision"]))
 
 
-def _check_result_shape(result: Any, *, v4: bool = False) -> None:
+def _check_result_shape(result: Any, *, v4: bool = False, v5: bool = False) -> None:
     if not (_keys(result, _RESULT_KEYS) and isinstance(result["truncated"], bool)
             and _int(result["evaluated"], safe=True) and result["evaluated"] >= 0
             and _int(result["not_evaluated"], safe=True) and result["not_evaluated"] >= 0
             and isinstance(result["findings"], list)):
         raise _segment_invalid()
-    max_findings = MAX_V4_FINDINGS if v4 else MAX_RESULT_FINDINGS
+    max_findings = MAX_V4_FINDINGS if v4 or v5 else MAX_RESULT_FINDINGS
     if len(result["findings"]) > max_findings:
         raise _too_many()
+    reasons = _reasons(v4, v5)
     for finding in result["findings"]:
-        if v4 and isinstance(finding, dict) and "reason" in finding:
+        if reasons and isinstance(finding, dict) and "reason" in finding:
             valid_keys_and_verdict = (
                 _keys(finding, _FINDING_KEYS | {"reason"})
                 and finding["verdict"] == "not_evaluated"
                 and isinstance(finding["reason"], str)
-                and finding["reason"] in REASON_VALUES
+                and finding["reason"] in reasons
             )
         else:
             valid_keys_and_verdict = (
@@ -741,14 +777,17 @@ def _check_choice_shape(choice: Any, history: bool) -> None:
         raise _segment_invalid()
 
 
-def _check_record_shape(record: Any, source_length: int, target_length: int, *, v4: bool = False) -> None:
+def _check_record_shape(record: Any, source_length: int, target_length: int, *, v4: bool = False,
+                        v5: bool = False) -> None:
     if not _keys(record, _RECORD_KEYS):
         raise _segment_invalid()
 
     def within(start: Any, end: Any, length: int) -> bool:
         return _int(start, safe=True) and _int(end, safe=True) and 0 <= start <= end <= length
 
-    if (not _int(record["index"], safe=True) or record["segmentation_version"] != SEGMENTATION_VERSION
+    versions = SEGMENTATION_VERSIONS_V5 if v5 else (SEGMENTATION_VERSION,)
+    if (not _int(record["index"], safe=True) or not isinstance(record["segmentation_version"], str)
+            or record["segmentation_version"] not in versions
             or not within(record["source_start"], record["source_end"], source_length)
             or not within(record["target_start"], record["target_end"], target_length)
             or not _hex(record["source_hash"]) or not _hex(record["target_hash"])
@@ -764,11 +803,11 @@ def _check_record_shape(record: Any, source_length: int, target_length: int, *, 
     if record["basis"] is not None and not _basis_v3(record["basis"]):
         raise _segment_invalid()
     if record["result"] is not None:
-        _check_result_shape(record["result"], v4=v4)
+        _check_result_shape(record["result"], v4=v4, v5=v5)
     choices = record["choices"]
     if not isinstance(choices, list):
         raise _segment_invalid()
-    max_choices = MAX_V4_CHOICES if v4 else MAX_SEGMENT_CHOICES
+    max_choices = MAX_V4_CHOICES if v4 or v5 else MAX_SEGMENT_CHOICES
     if len(choices) > max_choices:
         raise _too_many()
     for choice in choices:
@@ -813,19 +852,42 @@ def _check_record_content(record: dict[str, Any], source: str, target: str) -> N
         raise WorkfileError("workfile_duplicate_choices", _MSG_DUPLICATE_CHOICES)
 
 
-def _parse_v3(value: dict[str, Any], *, v4: bool = False) -> dict[str, Any]:
+def valid_review_features(value: Any) -> bool:
+    """``review_features`` of a v5 file: known tokens, strictly ascending, at most 8."""
+    return (isinstance(value, list) and len(value) <= MAX_REVIEW_FEATURES
+            and all(isinstance(token, str) and token in REVIEW_FEATURE_VALUES and (i == 0 or value[i - 1] < token)
+                    for i, token in enumerate(value)))
+
+
+def is_ambiguous_mention(finding: Any) -> bool:
+    """A finding Core reported under ``ambiguous-mention-v1``: an unsettled
+    one-character name, judged only once the user resolves it."""
+    return isinstance(finding, Mapping) and finding.get("reason") == REASON_AMBIGUOUS_MENTION
+
+
+def _parse_v3(value: dict[str, Any], *, v4: bool = False, v5: bool = False) -> dict[str, Any]:
+    """The v3, v4 and v5 reader (v3 SPEC "Reading", steps 3 to 10): v3 and v4
+    differ only in their limits; v5 adds ``review_features``, the
+    ``ambiguous_mention`` reason (only with ``ambiguous-mention-v1`` recorded)
+    and the gap-tolerant segmentation label (v5 SPEC "Reading")."""
     _safe_tree(value, items=MAX_V3_ITEMS)  # step 3
-    if not _keys(value, _TOP_V3):  # step 4
+    if not _keys(value, _TOP_V5 if v5 else _TOP_V3):  # step 4
         raise WorkfileError("workfile_unsupported_format", "不支持此稿件格式或版本。")
+    if v5 and not valid_review_features(value["review_features"]):
+        raise WorkfileError("workfile_invalid_content", _MSG_INVALID_CONTENT)
     # Step 5: what lib parseWorkfile does to the v1/v2 part, including the 128-item array cap.
     _safe_tree({"format": WORKFILE_FORMAT_V2, **{key: value[key] for key in _V2_PART}})
-    _check_legacy_parts(value, True, MAX_V3_TEXT_SCALARS, v4=v4)
+    _check_legacy_parts(value, True, MAX_V3_TEXT_SCALARS, v4=v4, v5=v5)
+    ambiguous_on = v5 and REVIEW_FEATURE_AMBIGUOUS_MENTION in value["review_features"]
+    if v5 and not ambiguous_on and any(is_ambiguous_mention(f) for h in value["history"]
+                                       for f in h["report"]["findings"]):
+        raise WorkfileError("workfile_invalid_content", _MSG_INVALID_CONTENT)
     _normalize_integral_numbers(value)
     segments, source, target = value["segments"], value["source"], value["target"]
     if not isinstance(segments, list):
         raise _segment_invalid()
     for record in segments:  # step 6
-        _check_record_shape(record, len(source), len(target), v4=v4)
+        _check_record_shape(record, len(source), len(target), v4=v4, v5=v5)
     for position, record in enumerate(segments):  # step 7
         if record["index"] != position or (position and (
                 record["source_start"] < segments[position - 1]["source_end"]
@@ -833,6 +895,11 @@ def _parse_v3(value: dict[str, Any], *, v4: bool = False) -> dict[str, Any]:
             raise WorkfileError("workfile_segment_order", _MSG_SEGMENT_ORDER)
     for record in segments:  # step 8
         _check_record_content(record, source, target)
+    # v5: one pairing per manuscript, so one label; an ambiguous_mention finding needs the feature.
+    if v5 and (len({record["segmentation_version"] for record in segments}) > 1
+               or (not ambiguous_on and any(is_ambiguous_mention(f) for record in segments
+                                            if record["result"] is not None for f in record["result"]["findings"]))):
+        raise _segment_invalid()
     if not isinstance(value["segment_choice_history"], list):  # step 9
         raise _segment_invalid()
     for choice in value["segment_choice_history"]:
@@ -852,7 +919,8 @@ def _parse_v3(value: dict[str, Any], *, v4: bool = False) -> dict[str, Any]:
 
 
 def parse_workfile(content: str) -> dict[str, Any]:
-    """Read a v1, v2, v3 or v4 workfile."""
+    """Read a v1, v2, v3, v4 or v5 workfile. A v5 file keeps its
+    ``review_features``; a lower format has no such key (no features)."""
     try:
         size = len(content.encode("utf-8"))
     except (AttributeError, UnicodeEncodeError) as exc:
@@ -864,8 +932,10 @@ def parse_workfile(content: str) -> dict[str, Any]:
         parsed = True
     except (ValueError, RecursionError):
         value, parsed = None, False
-    if parsed and isinstance(value, dict) and value.get("format") in (WORKFILE_FORMAT_V3, WORKFILE_FORMAT_V4):
-        return _parse_v3(value, v4=value.get("format") == WORKFILE_FORMAT_V4)
+    if parsed and isinstance(value, dict) and value.get("format") in (
+            WORKFILE_FORMAT_V3, WORKFILE_FORMAT_V4, WORKFILE_FORMAT_V5):
+        return _parse_v3(value, v4=value.get("format") == WORKFILE_FORMAT_V4,
+                         v5=value.get("format") == WORKFILE_FORMAT_V5)
     # Every other input gets the v2 reader's result, starting with its own 1 MiB check.
     if size > MAX_WORKFILE_BYTES:
         raise _too_large()
@@ -1023,10 +1093,11 @@ def _v1v2_legacy_fits(value: Mapping[str, Any]) -> bool:
     )
 
 
-def _v3_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
-    """Minified canonical v3 or v4 bytes (lowest format that holds the payload).
-    Only the oldest semantic history snapshots are dropped, and only while the
-    file is over 44 MiB; a file still too large fails."""
+def _v3_content(payload: Mapping[str, Any], value: dict[str, Any], *, v5: bool = False) -> str:
+    """Minified canonical v3, v4 or v5 bytes. Without ``v5``, the lowest of v3
+    and v4 that holds the payload; v5 appends ``review_features`` last. Only the
+    oldest semantic history snapshots are dropped, and only while the file is
+    over 44 MiB; a file still too large fails."""
     decisions = list(payload.get("semantic_decisions") or [])
     snapshots = list(payload.get("semantic_history") or [])[-MAX_SEMANTIC_HISTORY:]
     texts = _semantic_texts_needed(payload)
@@ -1057,14 +1128,15 @@ def _v3_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
         )
         for r in records
     )
-    fmt = WORKFILE_FORMAT_V3 if v3_compatible else WORKFILE_FORMAT_V4
-    if fmt == WORKFILE_FORMAT_V4 and isinstance(value.get("history"), list):
+    fmt = WORKFILE_FORMAT_V5 if v5 else WORKFILE_FORMAT_V3 if v3_compatible else WORKFILE_FORMAT_V4
+    if fmt != WORKFILE_FORMAT_V3 and isinstance(value.get("history"), list):
         value = {**value, "history": _order_document_history(value["history"])}
+    tail = {"review_features": list(payload.get("review_features") or [])} if v5 else {}
 
     def write(history: list) -> str:
         return _minify({"format": fmt, **value, "semantic_decisions": decisions,
                         "semantic_texts": texts, "semantic_history": history, "segments": records,
-                        "segment_choice_history": entries, "progress": ordered})
+                        "segment_choice_history": entries, "progress": ordered, **tail})
     content = write(snapshots)
     size = len(content.encode("utf-8"))
     while snapshots and size > MAX_V3_BYTES:
@@ -1076,9 +1148,63 @@ def _v3_content(payload: Mapping[str, Any], value: dict[str, Any]) -> str:
     return content
 
 
-def serialize_workfile(payload: Mapping[str, Any]) -> str:
-    """The lowest format that holds the payload (3-tier rule: v1/v2 -> v3 -> v4).
+def record_features(record: Mapping[str, Any], default: Any = ()) -> tuple[str, ...]:
+    """The review features a record's result was made with: its runtime
+    ``features`` key (set when it was checked in this session, never written),
+    else ``default``, the ``review_features`` of the file it was read from."""
+    own = record.get("features") if isinstance(record, Mapping) else None
+    if isinstance(own, (list, tuple)):
+        return tuple(own)
+    return tuple(default) if isinstance(default, (list, tuple)) else ()
 
+
+def with_file_features(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """v5 SPEC "Writing" step 1 (Web ``withFileFeatures``). The file's
+    ``review_features`` is the sorted union of the features of every record
+    written ``done`` and, when a written finding (the last two history reports
+    or a record result) has the reason ``ambiguous_mention``,
+    ``ambiguous-mention-v1``. A ``done`` record whose features differ from that
+    list is written ``stale``, so a reader never reuses a result made under
+    other features."""
+    own = payload.get("review_features")
+    own = list(own) if isinstance(own, (list, tuple)) else []
+    try:
+        segments = list(payload.get("segments") or [])
+        tokens: set[str] = set()
+        for record in segments:
+            if record["status"] == "done":
+                tokens.update(record_features(record, own))
+        if (any(is_ambiguous_mention(f) for h in list(payload.get("history") or [])[-MAX_HISTORY:]
+                for f in h["report"]["findings"])
+                or any(is_ambiguous_mention(f) for record in segments if record["result"] is not None
+                       for f in record["result"]["findings"])):
+            tokens.add(REVIEW_FEATURE_AMBIGUOUS_MENTION)
+    except (KeyError, TypeError, AttributeError):
+        # Not shaped like a payload: the reader rejects it with its own code.
+        return {**payload, "review_features": own}
+    features = sorted(tokens)
+    out = {**payload, "review_features": features}
+    if segments:
+        out["segments"] = [{**record, "status": "stale"}
+                           if record["status"] == "done" and sorted(record_features(record, own)) != features
+                           else record for record in segments]
+    return out
+
+
+def _needs_v5(payload: Mapping[str, Any]) -> bool:
+    """Recorded review features, or gap-tolerant records: what only v5 holds."""
+    try:
+        return bool(payload["review_features"]) or any(
+            record["segmentation_version"] != SEGMENTATION_VERSION for record in payload.get("segments") or [])
+    except (KeyError, TypeError):
+        return False
+
+
+def serialize_workfile(payload: Mapping[str, Any]) -> str:
+    """The lowest format that holds the payload (v5, then v1/v2 -> v3 -> v4).
+
+    0) The file's ``review_features`` is set first (``with_file_features``);
+       v5 when it is not empty or a record carries ``segmentation-v1-gaps``.
     1) ``v1v2_compatible`` (no segment records/history, <= 32 choices/findings/
        resolutions, no ``reason``) and UTF-8 bytes <= 1 MiB -> pretty v1 or v2;
     2) ``v3_compatible`` (all counts <= 32, no ``reason``) -> minified v3;
@@ -1087,8 +1213,13 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
     if not isinstance(payload, Mapping):
         raise WorkfileError("workfile_invalid_content", "稿件内容无效。")
     try:
+        payload = with_file_features(payload)
         value = {key: payload[key] for key in ("source", "target", "direction", "alignments", "choices")}
         value["history"] = list(payload["history"])[-MAX_HISTORY:]
+        if _needs_v5(payload):
+            content = _v3_content(payload, value, v5=True)
+            parse_workfile(content)
+            return content
         if (not payload.get("segments") and not payload.get("segment_choice_history")
                 and _v1v2_legacy_fits(value)):
             content = _v1_v2_content(payload, value)
@@ -1105,7 +1236,7 @@ def serialize_workfile(payload: Mapping[str, Any]) -> str:
 
 
 def semantic_payload_fits(payload: Mapping[str, Any]) -> bool:
-    """Whether the payload can be saved: valid and within the file limit (44 MiB in v3 and v4)."""
+    """Whether the payload can be saved: valid and within the file limit (44 MiB in v3 to v5)."""
     try:
         serialize_workfile(payload)
     except WorkfileError:

@@ -874,15 +874,27 @@ def test_generated_python_contract_dtos_load_and_resolve(contract_source) -> Non
             manuscript.WORKFILE_FORMAT_V2,
             manuscript.WORKFILE_FORMAT_V3,
             manuscript.WORKFILE_FORMAT_V4,
+            manuscript.WORKFILE_FORMAT_V5,
         )
+        assert module.REASON_VALUES == manuscript.REASON_VALUES
+        assert module.REASON_VALUES_V5 == manuscript.REASON_VALUES_V5
+        assert module.REVIEW_FEATURE_VALUES == manuscript.REVIEW_FEATURE_VALUES
+        assert module.SEGMENTATION_VERSION_V5_VALUES == manuscript.SEGMENTATION_VERSIONS_V5
         for cls_name in (
             "ContractManuscriptV4",
             "ContractFindingV4",
             "ContractCompactFindingV4",
+            "ContractManuscriptV5",
+            "ContractFindingV5",
+            "ContractCompactFindingV5",
+            "ContractSegmentRecordV5",
             "ContractResolution",
             "ContractSemanticIssue",
         ):
             typing.get_type_hints(getattr(module, cls_name), include_extras=True)
+        # v5 appends review_features as the 14th and last top-level key.
+        assert list(module.ContractManuscriptV5.__annotations__)[-1] == "review_features"
+        assert len(module.ContractManuscriptV5.__annotations__) == 14
 
         finding_hints = typing.get_type_hints(module.ContractFindingV4, include_extras=True)
         compact_hints = typing.get_type_hints(module.ContractCompactFindingV4, include_extras=True)

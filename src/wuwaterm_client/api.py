@@ -33,7 +33,8 @@ from .errors import (
     ERROR_UNKNOWN,
     ClientError,
 )
-from .manuscript import ReviewReport, valid_report
+from . import structure
+from .manuscript import REVIEW_FEATURE_AMBIGUOUS_MENTION, ReviewReport, valid_report
 from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
 
 TokenProvider = Callable[..., "str | None"]
@@ -59,6 +60,14 @@ _BEARER_PREFIX = "Bearer "
 # StatusView._apply_api_version, reached from _show_meta.
 SUPPORTED_API_VERSIONS: tuple[str, ...] = ("v1",)
 REVIEW_FEATURES_V2 = "dense-128,reason-v1"
+
+
+def review_feature_header(features=()) -> str:
+    """The ``X-WuwaTerm-Review-Features`` value of a review-v2 request: always
+    ``dense-128`` and ``reason-v1``, then the session's recorded features.
+    ``ambiguous-mention-v1`` needs ``reason-v1``, which is always there."""
+    extra = [REVIEW_FEATURE_AMBIGUOUS_MENTION] if REVIEW_FEATURE_AMBIGUOUS_MENTION in tuple(features or ()) else []
+    return ",".join([REVIEW_FEATURES_V2, *extra])
 
 
 def default_token_provider(origin: str | None = None) -> str | None:
@@ -201,15 +210,17 @@ class MetaResult:
 
 
 def _review_report(
-    data: Any, source: str, target: str, *, review_version: str = "review-v2"
+    data: Any, source: str, target: str, *, review_version: str = "review-v2", ambiguous: bool = False,
 ) -> ReviewReport:
     """Accept a report only for the exact text and locations submitted.
 
     A successful HTTP response alone does not prove that a report belongs to
     the current draft. Offsets are Unicode scalar indices, not Qt positions.
+    An ``ambiguous_mention`` finding is accepted only when the request asked
+    for ``ambiguous-mention-v1`` (``ambiguous``).
     """
     v2 = review_version == "review-v2"
-    if not valid_report(data, source, target, v4=v2):
+    if not valid_report(data, source, target, v4=v2, v5=v2 and ambiguous):
         raise ValueError("review is not a supported report")
     for side, text in (("source", source), ("target", target)):
         revision = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -584,10 +595,13 @@ class ApiClient:
         resolutions: list[dict[str, Any]] | None = None,
         resolution_context: dict[str, str] | None = None,
         review_version: str = "review-v2",
+        features: Any = (),
     ) -> ReviewReport:
         """One term check. ``resolutions`` and ``resolution_context`` go out
         only when there are resolutions: review-v2 rejects a null field, and
-        non-empty resolutions need their context."""
+        non-empty resolutions need their context. ``features``: the session's
+        recorded review features (``ambiguous-mention-v1`` when the server
+        lists it), sent after ``dense-128,reason-v1``."""
         if resolutions and resolution_context is None:
             raise ValueError("resolutions need a resolution_context")
         body: dict[str, Any] = {
@@ -600,14 +614,35 @@ class ApiClient:
             body["resolutions"] = list(resolutions)
             body["resolution_context"] = resolution_context
         v2 = review_version == "review-v2"
-        extra_headers = {"X-WuwaTerm-Review-Features": REVIEW_FEATURES_V2} if v2 else None
+        ambiguous = v2 and REVIEW_FEATURE_AMBIGUOUS_MENTION in tuple(features or ())
+        extra_headers = {"X-WuwaTerm-Review-Features": review_feature_header(features)} if v2 else None
         response = await self._request(
             "POST", "/v1/reviews", json=body, matcher_basis=v2, headers=extra_headers,
         )
         return self._parsed(
-            lambda data: _review_report(data, source, target, review_version=review_version),
+            lambda data: _review_report(data, source, target, review_version=review_version, ambiguous=ambiguous),
             self._json(response),
         )
+
+    async def structure_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        """One Layer 1 batch (``structure-check-v1``, Core ADR 0022): a body
+        from ``structure.batches``. The caller decides, from
+        ``get_capabilities()``, whether the server lists the capability. The
+        response is accepted only for exactly the segments sent."""
+        if not structure.valid_request(body):
+            raise ValueError("not a structure-check-v1 request")
+        response = await self._request(
+            "POST", "/v1/structure-checks",
+            content=structure.encode(body),
+            headers={"Content-Type": "application/json"},
+        )
+
+        def accept(data: Any) -> dict[str, Any]:
+            if not structure.valid_response(data, body):
+                raise ValueError("not a structure-check-v1 response for this request")
+            return data
+
+        return self._parsed(accept, self._json(response))
 
     async def get_meta(self) -> MetaResult:
         response = await self._request("GET", "/v1/meta")

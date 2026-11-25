@@ -134,6 +134,14 @@ class FakeClient:
         self.review_calls: list[dict] = []
         self.semantic_calls: list[dict] = []
         self.translation_calls: list[dict] = []
+        self.structure_calls: list[dict] = []
+        self.structure = lambda body: {"request_id": "l1", "check_version": "structure-check-v1",
+                                       "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
+                                       "segments": [{"index": i, "segment_id": seg.get("segment_id"), "findings": [],
+                                                     "omitted_findings": 0,
+                                                     "layout": {"source_paragraphs": 1, "target_paragraphs": 1,
+                                                                "source_lines": 1, "target_lines": 1}}
+                                                    for i, seg in enumerate(body["segments"])]}
         self.capability_calls = 0
 
     async def _before(self, name: str) -> None:
@@ -152,12 +160,17 @@ class FakeClient:
         return self.capabilities
 
     async def review_pair(self, source, target, direction, *, alignments=None, resolutions=None,
-                          resolution_context=None) -> dict:
+                          resolution_context=None, features=()) -> dict:
         call = {"source": source, "target": target, "direction": direction, "alignments": alignments,
-                "resolutions": resolutions, "resolution_context": resolution_context}
+                "resolutions": resolutions, "resolution_context": resolution_context, "features": tuple(features)}
         self.review_calls.append(call)
         await self._before("review_pair")
         return self.term(call)
+
+    async def structure_check(self, body) -> dict:
+        self.structure_calls.append(body)
+        await self._before("structure_check")
+        return self.structure(body)
 
     async def semantic_review(self, source, target, direction, *, before=None, precedents=None) -> dict:
         call = {"source": source, "target": target, "direction": direction, "before": before,
@@ -198,6 +211,9 @@ class StubHost:
 
     def refresh_semantic(self) -> None:
         self._record("refresh_semantic")
+
+    def render_structure(self) -> None:
+        self._record("render_structure")
 
     def refresh_segments(self) -> None:
         self._record("refresh_segments")
@@ -272,13 +288,15 @@ def make(client: FakeClient | None = None, payload: dict | None = None) -> tuple
 async def settle(controller: dc.DocumentRunController, *, limit: int = 2000) -> None:
     """Wait until no run is in flight and its completion callbacks have run."""
     for _ in range(limit):
-        running = [task for task in (controller.task, controller.semantic_task, controller.translate_task)
+        running = [task for task in (controller.task, controller.semantic_task, controller.translate_task,
+                                     controller.structure_task)
                    if task is not None and not task.done()]
         if running:
             await asyncio.wait(running, timeout=0.05)
             continue
         await asyncio.sleep(0)
-        if all(task is None for task in (controller.task, controller.semantic_task, controller.translate_task)):
+        if all(task is None for task in (controller.task, controller.semantic_task, controller.translate_task,
+                                         controller.structure_task)):
             return
     raise AssertionError("the controller did not settle")
 
@@ -640,10 +658,10 @@ def test_a_translation_refreshes_the_segment_rows_it_makes_stale() -> None:
 # -- the typed client boundary ----------------------------------------------
 
 def test_the_client_protocol_names_exactly_the_calls_the_runs_make() -> None:
-    """A run asks for these four things and nothing else, so the protocol must
+    """A run asks for these five things and nothing else, so the protocol must
     not grow into a second client: a wider one would not be ``ApiClient``."""
     declared = {name for name in dir(dc.WorkbenchApiClient) if not name.startswith("_")}
-    assert declared == {"get_capabilities", "review_pair", "semantic_review", "translate"}
+    assert declared == {"get_capabilities", "review_pair", "semantic_review", "structure_check", "translate"}
 
 
 def test_the_workbench_accepts_a_client_and_a_host_that_conform() -> None:

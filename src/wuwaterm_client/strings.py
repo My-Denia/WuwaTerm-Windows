@@ -684,7 +684,7 @@ RECENT_CLEAR = "清除最近文件"
 RECENT_FILE_MISSING = "文件已不存在，无法打开：{name}"
 
 
-# -- Long manuscripts: resumable segment term review (manuscript v3/v4) -----
+# -- Long manuscripts: resumable segment term review (manuscript v3 to v5) --
 MANUSCRIPT_SAVED_REPORT = "已保存的逐段术语结果：{count} 条发现。尚未与当前服务核对，开始审校时会先核对一次。"
 MANUSCRIPT_REPORT_RECHECK = "其中 {count} 条所在的段落待重新核对。"
 MANUSCRIPT_SEGMENTS_SAVED = "{count} 段有已保存的术语结果；开始审校时先核对一次，未变的段落不再重复审校。"
@@ -751,6 +751,7 @@ MANUSCRIPT_NOT_EVALUATED_REASON = {
     "no_target_region": "无对应译文区域",
     "found_outside_region": "译名在对应区域外",
     "ambiguous_repeat": "同段重复出现",
+    "ambiguous_mention": "可能是角色名的单字，待你确认",
 }
 MANUSCRIPT_NOT_EVALUATED_DETAIL = {
     "not_a_term": "未评估原因：此处已按“不是术语”记录，不按专有术语核对。",
@@ -758,8 +759,74 @@ MANUSCRIPT_NOT_EVALUATED_DETAIL = {
     "no_target_region": "未评估原因：未找到与该处对应的译文句段，无法核对。",
     "found_outside_region": "未评估原因：官方译名出现在配对句段之外，两侧可能存在拆并句偏差。",
     "ambiguous_repeat": "未评估原因：同一区域内多次出现，无法唯一对应到具体译文位置。",
+    "ambiguous_mention": "未评估原因：这个单字可能是角色名，也可能只是普通字，服务没有判断。",
 }
 MANUSCRIPT_NOT_EVALUATED_UNKNOWN = "未评估原因：{reason}"
+
+# -- Layered review (manuscript v5, structure-check-v1) --------------------
+# Layer 1 is deterministic and never saved; layer 2 is the experimental model
+# review; layer 3 is a reserved place that sends and stores nothing.
+MANUSCRIPT_LAYERS_TITLE = "分层审校"
+MANUSCRIPT_L1_TITLE = "第一层 · 确定性结构核查（不调用模型、不写入稿件）"
+MANUSCRIPT_L1_NOTE = (
+    "逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
+    "结果只在本次打开时显示，不写入稿件文件、导出或撤销历史；某段文本改动后，这一段的结果随即失效。"
+)
+MANUSCRIPT_L1_RUN = "运行结构核查（{count} 段）"
+MANUSCRIPT_L1_RERUN = "重新核查（{count} 段）"
+MANUSCRIPT_L1_RUNNING = "正在核查…"
+MANUSCRIPT_L1_COST = "每批最多 64 段，每批计 1 次审校额度；这次共 {count} 批。"
+MANUSCRIPT_L1_NOT_RUN = "尚未核查。"
+MANUSCRIPT_L1_CLEAN = "已核查 {checked} 段，没有发现结构问题。"
+MANUSCRIPT_L1_SUMMARY = "已核查 {checked} 段：{segments} 段有结构问题，共 {count} 条。"
+MANUSCRIPT_L1_OMITTED = "另有 {count} 条超过每段 16 条的上限，没有列出。"
+MANUSCRIPT_L1_UNCHECKED = "{count} 段尚未核查，或核查后改动过。"
+MANUSCRIPT_L1_SKIPPED = "{count} 段超过单段 2,000 字，无法核查。"
+MANUSCRIPT_L1_FAILED = "结构核查没有完成：{reason}"
+MANUSCRIPT_L1_NONE = "没有可核查的段落。"
+MANUSCRIPT_L1_UNAVAILABLE = "此服务暂不支持结构核查。术语审校仍可使用。"
+MANUSCRIPT_L1_LAYOUT = "第 {number} 段 · 段落 {sp} → {tp} · 非空行 {sl} → {tl}"
+MANUSCRIPT_L1_ITEM = "第 {number} 段 · {rule}\n{side}：{text}"
+MANUSCRIPT_L1_ITEM_SEGMENT = "第 {number} 段 · {rule}"
+MANUSCRIPT_L1_SOURCE = "原文"
+MANUSCRIPT_L1_TARGET = "译文"
+MANUSCRIPT_L1_RULES = {
+    "empty_target": "译文为空",
+    "paragraph_count_mismatch": "段落数不一致",
+    "line_count_mismatch": "行数不一致",
+    "placeholder_missing": "译文缺少占位符或标签",
+    "placeholder_unexpected": "译文多出占位符或标签",
+    "tag_unbalanced": "标签没有正确闭合",
+    "number_missing": "译文缺少数字",
+    "number_unexpected": "译文多出数字",
+}
+MANUSCRIPT_L1_LIST = "第一层结构问题"
+MANUSCRIPT_L2_TITLE = "第二层 · 高风险语义（模型，实验性）"
+MANUSCRIPT_L2_NOTE = "默认列出高、中置信度的发现；低置信度的发现折叠在列表末尾。"
+MANUSCRIPT_L2_COVERED = "{count} 条与第一层的结构问题重复，按第一层显示，这里不再重复提醒。"
+MANUSCRIPT_L2_LOW_SHOW = "展开低置信度发现（{count} 条）"
+MANUSCRIPT_L2_LOW_HIDE = "收起低置信度发现（{count} 条）"
+MANUSCRIPT_L2_OVERVIEW = "第二层 · 高置信 {high} · 中置信 {medium} · 低置信 {low}（已折叠）"
+MANUSCRIPT_L3_TITLE = "第三层 · 风格建议（预留）"
+MANUSCRIPT_L3_TOGGLE = "显示风格建议"
+MANUSCRIPT_L3_OFF = "默认关闭。"
+MANUSCRIPT_L3_ON = "这一层还没有内容：目前不提供风格建议，也不会发出任何额外的模型请求。"
+
+# -- Ambiguous single characters (review-v2 ambiguous-mention-v1) ---------
+MANUSCRIPT_AMBIGUOUS_SHOW = "歧义单字 · {count}（展开）"
+MANUSCRIPT_AMBIGUOUS_HIDE = "歧义单字 · {count}（收起）"
+MANUSCRIPT_AMBIGUOUS_NOTE = (
+    "这些单字可能是角色名，也可能只是普通字，服务没有判断，因此不计入冲突、问题和术语组数。"
+    "采纳候选词对后，下次审校时按这对词判断；忽略则按普通字处理。"
+)
+MANUSCRIPT_AMBIGUOUS_ITEM = "“{text}” · 第 {number} 段"
+MANUSCRIPT_AMBIGUOUS_ITEM_DOCUMENT = "“{text}” · 原文 {start}–{end}"
+MANUSCRIPT_AMBIGUOUS_ADOPT = "采纳 {zh} / {en}"
+MANUSCRIPT_AMBIGUOUS_IGNORE = "忽略（按普通字处理）"
+MANUSCRIPT_AMBIGUOUS_ADOPTED = "已采纳 {zh} / {en}，下次审校时按这对词判断。"
+MANUSCRIPT_AMBIGUOUS_IGNORED = "已标记“{text}”不是术语，下次审校时按普通字处理。"
+MANUSCRIPT_AMBIGUOUS_STAGED = "下次审校时发送"
+MANUSCRIPT_AMBIGUOUS_LIST = "歧义单字"
 
 MANUSCRIPT_TRANSLATED_MISMATCH = (
     "已写入机器翻译；有 {count} 段因两侧段落或句数不一致需手动切分（已原样保留段落，未强行合并错位）。"

@@ -1294,6 +1294,9 @@ def test_status_queries_stay_fast_with_many_issues_and_decisions(qapp) -> None:
     import time
     view = _many_issues_view()
     view._show_track(TRACK_SEMANTIC)
+    # Every issue here is low confidence, which Layer 2 folds by default; open
+    # the fold so the rebuild still lists all 1,024.
+    view.low_toggle.setChecked(True)
     started = time.perf_counter()
     view._issue_rows = []  # force a full rebuild
     view._refresh_semantic()
