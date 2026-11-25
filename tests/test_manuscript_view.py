@@ -218,12 +218,15 @@ def test_editing_explicit_alignment_is_undoable_and_auto_can_be_restored(qapp) -
     cursor = view.source_edit.textCursor()
     cursor.movePosition(QTextCursor.MoveOperation.End)
     cursor.insertText("!")
-    assert view._payload["alignments"] == []
-    assert "已清除" in view.status_label.text()
+    assert view._payload["alignments"] == value["alignments"]
+    assert "已清除" not in view.status_label.text()
     view._undo_replace()
     assert view._payload == value
-    view.source_edit.textCursor().insertText("!")
+    cursor = view.source_edit.textCursor()
+    cursor.select(QTextCursor.SelectionType.Document)
+    cursor.removeSelectedText()
     assert view._payload["alignments"] == []
+    assert "已清除" in view.status_label.text()
     view.auto_align_button.click()
     assert view._payload["alignments"] is None
     assert "自动对应" in view.status_label.text()
@@ -352,7 +355,7 @@ def test_full_import_edit_undo_save_review_and_endpoint_lifecycle(qapp, tmp_path
         cursor = view.source_edit.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText("!")
-        assert view._payload["alignments"] == []
+        assert view._payload["alignments"] == value["alignments"]
         assert view._payload["choices"] == value["choices"] and view._payload["history"] == value["history"]
         assert view._payload != view._saved_payload
         view._undo_replace()
@@ -442,7 +445,10 @@ def test_ime_selection_commit_and_document_undo_redo_keep_raw_and_metadata(qapp,
     expected = "A\r\n你c\xa0d\u2028e\u2029term"
     assert editor.raw_text() == expected
     assert editor.toPlainText() == reference.toPlainText()
-    assert view._payload["alignments"] == []
+    assert view._payload["alignments"] == [
+        {"source": {"start": 0, "end": len(expected), "text": expected},
+         "target": {"start": 0, "end": 1, "text": target}}
+    ]
     assert view._payload["history"] == value["history"]
     QTest.keyClick(editor, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert view._payload == value
@@ -2002,5 +2008,122 @@ def test_conflicting_choices_have_undoable_resolve_and_save_plus_txt_export(
         assert view.conflict_list.count() == 0
         assert view._conflict_indexes == []
         view._remove_conflicting_choice()
+    finally:
+        view.close()
+
+
+def test_save_as_button_uses_distinct_save_all_icon(qapp) -> None:
+    view = ManuscriptView(ApiClient(None))
+    try:
+        assert view.save_button.property("iconName") == "save"
+        assert view.save_as_button.property("iconName") == "save-all"
+        assert not view.save_as_button.icon().isNull()
+    finally:
+        view.close()
+
+
+def test_primary_cta_switches_by_manuscript_state(qapp) -> None:
+    view = ManuscriptView(ApiClient(None))
+    try:
+        assert view.review_button.objectName() == "primaryButton"
+        assert view.translate_button.objectName() == "commandButton"
+        assert view.translate_button.text() == ""
+
+        install(view, "今汐", "")
+        assert view.translate_button.objectName() == "primaryButton"
+        assert view.translate_button.property("iconColor") == "accent-fg"
+        assert view.review_button.objectName() == "commandButton"
+        assert view.translate_button.text() == ""
+
+        install(view, "今汐", "Jinhsi")
+        assert view.review_button.objectName() == "primaryButton"
+        assert view.translate_button.objectName() == "commandButton"
+        assert view.translate_button.property("iconColor") == ""
+        assert view.translate_button.text() == ""
+    finally:
+        view.close()
+
+
+def test_more_details_is_collapsed_by_default(qapp) -> None:
+    view = ManuscriptView(ApiClient(None))
+    try:
+        assert not view.details_button.isChecked()
+        assert not view.more_details.isVisible()
+    finally:
+        view.close()
+
+
+def test_remap_alignments_for_side_edit_preserves_shifts_and_drops_crossing() -> None:
+    from wuwaterm_client.document_edits import compute_minimal_splice, remap_alignments_for_side_edit
+
+    old_source = "Alpha. Beta."
+    old_target = "甲。 乙。"
+    alignments = [
+        {"source": {"start": 0, "end": 6, "text": "Alpha."}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+        {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+    ]
+
+    # Insert outside/after keeps spans intact; insert inside/before shifts or resizes spans.
+    appended = old_source + "!"
+    assert compute_minimal_splice(old_source, appended) == (len(old_source), len(old_source), 1)
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, appended, old_target,
+    ) == alignments
+
+    inserted = "Alpha! Beta."
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, inserted, old_target,
+    ) == [
+        {"source": {"start": 0, "end": 6, "text": "Alpha!"}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+        {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+    ]
+
+    prefixed = "00 " + old_source
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, prefixed, old_target,
+    ) == [
+        {"source": {"start": 3, "end": 9, "text": "Alpha."}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+        {"source": {"start": 10, "end": 15, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+    ]
+
+    # Target-side safe edit shifts target spans while leaving source untouched.
+    prefixed_target = "pre " + old_target
+    assert remap_alignments_for_side_edit(
+        alignments, "target", old_source, old_target, old_source, prefixed_target,
+    ) == [
+        {"source": {"start": 0, "end": 6, "text": "Alpha."}, "target": {"start": 4, "end": 6, "text": "甲。"}},
+        {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 7, "end": 9, "text": "乙。"}},
+    ]
+
+    # Deleting across a span boundary or deleting an entire span clears alignments.
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, "Alpha", old_target,
+    ) == []
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, "Alphata.", old_target,
+    ) == []
+
+
+def test_on_edit_two_sided_fallback_preserves_non_crossing_alignments(qapp) -> None:
+    view = ManuscriptView(ApiClient(None))
+    try:
+        value = empty_workfile()
+        value.update(
+            source="Alpha. Beta.",
+            target="甲。 乙。",
+            direction="en",
+            alignments=[
+                {"source": {"start": 0, "end": 6, "text": "Alpha."}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+                {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+            ],
+        )
+        view._set_payload(value)
+        view.source_edit.set_raw_text("00 Alpha. Beta.")
+        view.target_edit.set_raw_text("前 甲。 乙。")
+        view._on_edit(edit=None)
+        assert view._payload["alignments"] == [
+            {"source": {"start": 3, "end": 9, "text": "Alpha."}, "target": {"start": 2, "end": 4, "text": "甲。"}},
+            {"source": {"start": 10, "end": 15, "text": "Beta."}, "target": {"start": 5, "end": 7, "text": "乙。"}},
+        ]
     finally:
         view.close()

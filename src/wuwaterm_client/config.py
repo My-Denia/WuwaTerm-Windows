@@ -25,7 +25,7 @@ CONFIG_FILE_NAME = "config.json"
 
 # There is deliberately NO default server address. See ClientConfig.base_url.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
-DEFAULT_TRANSLATE_TIMEOUT_SECONDS = 60.0
+DEFAULT_TRANSLATE_TIMEOUT_SECONDS = 100.0
 # The same bounds the Settings dialog enforces. A hand-edited config file is
 # the only way a value outside them can arrive, and "never raises" must not
 # mean "passes a zero or a string straight into the HTTP client".
