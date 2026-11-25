@@ -328,15 +328,13 @@ def test_a_stored_response_carries_the_features_it_was_asked_with() -> None:
     assert not sr.is_current(stored, after, BASIS, ())
 
 
-def test_ambiguous_names_are_no_place_in_a_term_group_and_are_listed_apart() -> None:
+def test_ambiguous_names_are_no_place_in_a_term_group() -> None:
     payload, pairs = _long_payload([[AMB], [AMB], [AMB]], ambiguous=True)
     groups = sr.group_term_occurrences(payload["segments"], pairs, payload["source"], payload["target"], "en",
                                        basis=BASIS, features=(AMB,))
     assert groups == []
-    places = sr.ambiguous_places(payload["segments"], pairs, payload["source"], payload["target"], "en",
-                                 basis=BASIS, features=(AMB,))
-    assert [(p["segment_number"], p["source_span"]["text"], p["freshness"]) for p in places] == [(2, "椿", "current")]
-    assert payload["source"][places[0]["source_span"]["start"]] == "椿"
+    # The finding itself is kept in the record; only the grouping leaves it out.
+    assert [f["reason"] for f in payload["segments"][1]["result"]["findings"]] == ["ambiguous_mention"]
 
 
 # ---- segmentation-v1-gaps (MY-496) -------------------------------------------

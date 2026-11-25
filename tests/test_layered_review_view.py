@@ -18,6 +18,7 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication
 from test_manuscript_semantic import issue, semantic_report
 
+from wuwaterm_client import markdown_report as mdr
 from wuwaterm_client import strings, theme
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.manuscript import empty_workfile, serialize_workfile
@@ -152,6 +153,7 @@ def test_layer_one_runs_when_pressed_locates_and_is_never_written(qapp, tmp_path
         assert view.l1_run_button.text() == strings.MANUSCRIPT_L1_RUN.format(count=1)
         assert view.l1_run_button.isEnabled() and view.l1_list.isHidden()
         before = serialize_workfile(view._payload)
+        report_before = view.report_markdown()
         view.l1_run_button.click()
         await settle(view)
         assert server.paths() == ["/v1/capabilities", "/v1/structure-checks"]
@@ -163,8 +165,9 @@ def test_layer_one_runs_when_pressed_locates_and_is_never_written(qapp, tmp_path
         assert view.l1_run_button.text() == strings.MANUSCRIPT_L1_RERUN.format(count=1)
         view.l1_list.setCurrentRow(0)
         assert view.source_edit.textCursor().selectedText() == "100"
-        # Never written: not dirty, nothing to undo, the same bytes on save.
+        # Never written: not dirty, nothing to undo, the same export, the same bytes on save.
         assert not view.document_dirty and not view._controller.can_undo()
+        assert view.report_markdown() == report_before
         assert serialize_workfile(view._payload) == before
         path = tmp_path / "draft.wuwaterm"
         view._path = path
@@ -194,7 +197,8 @@ def test_layer_one_says_when_the_service_does_not_offer_it(qapp) -> None:
         await settle(view)
         assert server.paths() == ["/v1/capabilities"]
         assert strings.MANUSCRIPT_L1_UNAVAILABLE in view.l1_status.text()
-        assert not view.l1_run_button.isEnabled()
+        assert not view.l1_run_button.isEnabled() and view.l1_run_button.isHidden()
+        assert view.l1_note.isHidden() and view.l1_list.isHidden()
     asyncio.run(scenario())
 
 
@@ -295,6 +299,10 @@ def test_ambiguous_names_are_folded_after_the_judged_findings_and_not_counted(qa
         assert view.status_label.text() == strings.MANUSCRIPT_AMBIGUOUS_ADOPTED.format(zh="椿", en="Camellya")
         assert view.findings.count() == 1 and view.ambiguous_list.count() == 1
         assert strings.MANUSCRIPT_AMBIGUOUS_STAGED in view.ambiguous_list.item(0).text()
+        # The exported report says the choice goes out, not that a desktop never sends it.
+        exported = view.report_markdown()
+        assert mdr.CHOICE_REASONS["position_basis_match"] in exported
+        assert mdr.CHOICE_REASONS["desktop_not_submitted"] not in exported
         # The next check sends it; Core then judges the name.
         view._start_review()
         await settle(view)
@@ -318,6 +326,9 @@ def test_an_ambiguous_name_can_be_marked_an_ordinary_word(qapp) -> None:
         view.ambiguous_ignore_button.click()
         [choice] = view._payload["choices"]
         assert (choice["choice"], choice["candidate"]) == ("not_a_term", None)
+        exported = view.report_markdown()
+        assert mdr.CHOICE_REASONS["user_not_a_term"] in exported
+        assert mdr.CHOICE_REASONS["imported_not_a_term"] not in exported
         view._start_review()
         await settle(view)
         second = AMBIGUOUS_SOURCE.index("椿", 1)

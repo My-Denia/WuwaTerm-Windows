@@ -219,6 +219,28 @@ def test_a_refused_resolution_is_checked_once_more_without_it() -> None:
     asyncio.run(scenario())
 
 
+def test_the_report_tells_this_sessions_choice_from_a_files() -> None:
+    """``markdown_report.reconcile_choices``: a choice made in this session goes
+    out with the next check; one read from a file stays on file."""
+    from wuwaterm_client import markdown_report as mdr
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=(AMB,))
+        client.term = ambiguous_report
+        controller, client, _host = make(client, short_payload())
+        controller.start_review()
+        await settle(controller)
+        finding = controller.payload["history"][-1]["report"]["findings"][0]
+        controller.choose_document(finding, CANDIDATE)
+        latest = {**controller.payload["history"][-1], "trusted": True}
+        choices = controller.payload["choices"]
+        mine = mdr.reconcile_choices(choices, controller.payload, latest, own=controller.is_session_choice)
+        assert [(r["status"], r["code"]) for r in mine] == [("applicable", "position_basis_match")]
+        as_file = mdr.reconcile_choices(choices, controller.payload, latest)
+        assert [(r["status"], r["code"]) for r in as_file] == [("pending", "desktop_not_submitted")]
+    asyncio.run(scenario())
+
+
 def test_a_choice_read_from_a_file_is_never_sent() -> None:
     async def scenario() -> None:
         client = FakeClient(capabilities=(AMB,))

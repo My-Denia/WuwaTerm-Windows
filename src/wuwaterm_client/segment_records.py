@@ -1355,7 +1355,7 @@ def group_term_occurrences(
     Ambiguous one-character names (``ambiguous_mention``) are no place in any
     group and take no ``finding_index``: they are not evaluated and not a
     problem until the user resolves them, so a caller lists them apart, after
-    the groups (``ambiguous_places``). ``features`` is the session's review
+    the groups. ``features`` is the session's review
     feature set (``None`` while unknown), ``file_features`` the
     ``review_features`` of the file the records were read from.
 
@@ -1576,52 +1576,6 @@ def group_term_occurrences(
     for g in groups:
         g.pop("_order", None)
     return groups
-
-
-def ambiguous_places(
-    records: Sequence[Mapping],
-    pairs: Sequence,
-    source: str,
-    target: str,
-    direction: str,
-    *,
-    alignments: Sequence[Mapping] | None = None,
-    basis: Mapping | None = None,
-    features: Sequence[str] | None = (),
-    file_features: Sequence[str] | None = None,
-) -> list[dict[str, Any]]:
-    """The ambiguous one-character names of the records ``group_term_occurrences``
-    reads, in text order: each with its record, its core-relative and
-    whole-text source span, its candidates, the record's freshness and the
-    user's choice there (Web ``splitAmbiguousSegments``)."""
-    places: list[dict[str, Any]] = []
-    for fallback_idx, record in enumerate(records or ()):
-        seg_index = record.get("index", fallback_idx)
-        if pairs and 0 <= seg_index < len(pairs) and getattr(pairs[seg_index], "status", STATUS_READY) != STATUS_READY:
-            continue
-        freshness = _record_freshness(record, source, target, direction, alignments, basis, features,
-                                      file_features)
-        if freshness is None:
-            continue
-        s_start = record["source_start"]
-        choices_by_place = {_place(c): c for c in record.get("choices") or ()}
-        for finding in expand_result(record, source, target)["findings"]:
-            if not is_ambiguous_mention(finding):
-                continue
-            core_s = finding["source_span"]
-            places.append({
-                "segment_index": seg_index,
-                "segment_number": seg_index + 1,
-                "core_source_span": core_s,
-                "source_span": {"start": s_start + core_s["start"], "end": s_start + core_s["end"],
-                                "text": core_s["text"]},
-                "source_context": _context_snippet(source[s_start:record["source_end"]],
-                                                   (core_s["start"], core_s["end"])),
-                "candidates": finding["candidates"],
-                "freshness": freshness,
-                "choice": choices_by_place.get((core_s["start"], core_s["end"])),
-            })
-    return places
 
 
 def adopt_file_features(payload: Mapping[str, Any], features: Sequence[str]) -> tuple[Parts, tuple[str, ...]]:

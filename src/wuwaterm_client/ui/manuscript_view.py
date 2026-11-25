@@ -1953,6 +1953,10 @@ class ManuscriptView(QWidget):
             lines.append(strings.MANUSCRIPT_L1_SKIPPED.format(count=len(skipped)))
         self.l1_status.setText("\n".join(lines))
         self.l1_status.setVisible(bool(lines))
+        # A service that does not offer the check: the feature is hidden
+        # (ADR 0022), and only the line saying so stays.
+        self.l1_note.setVisible(not unavailable)
+        self.l1_run_button.setVisible(not unavailable)
         rows: list[tuple[int, dict]] = []
         texts: list[str] = []
         for view in views:
@@ -1986,7 +1990,7 @@ class ManuscriptView(QWidget):
                 review_states.mark(item, review_states.NEEDS_CHECK)
             self.l1_list.setCurrentRow(-1)
             self.l1_list.blockSignals(False)
-        self.l1_list.setVisible(bool(rows))
+        self.l1_list.setVisible(bool(rows) and not unavailable)
         self._render_layer_overview()
         if self._covered_count or (state.results and self._issue_rows):
             # What Layer 1 covers decides which semantic issues are listed.
@@ -4979,7 +4983,10 @@ class ManuscriptView(QWidget):
         return {
             "draft": draft, "latest": latest, "previous": previous, "currency": currency,
             "choices": payload["choices"],
-            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest),
+            # This session's own choices (an ambiguous name adopted or marked an
+            # ordinary word) are the ones a document check sends.
+            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest,
+                                                own=self._controller.is_session_choice),
             "comparison": mdr.compare_reports(previous, latest) if latest and previous else None,
             "semantic": semantic_part, "segment_terms": segment_terms,
             "segment_choice_history": len(payload.get("segment_choice_history") or []),
