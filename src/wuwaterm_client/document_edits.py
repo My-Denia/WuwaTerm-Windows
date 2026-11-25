@@ -194,6 +194,54 @@ class EditHistory:
         return bool(self.redo)
 
 
+def compute_minimal_splice(before: str, after: str) -> tuple[int, int, int] | None:
+    """Minimal ``(start, end, replacement_len)`` scalar splice transforming ``before`` to ``after``."""
+    if before == after:
+        return None
+    prefix = 0
+    limit = min(len(before), len(after))
+    while prefix < limit and before[prefix] == after[prefix]:
+        prefix += 1
+    suffix = 0
+    rem_before = len(before) - prefix
+    rem_after = len(after) - prefix
+    while suffix < rem_before and suffix < rem_after and before[len(before) - 1 - suffix] == after[len(after) - 1 - suffix]:
+        suffix += 1
+    return prefix, len(before) - suffix, len(after) - suffix - prefix
+
+
+def _remap_span_after_splice(
+    span: dict[str, Any],
+    new_text: str,
+    start: int,
+    end: int,
+    delta: int,
+    *,
+    allow_empty: bool,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Remap one alignment span after splicing ``[start:end]`` by ``delta`` scalars.
+
+    Returns ``(ok, mapped_span)``. ``ok`` is ``False`` when the splice crosses
+    a span boundary, goes out of bounds, or empties a non-nullable span.
+    """
+    ss, se = int(span["start"]), int(span["end"])
+    if se <= start:
+        return True, copy.deepcopy(span)
+    if ss >= end:
+        ns, ne = ss + delta, se + delta
+        if ns < 0 or ne > len(new_text) or ne <= ns:
+            return False, None
+        return True, {"start": ns, "end": ne, "text": new_text[ns:ne]}
+    if ss <= start and end <= se:
+        ne = se + delta
+        if ne <= ss:
+            return (True, None) if allow_empty else (False, None)
+        if ne > len(new_text):
+            return False, None
+        return True, {"start": ss, "end": ne, "text": new_text[ss:ne]}
+    return False, None
+
+
 def remap_alignments_for_target_splice(
     alignments: list[dict[str, Any]] | None,
     source: str,
@@ -246,18 +294,51 @@ def remap_alignments_for_target_splice(
             else:
                 new_t = None
         else:
-            ts, te = int(t_span["start"]), int(t_span["end"])
-            if te <= start:
-                new_t = copy.deepcopy(t_span)
-            elif ts >= end:
-                ns, ne = ts + delta, te + delta
-                new_t = {"start": ns, "end": ne, "text": next_target[ns:ne]}
-            elif ts <= start and end <= te:
-                ne = te + delta
-                new_t = None if ne <= ts else {"start": ts, "end": ne, "text": next_target[ts:ne]}
-            else:
+            ok, new_t = _remap_span_after_splice(t_span, next_target, start, end, delta, allow_empty=True)
+            if not ok:
                 return []
         remapped.append({"source": s_span, "target": new_t})
     if fill_source_span is not None and matched_fills != 1:
         return []
     return remapped if manuscript._alignments(remapped, source, next_target) else []
+
+
+def remap_alignments_for_side_edit(
+    alignments: list[dict[str, Any]] | None,
+    side: str,
+    old_source: str,
+    old_target: str,
+    new_source: str,
+    new_target: str,
+    edit: tuple[int, int, int] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Remap explicit ``alignments`` after editing either ``source`` or ``target``.
+
+    Uses ``edit`` (``(start, end, replacement_len)``) when available or derives
+    the minimal splice between the old and new side text. Preserves ``None`` and
+    ``[]``, shifts trailing spans, resizes enclosing spans, and falls back to
+    ``[]`` on boundary-crossing edits, empty source collapse, or invalid result.
+    """
+    if alignments is None:
+        return None
+    if not alignments:
+        return []
+    if side not in ("source", "target"):
+        return []
+    before_text = old_source if side == "source" else old_target
+    after_text = new_source if side == "source" else new_target
+    splice = edit if edit is not None else compute_minimal_splice(before_text, after_text)
+    if splice is None:
+        copied = copy.deepcopy(alignments)
+        return copied if manuscript._alignments(copied, new_source, new_target) else []
+    start, end, replacement_len = splice
+    if side == "target":
+        return remap_alignments_for_target_splice(alignments, new_source, new_target, start, end, replacement_len)
+    delta = replacement_len - (end - start)
+    remapped: list[dict[str, Any]] = []
+    for region in alignments:
+        ok, new_s = _remap_span_after_splice(region["source"], new_source, start, end, delta, allow_empty=False)
+        if not ok or new_s is None:
+            return []
+        remapped.append({"source": new_s, "target": copy.deepcopy(region["target"])})
+    return remapped if manuscript._alignments(remapped, new_source, new_target) else []

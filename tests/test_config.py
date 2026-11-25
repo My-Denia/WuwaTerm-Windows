@@ -213,3 +213,8 @@ def test_an_address_the_client_itself_cannot_parse_is_refused() -> None:
     """
     assert not usable_base_url("https://\texample.invalid")
     assert not usable_base_url("https://exa\nmple.invalid")
+
+
+def test_default_translate_timeout_exceeds_core_request_budget() -> None:
+    """Client translate timeout leaves headroom above Core's 90 s request budget."""
+    assert DEFAULT_TRANSLATE_TIMEOUT_SECONDS == 100.0

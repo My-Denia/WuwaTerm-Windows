@@ -39,7 +39,7 @@ from ..document_controller import (
 from ..document_edits import (
     REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
     CommandOutcome, EditOutcome, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
-    remap_alignments_for_target_splice,
+    remap_alignments_for_side_edit, remap_alignments_for_target_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
@@ -883,13 +883,14 @@ class ManuscriptView(QWidget):
             (self.new_button, "file-plus", strings.MANUSCRIPT_NEW),
             (self.open_button, "folder-open", strings.MANUSCRIPT_OPEN),
             (self.save_button, "save", strings.MANUSCRIPT_SAVE),
-            (self.save_as_button, "save", strings.MANUSCRIPT_SAVE_AS),
+            (self.save_as_button, "save-all", strings.MANUSCRIPT_SAVE_AS),
             (self.undo_button, "undo-2", strings.MANUSCRIPT_UNDO),
             (self.redo_button, "redo-2", strings.MANUSCRIPT_REDO),
         ):
             button.setObjectName("commandButton")
             button.setText("")
             button.setIcon(icon(name))
+            button.setProperty("iconName", name)
             button.setIconSize(QSize(18, 18))
             button.setFixedWidth(34)
             button.setToolTip(description)
@@ -1716,6 +1717,7 @@ class ManuscriptView(QWidget):
             return
         current = self._current_issue()
         rows = sorted(self._session.issues(), key=lambda issue: (
+            0 if self._issue_state(issue) in sessions.UNHANDLED else 1,
             issue.segment_index,
             (issue.source_span or issue.target_span or {"start": 0})["start"]))
         same = len(rows) == len(self._issue_rows) and all(a is b for a, b in zip(rows, self._issue_rows))
@@ -2867,8 +2869,26 @@ class ManuscriptView(QWidget):
             if isinstance(term, str) and term:
                 self.lookup_requested.emit(term)
 
+    def _sync_primary_cta(self) -> None:
+        translate_primary = not _blank(self._payload["source"]) and _blank(self._payload["target"])
+        changed = False
+        for button, target_name in (
+            (self.translate_button, "primaryButton" if translate_primary else "commandButton"),
+            (self.review_button, "commandButton" if translate_primary else "primaryButton"),
+        ):
+            if button.objectName() != target_name:
+                button.setObjectName(target_name)
+                button.style().unpolish(button)
+                button.style().polish(button)
+                changed = True
+        if changed:
+            icon_color = "accent-fg" if translate_primary else ""
+            self.translate_button.setIcon(icon("languages", icon_color or None))
+            self.translate_button.setProperty("iconColor", icon_color)
+
     def _update_controls(self) -> None:
         self._sync_translation()
+        self._sync_primary_cta()
         busy = self._busy()
         composing = self.source_edit._ime_active or self.target_edit._ime_active
         # Long manuscripts are reviewed per segmentation-v1 pair, so any
@@ -3190,11 +3210,12 @@ class ManuscriptView(QWidget):
     def _on_edit(self, *_args, edit: tuple | None = None) -> None:
         if self._updating:
             return
+        before = self._draft_snapshot()
         value = self._draft_snapshot()
         value["source"] = self.source_edit.raw_text()
         value["target"] = self.target_edit.raw_text()
         value["direction"] = self.direction_combo.currentData()
-        if value == self._draft_snapshot():
+        if value == before:
             if edit is not None:
                 # Text rewritten with identical text: still an edit of that range.
                 self._controller.note_edit(edit)
@@ -3202,10 +3223,34 @@ class ManuscriptView(QWidget):
                 self._update_controls()
             return
         if value["alignments"] is not None:
-            recheck = self._records_with_input_change([])
-            value["alignments"] = []
-            self.status_label.setText(strings.MANUSCRIPT_ALIGNMENTS_CLEARED + (
-                strings.MANUSCRIPT_TERM_RECHECK_COUNT.format(count=recheck) if recheck else ""))
+            before_alignments = value["alignments"]
+            if edit is not None and edit[0] in ("source", "target"):
+                remapped = remap_alignments_for_side_edit(
+                    before_alignments,
+                    edit[0],
+                    before["source"],
+                    before["target"],
+                    value["source"],
+                    value["target"],
+                    edit=edit[1:],
+                )
+            elif value["source"] != before["source"] or value["target"] != before["target"]:
+                remapped = before_alignments
+                if value["source"] != before["source"]:
+                    remapped = remap_alignments_for_side_edit(
+                        remapped, "source", before["source"], before["target"], value["source"], before["target"]
+                    )
+                if value["target"] != before["target"]:
+                    remapped = remap_alignments_for_side_edit(
+                        remapped, "target", value["source"], before["target"], value["source"], value["target"]
+                    )
+            else:
+                remapped = []
+            value["alignments"] = remapped
+            if before_alignments and not remapped:
+                recheck = self._records_with_input_change(remapped)
+                self.status_label.setText(strings.MANUSCRIPT_ALIGNMENTS_CLEARED + (
+                    strings.MANUSCRIPT_TERM_RECHECK_COUNT.format(count=recheck) if recheck else ""))
         self._apply_edit(value, editors_already_updated=True, edits=[edit] if edit is not None else None)
 
     def _start_review(self) -> None:
@@ -4078,9 +4123,12 @@ class ManuscriptView(QWidget):
         if value[side] == text:
             self.status_label.setText(strings.IMPORT_UNCHANGED)
             return False
+        before_source, before_target = value["source"], value["target"]
         value[side] = text
         if value["alignments"] is not None:
-            value["alignments"] = []
+            value["alignments"] = remap_alignments_for_side_edit(
+                value["alignments"], side, before_source, before_target, value["source"], value["target"]
+            )
         self._apply_edit(value)
         self.status_label.setText(strings.IMPORT_REPLACED[side])
         return True

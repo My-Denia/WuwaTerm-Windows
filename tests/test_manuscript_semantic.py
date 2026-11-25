@@ -249,8 +249,8 @@ def test_accept_advances_and_undo_redo_restore_text_and_decision(qapp) -> None:
         [decision] = view._payload["semantic_decisions"]
         assert (decision["decision"], decision["applied_text"]) == ("accepted", "third")
         assert decision["target_revision"] == digest(TARGET)
-        # Automatically on to the next issue still waiting for a decision.
-        assert view.semantic_list.currentRow() == 1
+        # Pending-first queue keeps the remaining undecided issue at row 0.
+        assert view.semantic_list.currentRow() == 0
         assert view.target_edit.textCursor().selectedText() == "will leave"
         review_state = view._review_state
         view.ignore_button.click()
@@ -263,7 +263,7 @@ def test_accept_advances_and_undo_redo_restore_text_and_decision(qapp) -> None:
         assert states == ["pending", "pending"]
         view._redo_edit()
         assert view._payload["target"] == accepted
-        assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "pending"]
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "accepted"]
     asyncio.run(scenario())
 
 
@@ -712,7 +712,7 @@ def test_deciding_one_identical_occurrence_leaves_the_others_pending(qapp) -> No
         view._show_track(TRACK_SEMANTIC)
         view.semantic_list.setCurrentRow(0)
         view.ignore_button.click()
-        assert [view._issue_state(i) for i in view._issue_rows] == ["ignored", "pending", "pending"]
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "pending", "ignored"]
         view.semantic_list.setCurrentRow(1)
         view.ignore_button.click()
         assert len(view._decisions()) == 2, "two occurrences, two decisions"
@@ -1234,7 +1234,7 @@ def test_accepting_one_issue_leaves_the_other_issues_of_its_segment_executable(q
         view._show_track(TRACK_SEMANTIC)
         view.semantic_list.setCurrentRow(0)
         view.accept_button.click()
-        assert view.semantic_list.currentRow() == 1
+        assert view.semantic_list.currentRow() == 0
         assert view.accept_button.isEnabled() and view.adjust_button.isEnabled()
         view.accept_button.click()
         both = TARGET.replace("second", "third").replace("will leave", "will not leave")
@@ -1242,8 +1242,8 @@ def test_accepting_one_issue_leaves_the_other_issues_of_its_segment_executable(q
         assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "accepted"]
         view._undo_replace()
         assert view._payload["target"] == TARGET.replace("second", "third")
-        assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "pending"]
-        view.semantic_list.setCurrentRow(1)
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "accepted"]
+        view.semantic_list.setCurrentRow(0)
         assert view.accept_button.isEnabled()
         view._undo_replace()
         assert view._payload["target"] == TARGET

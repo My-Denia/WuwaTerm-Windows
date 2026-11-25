@@ -277,3 +277,28 @@ def test_integral_float_alignment_offsets_are_read_as_int() -> None:
     with pytest.raises(manuscript.WorkfileError) as error:
         manuscript.parse_workfile(json.dumps(bad))
     assert error.value.code == "workfile_invalid_content"
+
+
+def test_pure_remap_alignments_for_side_edit_without_qt() -> None:
+    from wuwaterm_client.document_edits import remap_alignments_for_side_edit
+
+    old_source, old_target = "Alpha. Beta.", "甲。 乙。"
+    alignments = [
+        {"source": {"start": 0, "end": 6, "text": "Alpha."}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+        {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+    ]
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, "00 " + old_source, old_target,
+    ) == [
+        {"source": {"start": 3, "end": 9, "text": "Alpha."}, "target": {"start": 0, "end": 2, "text": "甲。"}},
+        {"source": {"start": 10, "end": 15, "text": "Beta."}, "target": {"start": 3, "end": 5, "text": "乙。"}},
+    ]
+    assert remap_alignments_for_side_edit(
+        alignments, "target", old_source, old_target, old_source, "Alpha " + old_target,
+    ) == [
+        {"source": {"start": 0, "end": 6, "text": "Alpha."}, "target": {"start": 6, "end": 8, "text": "甲。"}},
+        {"source": {"start": 7, "end": 12, "text": "Beta."}, "target": {"start": 9, "end": 11, "text": "乙。"}},
+    ]
+    assert remap_alignments_for_side_edit(
+        alignments, "source", old_source, old_target, "Alphata.", old_target,
+    ) == []
