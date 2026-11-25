@@ -58,7 +58,8 @@ from . import semantic_session as sessions
 from .document_edits import (
     HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome, PART_KEYS,
     REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
-    REVIEW_KEYS, copy_payload, draft_of, merge_draft, normalize_semantic, restore_draft_into,
+    REVIEW_KEYS, copy_payload, draft_of, merge_draft, normalize_semantic, remap_alignments_for_target_splice,
+    restore_draft_into,
 )
 from .errors import (
     ERROR_CANCELLED, ERROR_FORBIDDEN, ERROR_INSECURE_ENDPOINT, ERROR_INVALID_REQUEST,
@@ -70,8 +71,8 @@ from .manuscript import (
     empty_workfile, semantic_payload_fits, serialize_workfile,
 )
 from .segmentation import (
-    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE, pair_is_sendable,
-    pair_segments, segment_text,
+    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
+    _core as seg_core, _paragraph_ranges as seg_paragraph_ranges, pair_is_sendable, pair_segments, segment_text,
 )
 
 # The whole-manuscript term review keeps its historical request shape; above
@@ -122,6 +123,13 @@ class Translation:
     count: int = 0
     previous: tuple[str, str] | None = None
     out: list[str] = field(default_factory=list)
+    append_start: int | None = None
+    append_prefix: str = ""
+    source_base: int = 0
+    retranslate: bool = False
+    batch_remaining: list[tuple[int, int]] = field(default_factory=list)
+    batch_total: int = 0
+    batch_done: int = 0
 
 
 class TranslationResponse(Protocol):
@@ -230,7 +238,13 @@ class WorkbenchHost(Protocol):
     def selected_segment(self):
         """The segment the owner has selected, as a pair, or None."""
 
-    def apply_target_write(self, changed: str, edit: tuple) -> bool:
+    def apply_target_write(
+        self,
+        changed: str,
+        edit: tuple,
+        *,
+        alignments: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Write finished translation pieces as one undoable edit.
 
         False when the editor cannot display ``changed``; nothing is committed
@@ -293,6 +307,7 @@ class DocumentRunController:
         self.translate_state = TRANSLATION_IDLE
         self.translate_run: Translation | None = None
         self.translate_status = ""
+        self.translation_withdrawn = False
 
     # -- document state the view reads while rendering -----------------------
     def decisions(self) -> list[dict]:
@@ -633,7 +648,12 @@ class DocumentRunController:
         value["semantic_decisions"] = decisions
         if target is not None:
             value["target"] = target
-            if value["alignments"] is not None:
+            if replaced is not None:
+                value["alignments"] = remap_alignments_for_target_splice(
+                    value["alignments"], value["source"], target,
+                    replaced["start"], replaced["end"], len(applied_text or ""),
+                )
+            elif value["alignments"] is not None:
                 value["alignments"] = []
         candidate = copy_payload(self.payload)
         candidate.update(copy_payload(value))
@@ -1107,6 +1127,48 @@ class DocumentRunController:
                 and payload["target"] == run.target)
         return run if same else None
 
+    def clear_history(self) -> None:
+        self.history.clear()
+        self.translation_withdrawn = False
+
+    def resumable_partial_prefix(self) -> tuple[int, str, int, str, tuple[str, str]] | None:
+        """For an unaligned, multi-segment partial-prefix manuscript, return
+        ``(tail_start, tail_text, append_start, append_prefix, before_pair)``."""
+        payload = self.payload
+        source, target = payload["source"], payload["target"]
+        if payload["alignments"] is not None or blank(source) or blank(target):
+            return None
+        if len(segment_text(source)) < 2:
+            return None
+        if any(p.status == STATUS_UNTRANSLATED for p in self.current_pairs()):
+            return None
+        s_paras = seg_paragraph_ranges(source)
+        t_paras = seg_paragraph_ranges(target)
+        if not (1 <= len(t_paras) < len(s_paras)):
+            return None
+        prefix_count = len(t_paras)
+        tail_start = s_paras[prefix_count][0]
+        tail_text = source[tail_start:]
+        s_prev_cs, s_prev_ce = seg_core(source, *s_paras[prefix_count - 1])
+        t_last_cs, t_last_ce = seg_core(target, *t_paras[-1])
+        sep = source[s_prev_ce:tail_start]
+        if target[t_last_ce:] == sep:
+            append_start = len(target)
+            append_prefix = ""
+        else:
+            append_start = t_last_ce
+            append_prefix = sep
+        before_pair = (source[s_prev_cs:s_prev_ce], target[t_last_cs:t_last_ce])
+        return tail_start, tail_text, append_start, append_prefix, before_pair
+
+    def has_resumable_remainder(self) -> bool:
+        """Whether a non-blank manuscript has remaining untranslated paragraphs to resume."""
+        if self.translation_withdrawn or blank(self.payload["source"]) or blank(self.payload["target"]):
+            return False
+        if any(p.status == STATUS_UNTRANSLATED for p in self.current_pairs()):
+            return True
+        return self.resumable_partial_prefix() is not None
+
     def withdraw_translation_offer(self) -> str | None:
         """An edit, undo or redo withdraws the offer to continue.
 
@@ -1116,6 +1178,7 @@ class DocumentRunController:
         if self.translate_state in TRANSLATION_RESUMABLE and self.resumable() is None:
             previous = self.translate_status
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+            self.translation_withdrawn = True
             return previous
         return None
 
@@ -1131,40 +1194,279 @@ class DocumentRunController:
         self.host.refresh_segments_if_shown()
         self.host.update_controls()
 
-    def start_translation(self) -> None:
-        """Translate a blank translation or one untranslated segment; never
-        overwrite text the owner already has. After a pause or a failure the
-        same press continues from the first unfinished piece."""
+    def _adjacent_before_context(self, pairs: list, target_pair) -> tuple[str, str] | None:
+        idx = pairs.index(target_pair)
+        source, target = self.payload["source"], self.payload["target"]
+        for prev in reversed(pairs[:idx]):
+            if prev.status == STATUS_READY and prev.target.core_end > prev.target.core_start:
+                return (
+                    source[prev.source.core_start:prev.source.core_end],
+                    target[prev.target.core_start:prev.target.core_end],
+                )
+        return None
+
+    def start_translation(self, *, single_segment: bool = False) -> None:
+        """Translate a blank target, resume remaining untranslated paragraphs,
+        or translate/re-translate one segment without overwriting finished work."""
         payload = self.payload
         source, target, direction = payload["source"], payload["target"], payload["direction"]
         cursor = self.resumable()
         pair = None
         if cursor is not None and cursor.segment is not None:
+            wanted = STATUS_READY if cursor.retranslate else STATUS_UNTRANSLATED
             pair = next((p for p in self.current_pairs()
-                         if p.status == STATUS_UNTRANSLATED and p.source.core_start == cursor.segment), None)
+                         if p.status == wanted and p.source.core_start == cursor.segment), None)
             if pair is None:
                 cursor = None
-        if cursor is None and not blank(target):
-            pair = self.host.selected_segment()
-            if pair is None or pair.status != STATUS_UNTRANSLATED:
-                self.host.report_status(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
-                return
+
+        partial_tail = None
+        batch_spans: list[tuple[int, int]] = []
+        retranslate_pair = None
+        if cursor is None and blank(target):
+            self.translation_withdrawn = False
+        elif cursor is None:
+            selected = self.host.selected_segment()
+            pairs = self.current_pairs()
+            if single_segment:
+                if selected is not None and selected.status == STATUS_UNTRANSLATED:
+                    pair = selected
+                elif (
+                    selected is not None
+                    and selected.status == STATUS_READY
+                    and not selected.hard_cut
+                    and 0 < selected.source.core_end - selected.source.core_start <= SEGMENT_LIMIT
+                ):
+                    retranslate_pair = selected
+                else:
+                    self.host.report_status(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
+                    return
+            else:
+                if self.translation_withdrawn:
+                    self.host.report_status(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
+                    return
+                untranslated = [p for p in pairs if p.status == STATUS_UNTRANSLATED]
+                if untranslated:
+                    pair = untranslated[0]
+                    batch_spans = [(p.source.core_start, p.source.core_end) for p in untranslated]
+                else:
+                    partial_tail = self.resumable_partial_prefix()
+                    if partial_tail is None:
+                        self.host.report_status(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
+                        return
+
+        if retranslate_pair is not None:
+            self._launch_retranslate(retranslate_pair)
+            return
+
         retry = cursor is not None and self.translate_state == "failed"
         self.stop_translation()
-        # A new record, so the ended task's callback never sees this run's identity.
-        # A single-segment run carries its unwritten pieces (``out``) along.
-        fresh = {"generation": self.translate_generation, "retry": retry,
-                 "out": [] if cursor is None else list(cursor.out)}
-        run = replace(cursor, **fresh) if cursor is not None else Translation(
-            source=source, direction=direction, target=target,
-            segment=None if pair is None else pair.source.core_start, **fresh)
+        self.translation_withdrawn = False
+        if cursor is not None and cursor.batch_remaining:
+            self._launch_batch_untranslated(cursor, retry=retry)
+            return
+        if batch_spans:
+            initial = Translation(
+                generation=self.translate_generation,
+                source=source,
+                direction=direction,
+                target=target,
+                segment=batch_spans[0][0],
+                batch_remaining=list(batch_spans),
+                batch_total=len(batch_spans),
+                batch_done=0,
+            )
+            self._launch_batch_untranslated(initial, retry=False)
+            return
+
+        if cursor is not None:
+            fresh = {"generation": self.translate_generation, "retry": retry, "out": list(cursor.out)}
+            run = replace(cursor, **fresh)
+            text = (
+                source[run.source_base:] if run.source_base
+                else (source if pair is None else source[pair.source.core_start:pair.source.core_end])
+            )
+            pieces = segment_text(text, SEGMENT_LIMIT)
+            self.translate_run, self.translate_state = run, "retrying" if retry else "waiting"
+            self.translate_task = asyncio.ensure_future(self.run_translation(run, pair, text, pieces))
+            self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
+            self._translation_ui()
+            return
+
+        if partial_tail is not None:
+            tail_start, tail_text, append_start, append_prefix, before_pair = partial_tail
+            pieces = segment_text(tail_text, SEGMENT_LIMIT)
+            run = Translation(
+                generation=self.translate_generation,
+                source=source,
+                direction=direction,
+                target=target,
+                previous=before_pair,
+                append_start=append_start,
+                append_prefix=append_prefix,
+                source_base=tail_start,
+                count=sum(1 for p in pieces if p.core_end > p.core_start),
+            )
+            self.translate_run, self.translate_state = run, "waiting"
+            self.translate_task = asyncio.ensure_future(self.run_translation(run, None, tail_text, pieces))
+            self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
+            self._translation_ui()
+            return
+
+        run = Translation(
+            generation=self.translate_generation,
+            source=source,
+            direction=direction,
+            target=target,
+            segment=None if pair is None else pair.source.core_start,
+            previous=self._adjacent_before_context(self.current_pairs(), pair) if pair is not None else None,
+        )
         text = source if pair is None else source[pair.source.core_start:pair.source.core_end]
         pieces = segment_text(text, SEGMENT_LIMIT)
         run.count = sum(1 for piece in pieces if piece.core_end > piece.core_start)
-        self.translate_run, self.translate_state = run, "retrying" if retry else "waiting"
+        self.translate_run, self.translate_state = run, "waiting"
         self.translate_task = asyncio.ensure_future(self.run_translation(run, pair, text, pieces))
         self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
         self._translation_ui()
+
+    def _launch_retranslate(self, pair) -> None:
+        self.stop_translation()
+        self.translation_withdrawn = False
+        payload = self.payload
+        source, target, direction = payload["source"], payload["target"], payload["direction"]
+        text = source[pair.source.core_start:pair.source.core_end]
+        pieces = segment_text(text, SEGMENT_LIMIT)
+        run = Translation(
+            generation=self.translate_generation,
+            source=source,
+            direction=direction,
+            target=target,
+            segment=pair.source.core_start,
+            retranslate=True,
+            previous=self._adjacent_before_context(self.current_pairs(), pair),
+            count=sum(1 for piece in pieces if piece.core_end > piece.core_start),
+        )
+        self.translate_run, self.translate_state = run, "waiting"
+        self.translate_task = asyncio.ensure_future(self.run_translation(run, pair, text, pieces))
+        self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
+        self._translation_ui()
+
+    def retranslate_segment(self, pair=None) -> None:
+        """Translate a single ready segment again and replace only its core span."""
+        target_pair = pair if pair is not None else self.host.selected_segment()
+        if (
+            target_pair is None
+            or target_pair.status != STATUS_READY
+            or target_pair.hard_cut
+            or not (0 < target_pair.source.core_end - target_pair.source.core_start <= SEGMENT_LIMIT)
+        ):
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_ONLY_BLANK)
+            return
+        self._launch_retranslate(target_pair)
+
+    def _launch_batch_untranslated(self, base_run: Translation, *, retry: bool) -> None:
+        run = Translation(
+            generation=self.translate_generation,
+            source=self.payload["source"],
+            direction=self.payload["direction"],
+            target=self.payload["target"],
+            segment=base_run.batch_remaining[0][0],
+            retry=retry,
+            previous=base_run.previous,
+            batch_remaining=list(base_run.batch_remaining),
+            batch_total=base_run.batch_total or len(base_run.batch_remaining),
+            batch_done=base_run.batch_done,
+        )
+        self.translate_run, self.translate_state = run, "retrying" if retry else "waiting"
+        self.translate_task = asyncio.ensure_future(self.run_batch_untranslated(run))
+        self.translate_task.add_done_callback(lambda _task: self.translation_done(run))
+        self._translation_ui()
+
+    async def run_batch_untranslated(self, run: Translation) -> None:
+        generation = run.generation
+        try:
+            self.capabilities = await self.api_client.get_capabilities()
+            context_on = semantic.CAPABILITY_TRANSLATION_CONTEXT in self.capabilities
+            candidates = (sessions.precedent_candidates(self.payload, self.current_pairs())
+                          if context_on and self.host.precedents_selected() else [])
+            template = strings.MANUSCRIPT_TRANSLATE_RETRYING if run.retry else strings.MANUSCRIPT_TRANSLATING
+            while run.batch_remaining:
+                core_start, _core_end = run.batch_remaining[0]
+                pairs = self.current_pairs()
+                pair = next(
+                    (p for p in pairs if p.status == STATUS_UNTRANSLATED and p.source.core_start == core_start),
+                    None,
+                )
+                if pair is None:
+                    run.batch_remaining.pop(0)
+                    continue
+                ctx_previous = self._adjacent_before_context(pairs, pair)
+                pair_source = run.source[pair.source.core_start:pair.source.core_end]
+                pieces = segment_text(pair_source, SEGMENT_LIMIT)
+                self.host.report_status(template.format(index=run.batch_done + 1, total=run.batch_total))
+                translated_parts: list[str] = []
+                for piece in pieces:
+                    core = pair_source[piece.core_start:piece.core_end]
+                    if not core:
+                        translated_parts.append(pair_source[piece.start:piece.end])
+                        continue
+                    context = None
+                    if context_on:
+                        before = semantic.context_before(*ctx_previous) if ctx_previous is not None else None
+                        precedents = semantic.select_precedents(
+                            candidates, core, pair.source.core_start + piece.core_start
+                        )
+                        context = {**({"before": before} if before is not None else {}),
+                                   **({"precedents": precedents} if precedents else {})} or None
+                    result = await self.api_client.translate(core, to=run.direction, context=context)
+                    if generation != self.translate_generation:
+                        return
+                    translated_parts.append(
+                        pair_source[piece.start:piece.core_start] + result.text + pair_source[piece.core_end:piece.end]
+                    )
+                    ctx_previous = (core, result.text)
+                if generation != self.translate_generation:
+                    return
+                if not self.translation_basis_unchanged(run):
+                    self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+                    self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+                    self._translation_ui()
+                    return
+                if not self.write_translation(run, "".join(translated_parts), pair):
+                    self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+                    self.host.report_status(strings.MANUSCRIPT_EDIT_REJECTED)
+                    self._translation_ui()
+                    return
+                run.previous = ctx_previous
+                run.target = self.payload["target"]
+                run.source = self.payload["source"]
+                run.batch_remaining.pop(0)
+                run.batch_done += 1
+                run.done = run.batch_done
+                run.count = run.batch_total
+                run.segment = run.batch_remaining[0][0] if run.batch_remaining else None
+                run.written = True
+                run.retry = False
+        except ClientError as exc:
+            if generation == self.translate_generation:
+                run.done = run.batch_done
+                run.count = run.batch_total
+                if exc.code == ERROR_CANCELLED:
+                    self.translation_stopped(run, "paused")
+                else:
+                    self.translation_stopped(
+                        run,
+                        "paused" if exc.code in QUOTA_CODES else "failed",
+                        exc.message,
+                        quota=exc.code in QUOTA_CODES,
+                    )
+            return
+        if generation != self.translate_generation:
+            return
+        self.translate_task = None
+        self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+        mismatched = sum(1 for p in self.current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT)
+        self.host.report_translation_complete(mismatched)
+        self.host.refresh_segments_if_shown()
 
     def translation_done(self, run: Translation) -> None:
         """A task that ended without an outcome (an unexpected error) is a failure."""
@@ -1174,7 +1476,7 @@ class DocumentRunController:
 
     async def run_translation(self, run: Translation, pair, text: str, pieces: list) -> None:
         generation = run.generation
-        base = 0 if pair is None else pair.source.core_start
+        base = run.source_base if pair is None else pair.source.core_start
         try:
             # Capabilities are part of the basis: probe again, never reuse.
             self.capabilities = await self.api_client.get_capabilities()
@@ -1226,6 +1528,8 @@ class DocumentRunController:
         self.translate_run, self.translate_state = None, TRANSLATION_IDLE
         mismatched = sum(1 for p in self.current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT)
         self.host.report_translation_complete(mismatched)
+        if run.retranslate and not mismatched:
+            self.host.report_status(strings.MANUSCRIPT_RETRANSLATED)
         # The rows carry the run's own verdict; it just ended.
         self.host.refresh_segments_if_shown()
 
@@ -1236,12 +1540,27 @@ class DocumentRunController:
 
     def write_translation(self, run: Translation, added: str, pair=None) -> bool:
         """Write finished pieces as one undoable edit; False if the editor
-        cannot show the result. Without ``pair`` they go to the whole target:
-        replacing the blank one, or appended to the part already written."""
+        cannot show the result."""
         target = run.target
+        current_alignments = self.payload["alignments"]
+        remapped = current_alignments
         if pair is None:
-            changed = (target if run.written else "") + added
-            edit = ("target", len(target) if run.written else 0, len(target), len(added))
+            if run.append_start is not None and not run.written:
+                inserted = run.append_prefix + added
+                changed = target[:run.append_start] + inserted
+                edit = ("target", run.append_start, len(target), len(inserted))
+            else:
+                start = len(target) if run.written else 0
+                changed = (target if run.written else "") + added
+                edit = ("target", start, len(target), len(added))
+            remapped = None if current_alignments is None else []
+        elif run.retranslate:
+            start, end = pair.target.core_start, pair.target.core_end
+            changed = target[:start] + added + target[end:]
+            edit = ("target", start, end, len(added))
+            remapped = remap_alignments_for_target_splice(
+                current_alignments, self.payload["source"], changed, start, end, len(added),
+            )
         else:
             position = pair.target.core_start
             left = "\n\n" if position > 0 and target[position - 1] not in WHITESPACE else ""
@@ -1249,25 +1568,34 @@ class DocumentRunController:
             inserted = left + added + right
             changed = target[:position] + inserted + target[position:]
             edit = ("target", position, position, len(inserted))
-        return self.host.apply_target_write(changed, edit)
+            fill_start = position + len(left)
+            fill_end = fill_start + len(added)
+            remapped = remap_alignments_for_target_splice(
+                current_alignments,
+                self.payload["source"],
+                changed,
+                position,
+                position,
+                len(inserted),
+                fill_source_span=(pair.source.core_start, pair.source.core_end),
+                fill_target_span=(fill_start, fill_end),
+                fill_pair_source_span=(pair.source.start, pair.source.end),
+            )
+        return self.host.apply_target_write(changed, edit, alignments=remapped)
 
     def translation_stopped(self, run: Translation, state: str, reason: str = "", *,
                             quota: bool = False) -> None:
         """The run ended before its last piece: the owner paused it, the
         service asked to wait, or a piece failed. The run stays as the cursor
-        for the next press. A whole-manuscript run writes what is finished as
-        one edit. A single-segment run keeps its finished pieces unwritten and
-        writes them all when the segment completes: writing part of it would
-        make the segment no longer untranslated, so the resume could not find
-        it again."""
+        for the next press."""
         self.translate_task = None
         if not self.translation_basis_unchanged(run):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE
             self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
             self._translation_ui()
             return
-        segment = run.segment is not None
-        if not segment:
+        segment = run.segment is not None and not run.batch_remaining
+        if not segment and not run.batch_remaining:
             kept = "".join(run.out)
             if kept:
                 if not self.write_translation(run, kept):
@@ -1276,6 +1604,9 @@ class DocumentRunController:
                     self._translation_ui()
                     return
                 run.target, run.written = self.payload["target"], True
+                if run.append_start is not None:
+                    run.append_start = None
+                    run.append_prefix = ""
             run.out = []
         if state == "failed":
             text = (strings.MANUSCRIPT_TRANSLATE_SEGMENT_FAILED if segment else strings.MANUSCRIPT_TRANSLATE_FAILED).format(

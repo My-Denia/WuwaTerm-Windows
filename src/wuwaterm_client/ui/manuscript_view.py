@@ -30,6 +30,7 @@ from .. import markdown_report as mdr
 from .. import segment_records as sr
 from .. import semantic, strings
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
+from .error_presentation import SEVERITY_INFO, SEVERITY_WARN
 from .. import semantic_session as sessions
 from ..document_controller import (
     DOCUMENT_REVIEW_LIMIT as _DOCUMENT_REVIEW_LIMIT, Translation as _Translation,
@@ -38,13 +39,15 @@ from ..document_controller import (
 from ..document_edits import (
     REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED, REASON_STALE,
     CommandOutcome, EditOutcome, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
+    remap_alignments_for_target_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
     parse_workfile, save_workfile, serialize_workfile,
 )
-from ..segmentation import STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
-from .components import ChevronComboBox
+from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
+from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
+from .components import Banner, ChevronComboBox
 from .icons import icon
 
 # Precedents (the owner's earlier choices in this manuscript) go with both
@@ -657,15 +660,22 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         view = self._view
         return view._current_segment() if view.track_stack.currentIndex() == TRACK_SEGMENTS else None
 
-    def apply_target_write(self, changed: str, edit: tuple) -> bool:
+    def apply_target_write(
+        self,
+        changed: str,
+        edit: tuple,
+        *,
+        alignments: list[dict] | None = None,
+    ) -> bool:
         view = self._view
         if not view.target_edit.can_display(changed):
             return False
         value = view._draft_snapshot()
         value["target"] = changed
         if value["alignments"] is not None:
-            value["alignments"] = []
+            value["alignments"] = [] if alignments is None else alignments
         view._apply_edit(value, edits=[edit])
+        view._save_recovery_snapshot()
         return True
 
 
@@ -680,8 +690,20 @@ class ManuscriptView(QWidget):
     documentSaved = Signal()
     documentOpened = Signal(str)
 
-    def __init__(self, api_client, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        api_client,
+        parent: QWidget | None = None,
+        *,
+        recovery_path: Path | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._recovery_path = recovery_path
+        self._recovery_pending = False
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.setInterval(1500)
+        self._recovery_timer.timeout.connect(self._save_recovery_snapshot)
         # The runs and the document state they commit to. Its host is
         # _WorkbenchHostAdapter below: it renders state and performs the one
         # edit a run cannot do itself.
@@ -881,6 +903,8 @@ class ManuscriptView(QWidget):
         self.inspector_button.clicked.connect(self._toggle_inspector)
         toolbar.addWidget(self.inspector_button)
         outer.addWidget(self.toolbar)
+        self.recovery_banner = Banner(self)
+        outer.addWidget(self.recovery_banner)
 
         self.editor_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.editor_splitter.setChildrenCollapsible(False)
@@ -1215,6 +1239,7 @@ class ManuscriptView(QWidget):
         self._build_shortcuts()
         self._render_issue(None)
         self._update_inspector_button()
+        self._check_startup_recovery()
         self._update_controls()
         self._guard_text_inputs()
 
@@ -1531,7 +1556,7 @@ class ManuscriptView(QWidget):
         self.translate_segment_button = QPushButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
         self.translate_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.translate_segment_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.translate_segment_button.clicked.connect(self._translate)
+        self.translate_segment_button.clicked.connect(self._translate_segment)
         layout.addWidget(self.translate_segment_button)
         layout.addStretch(1)
 
@@ -2088,7 +2113,12 @@ class ManuscriptView(QWidget):
                 hints.append(strings.MANUSCRIPT_SEGMENT_TERMS_TRUNCATED.format(
                     number=pair.index + 1, count=len(record["result"]["findings"])))
             self.segment_hint.setText("\n".join(hints))
-            self.translate_segment_button.setVisible(pair.status == STATUS_UNTRANSLATED)
+            can_retranslate = (
+                pair.status == STATUS_READY
+                and not pair.hard_cut
+                and 0 < pair.source.core_end - pair.source.core_start <= SEGMENT_LIMIT
+            )
+            self.translate_segment_button.setVisible(pair.status == STATUS_UNTRANSLATED or can_retranslate)
             self.translate_segment_button.setEnabled(self._translate_ready())
         finished = record is not None and pair.index in sr.parts_of(self._payload).progress["completed"]
         self.finish_button.setText(strings.MANUSCRIPT_SEGMENT_UNFINISH if finished else strings.MANUSCRIPT_SEGMENT_FINISH)
@@ -2097,6 +2127,7 @@ class ManuscriptView(QWidget):
         self.next_pending_button.setVisible(long)
         self._render_segment_choices(pair.index if record is not None else None)
         self._update_segment_actions()
+        self._render_translate_offer()
 
     def _render_segment_choices(self, index: int | None) -> None:
         """The segment's choices, then history choices that can come back to it.
@@ -2877,6 +2908,7 @@ class ManuscriptView(QWidget):
         self._update_tracks()
         self._update_semantic_actions()
         self._render_semantic_progress()
+        self._schedule_recovery_save()
 
     def _render_review_state(self) -> None:
         labels = {
@@ -2998,11 +3030,104 @@ class ManuscriptView(QWidget):
         """Drop the document review in flight; its answer is no longer wanted."""
         self._controller.cancel_pending()
 
-    def cancel_background_work(self) -> None:
+    def cancel_background_work(self, *, clear_recovery_draft: bool = False) -> None:
         """Stop every request this view started (window close)."""
+        self._recovery_timer.stop()
+        if clear_recovery_draft and not self._recovery_pending:
+            self._clear_recovery_draft()
         self._cancel_pending()
         self._stop_semantic()
         self._stop_translation()
+
+    @staticmethod
+    def _has_recovery_content(payload: dict) -> bool:
+        return any(bool(payload.get(k)) for k in ("source", "target", "choices", "history", "semantic_decisions"))
+
+    def _check_startup_recovery(self) -> None:
+        if self._recovery_path is None:
+            return
+        state = load_recovery(self._recovery_path)
+        if state.status == "valid" and state.payload is not None and self._has_recovery_content(state.payload):
+            self._recovery_pending = True
+            message = (
+                strings.RECOVERY_DRAFT_BANNER.format(time=state.saved_at)
+                if state.saved_at
+                else strings.RECOVERY_DRAFT_BANNER_NO_TIME
+            )
+            self.recovery_banner.show_message(
+                message,
+                SEVERITY_INFO,
+                actions=[
+                    (strings.RECOVERY_RESTORE_BUTTON, lambda s=state: self._restore_recovery_draft(s)),
+                    (strings.RECOVERY_DISCARD_BUTTON, self._discard_recovery_draft),
+                ],
+                closable=True,
+            )
+        elif state.status == "corrupt":
+            self._recovery_pending = True
+            self.recovery_banner.show_message(
+                strings.RECOVERY_DRAFT_CORRUPT_BANNER,
+                SEVERITY_WARN,
+                actions=[(strings.RECOVERY_DISCARD_BUTTON, self._discard_recovery_draft)],
+                closable=True,
+            )
+
+    def _restore_recovery_draft(self, state: RecoveryState) -> None:
+        if state.payload is None:
+            return
+        payload = _copy_payload(state.payload)
+        if not self.source_edit.can_display(payload["source"]) or not self.target_edit.can_display(payload["target"]):
+            self.status_label.setText(strings.MANUSCRIPT_UNSUPPORTED_TEXT)
+            return
+        self._recovery_pending = False
+        self.recovery_banner.clear()
+        self._replace_document(payload, (payload.get("progress") or {}).get("current"))
+        self._controller.reset_known_texts(payload)
+        self._path = Path(state.source_path) if state.source_path else None
+        self._records()
+        self._saved_payload = empty_workfile()
+        self._set_review_state("history" if payload["history"] else "none")
+        self._show_segment_term_report()
+        self.status_label.setText(strings.RECOVERY_RESTORED_STATUS)
+        self._update_controls()
+        self._save_recovery_snapshot()
+
+    def _discard_recovery_draft(self) -> None:
+        self._recovery_pending = False
+        self._recovery_timer.stop()
+        self._clear_recovery_draft()
+        self.recovery_banner.clear()
+
+    def _clear_recovery_draft(self) -> None:
+        if self._recovery_path is not None:
+            clear_recovery(self._recovery_path)
+
+    def _schedule_recovery_save(self) -> None:
+        if self._recovery_path is None:
+            return
+        if self.document_dirty and self._has_recovery_content(self._payload):
+            self._recovery_pending = False
+            if self.recovery_banner.is_showing():
+                self.recovery_banner.clear()
+            self._recovery_timer.start()
+        elif not self.document_dirty and not self._recovery_pending:
+            self._recovery_timer.stop()
+            self._clear_recovery_draft()
+
+    def _save_recovery_snapshot(self) -> None:
+        if self._recovery_path is None:
+            return
+        self._recovery_timer.stop()
+        if self.document_dirty and self._has_recovery_content(self._payload):
+            try:
+                snapshot = _copy_payload(self._payload)
+                if snapshot.get("semantic_decisions") or snapshot.get("semantic_history"):
+                    snapshot.setdefault("semantic_history", [])
+                    snapshot["semantic_texts"] = self._controller.semantic_texts(snapshot)
+                    _normalize_semantic(snapshot)
+                save_recovery(self._recovery_path, snapshot, source_path=self._path)
+            except (OSError, WorkfileError):
+                pass
 
     def _invalidate_report(self) -> None:
         previous = self._review_state
@@ -3258,26 +3383,39 @@ class ManuscriptView(QWidget):
         """Both translate buttons say what the next press does."""
         offer = {"paused": strings.MANUSCRIPT_TRANSLATE_CONTINUE,
                  "failed": strings.MANUSCRIPT_TRANSLATE_RETRY}.get(self._translate_state)
+        button_offer = offer or (
+            strings.MANUSCRIPT_TRANSLATE_RESUME if self._controller.has_resumable_remainder() else None
+        )
         button = self.translate_button
-        if button.text() != (offer or ""):
-            button.setText(offer or "")
-            if offer:
+        if button.text() != (button_offer or ""):
+            button.setText(button_offer or "")
+            if button_offer:
                 button.setMinimumWidth(0)
                 button.setMaximumWidth(16777215)  # Qt's QWIDGETSIZE_MAX: the icon button grows to fit its label
             else:
                 button.setFixedWidth(34)
-        button.setToolTip(f"{offer or strings.MANUSCRIPT_TRANSLATE}（Ctrl+Shift+T）")
-        button.setAccessibleName(offer or strings.MANUSCRIPT_TRANSLATE)
-        self.translate_segment_button.setText(offer or strings.MANUSCRIPT_TRANSLATE_SEGMENT)
+        button.setToolTip(f"{button_offer or strings.MANUSCRIPT_TRANSLATE}（Ctrl+Shift+T）")
+        button.setAccessibleName(button_offer or strings.MANUSCRIPT_TRANSLATE)
+        pair = self._current_segment()
+        segment_default = (
+            strings.MANUSCRIPT_RETRANSLATE_SEGMENT
+            if pair is not None and pair.status == STATUS_READY
+            else strings.MANUSCRIPT_TRANSLATE_SEGMENT
+        )
+        self.translate_segment_button.setText(offer or segment_default)
 
     def _translate(self) -> None:
-        """Translate a blank translation or one untranslated segment; never
-        overwrite text the owner already has. After a pause or a failure the
-        same press continues from the first unfinished piece (the run itself,
-        and what it resumes from, is DocumentRunController.start_translation)."""
+        """Translate a blank translation or resume remaining untranslated paragraphs;
+        never overwrite text the owner already has."""
         if not self._input_ready() or not self._translate_ready():
             return
         self._controller.start_translation()
+
+    def _translate_segment(self) -> None:
+        """Translate the selected untranslated segment or re-translate a ready one."""
+        if not self._input_ready() or not self._translate_ready():
+            return
+        self._controller.start_translation(single_segment=True)
 
     def _render_mismatch_prompt(self) -> None:
         if not self._mismatch_prompt_active:
@@ -3357,8 +3495,9 @@ class ManuscriptView(QWidget):
             return
         value = self._draft_snapshot()
         value["target"] = changed
-        if value["alignments"] is not None:
-            value["alignments"] = []
+        value["alignments"] = remap_alignments_for_target_splice(
+            value["alignments"], value["source"], changed, span["start"], span["end"], len(replacement)
+        )
         self._apply_edit(value, edits=[("target", span["start"], span["end"], len(replacement))])
         self.status_label.setText(strings.MANUSCRIPT_REPLACED)
         self._update_controls()
@@ -3521,6 +3660,10 @@ class ManuscriptView(QWidget):
                 self._payload.pop(key, None)
         self._path = path
         self._saved_payload = _copy_payload(self._payload)
+        self._recovery_pending = False
+        self._recovery_timer.stop()
+        self._clear_recovery_draft()
+        self.recovery_banner.clear()
         self.status_label.setText(strings.MANUSCRIPT_SAVE_DONE)
         self._update_controls()
         self.documentSaved.emit()
@@ -3569,6 +3712,10 @@ class ManuscriptView(QWidget):
         # mapped now, before the baseline, so opening never looks edited.
         self._records()
         self._saved_payload = _copy_payload(self._payload)
+        self._recovery_pending = False
+        self._recovery_timer.stop()
+        self._clear_recovery_draft()
+        self.recovery_banner.clear()
         self._set_review_state("history" if value["history"] else "none")
         # Saved segment results show as saved: nothing is sent until a review.
         self._show_segment_term_report()
@@ -3585,6 +3732,10 @@ class ManuscriptView(QWidget):
         self._controller.reset_known_texts()
         self._saved_payload = _copy_payload(value)
         self._path = None
+        self._recovery_pending = False
+        self._recovery_timer.stop()
+        self._clear_recovery_draft()
+        self.recovery_banner.clear()
         self._set_review_state("none")
         self._update_controls()
         return True

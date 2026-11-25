@@ -246,11 +246,13 @@ class StubHost:
     def selected_segment(self):
         return self.segment
 
-    def apply_target_write(self, changed: str, edit: tuple) -> bool:
+    def apply_target_write(self, changed: str, edit: tuple, *, alignments=None) -> bool:
         if self.refuse_write:
             return False
         self.writes.append((changed, edit))
         self.controller.payload["target"] = changed
+        if alignments is not None or self.controller.payload.get("alignments") is not None:
+            self.controller.payload["alignments"] = alignments
         return True
 
 
@@ -987,4 +989,169 @@ def test_a_decision_whose_span_moved_is_refused_as_stale() -> None:
 
         assert not outcome.committed and outcome.reason == de.REASON_STALE
         assert controller.payload["target"] == DECISION_TARGET.replace("遇见", "碰见")
+    asyncio.run(scenario())
+
+
+def test_localized_decision_splice_preserves_and_shifts_explicit_alignments() -> None:
+    async def scenario() -> None:
+        p1_s = "First para." + " " + "x" * 980
+        p1_t = "Alpha one." + " " + "y" * 980
+        s2 = DECISION_SOURCE + " " + "m" * 980
+        t2 = DECISION_TARGET + " " + "n" * 980
+        source = f"{p1_s}\n\n{s2}"
+        target = f"{p1_t}\n\n{t2}"
+        p2_s_start = len(p1_s) + 2
+        p2_t_start = len(p1_t) + 2
+        alignments = [
+            {"source": {"start": 0, "end": len(p1_s), "text": p1_s}, "target": {"start": 0, "end": len(p1_t), "text": p1_t}},
+            {"source": {"start": p2_s_start, "end": len(source), "text": s2}, "target": {"start": p2_t_start, "end": len(target), "text": t2}},
+        ]
+        client = FakeClient()
+        client.semantic = lambda call: (
+            decision_report(call["source"], call["target"])
+            if "遇见" in call["target"]
+            else semantic_report(call["source"], call["target"])
+        )
+        controller, _client, _host = make(client, copy_payload_for_alignment_test(source, target, alignments))
+        controller.start_review()
+        await settle(controller)
+        issue = only_issue(controller)
+        outcome = controller.accept_issue(issue, can_display=lambda text: True)
+        assert outcome.committed and outcome.changed
+        expected_t2 = t2.replace("遇见", GREETS)
+        assert controller.payload["target"] == f"{p1_t}\n\n{expected_t2}"
+        assert controller.payload["alignments"][0]["target"] == {"start": 0, "end": len(p1_t), "text": p1_t}
+        assert controller.payload["alignments"][1]["target"] == {
+            "start": p2_t_start,
+            "end": p2_t_start + len(expected_t2),
+            "text": expected_t2,
+        }
+        controller.undo()
+        assert controller.payload["target"] == target
+        assert controller.payload["alignments"][1]["target"]["text"] == t2
+
+        # Unmatched fill_source_span fails closed to [], and whole blank-target write clears stale alignments.
+        unmatched = de.remap_alignments_for_target_splice(
+            [{"source": {"start": 0, "end": 3, "text": "甲一。"}, "target": None}],
+            "甲一。", "[甲一。]", 0, 0, 5,
+            fill_source_span=(99, 100), fill_target_span=(0, 5),
+        )
+        assert unmatched == []
+    asyncio.run(scenario())
+
+
+def copy_payload_for_alignment_test(source: str, target: str, alignments: list[dict] | None) -> dict:
+    from wuwaterm_client.manuscript import empty_workfile
+    p = empty_workfile()
+    p.update(source=source, target=target, direction="en", alignments=alignments)
+    return p
+
+
+def test_batch_resume_reopened_untranslated_partial_prefix_and_retranslate_undo() -> None:
+    async def scenario() -> None:
+        # 1. Reopened manuscript with 2 explicit untranslated regions: batch translates both sequentially with alignments preserved.
+        # Keep each paragraph > 950 scalars so ready pairs stay distinct under segmentation's 1800-scalar merge cap.
+        p1 = "甲一。" + "文" * 980
+        p2 = "甲二。" + "文" * 980
+        p3 = "甲三。" + "文" * 980
+        sep = "\n\n"
+        source = f"{p1}{sep}{p2}{sep}{p3}"
+        target = "A1." + "x" * 980
+        s1_end = len(p1)
+        s2_start = s1_end + len(sep)
+        s2_end = s2_start + len(p2)
+        s3_start = s2_end + len(sep)
+        s3_end = s3_start + len(p3)
+        alignments = [
+            {"source": {"start": 0, "end": s1_end, "text": p1}, "target": {"start": 0, "end": len(target), "text": target}},
+            {"source": {"start": s2_start, "end": s2_end, "text": p2}, "target": None},
+            {"source": {"start": s3_start, "end": s3_end, "text": p3}, "target": None},
+        ]
+        p = copy_payload_for_alignment_test(source, target, alignments)
+        controller, client, host = make(FakeClient(), p)
+        assert controller.has_resumable_remainder() is True
+        controller.start_translation()
+        await settle(controller)
+        assert [c["text"] for c in client.translation_calls] == [p2, p3]
+        t2 = f"[{p2}]"
+        t3 = f"[{p3}]"
+        assert controller.payload["target"] == f"{target}\n\n{t2}\n\n{t3}"
+        t2_start = len(target) + 2
+        t2_end = t2_start + len(t2)
+        t3_start = t2_end + 2
+        t3_end = t3_start + len(t3)
+        assert controller.payload["alignments"] == [
+            {"source": {"start": 0, "end": s1_end, "text": p1}, "target": {"start": 0, "end": len(target), "text": target}},
+            {"source": {"start": s2_start, "end": s2_end, "text": p2}, "target": {"start": t2_start, "end": t2_end, "text": t2}},
+            {"source": {"start": s3_start, "end": s3_end, "text": p3}, "target": {"start": t3_start, "end": t3_end, "text": t3}},
+        ]
+
+        # 2. Multi-segment unaligned partial-prefix manuscript resumes tail with exact separator & before context
+        # (including replacing trailing whitespace cleanly); short (<2 segments) unaligned docs refuse overwrite cleanly.
+        short_existing = copy_payload_for_alignment_test("  First paragraph.\n\nSecond paragraph.\n", "已有译文", None)
+        c_short, cl_short, _ = make(FakeClient(), short_existing)
+        assert c_short.has_resumable_remainder() is False
+        c_short.start_translation()
+        await settle(c_short)
+        assert cl_short.translation_calls == []
+
+        partial_src = f"{p1}\n\n{p2}\n\n{p3}"
+        partial = copy_payload_for_alignment_test(partial_src, "Prefix one.\n", None)
+        c2, cl2, _h2 = make(FakeClient(capabilities=(dc.semantic.CAPABILITY_TRANSLATION_CONTEXT,)), partial)
+        assert c2.has_resumable_remainder() is True
+        c2.start_translation()
+        await settle(c2)
+        assert [c["text"] for c in cl2.translation_calls] == [p2, p3]
+        assert cl2.translation_calls[0]["context"] == {"before": {"source": p1[-400:], "target": "Prefix one."}}
+        assert c2.payload["target"] == f"Prefix one.\n\n[{p2}]\n\n[{p3}]"
+
+        # Non-adjacent untranslated regions use the immediate preceding ready pair as before context, not an earlier batch output.
+        p4 = "甲四。" + "文" * 980
+        non_adj_src = f"{p1}\n\n{p2}\n\n{p3}\n\n{p4}"
+        t1_init = "A1." + "x" * 980
+        t3_init = "A3." + "z" * 980
+        p2_s = len(p1) + 2
+        p3_s = p2_s + len(p2) + 2
+        p4_s = p3_s + len(p3) + 2
+        non_adj_target = f"{t1_init}\n\n{t3_init}"
+        non_adj_align = [
+            {"source": {"start": 0, "end": len(p1), "text": p1}, "target": {"start": 0, "end": len(t1_init), "text": t1_init}},
+            {"source": {"start": p2_s, "end": p2_s + len(p2), "text": p2}, "target": None},
+            {"source": {"start": p3_s, "end": p3_s + len(p3), "text": p3}, "target": {"start": len(t1_init) + 2, "end": len(non_adj_target), "text": t3_init}},
+            {"source": {"start": p4_s, "end": len(non_adj_src), "text": p4}, "target": None},
+        ]
+        c_na, cl_na, _ = make(
+            FakeClient(capabilities=(dc.semantic.CAPABILITY_TRANSLATION_CONTEXT,)),
+            copy_payload_for_alignment_test(non_adj_src, non_adj_target, non_adj_align),
+        )
+        c_na.start_translation()
+        await settle(c_na)
+        assert cl_na.translation_calls[0]["context"] == {"before": {"source": p1[-400:], "target": t1_init[-400:]}}
+        assert cl_na.translation_calls[1]["context"] == {"before": {"source": p3[-400:], "target": t3_init[-400:]}}
+
+        # Blank-target full write drops stale target:None regions instead of leaving them unfilled.
+        stale_blank = copy_payload_for_alignment_test(
+            f"{p1}\n\n{p2}", "",
+            [
+                {"source": {"start": 0, "end": len(p1), "text": p1}, "target": None},
+                {"source": {"start": len(p1) + 2, "end": len(p1) + 2 + len(p2), "text": p2}, "target": None},
+            ],
+        )
+        c_sb, _cl_sb, _ = make(FakeClient(), stale_blank)
+        c_sb.start_translation()
+        await settle(c_sb)
+        assert c_sb.payload["alignments"] == []
+
+        # 3. Single-segment retranslate of a ready pair updates target & preserves shifted alignments.
+        pairs = controller.current_pairs()
+        assert len(pairs) == 3
+        prior_calls = len(client.translation_calls)
+        controller.retranslate_segment(pairs[0])
+        await settle(controller)
+        assert len(client.translation_calls) == prior_calls + 1
+        t1 = f"[{p1}]"
+        assert controller.payload["target"] == f"{t1}\n\n{t2}\n\n{t3}"
+        assert controller.payload["alignments"][0]["target"]["text"] == t1
+        assert controller.payload["alignments"][1]["target"]["text"] == t2
+        assert controller.payload["alignments"][2]["target"]["text"] == t3
     asyncio.run(scenario())

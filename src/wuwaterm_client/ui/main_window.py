@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, recent, strings
+from ..recovery import default_recovery_path
 from ..api import ApiClient
 from ..config import (
     ClientConfig,
@@ -167,7 +168,9 @@ class MainWindow(QMainWindow):
         self.status_view = StatusView(
             self.api_client, self, on_enter_token=self.enter_token
         )
-        self.manuscript_view = ManuscriptView(self.api_client, self)
+        self.manuscript_view = ManuscriptView(
+            self.api_client, self, recovery_path=default_recovery_path()
+        )
 
         self.stack = QStackedWidget(self)
         # The pages adapt or scroll internally on a small workspace. Do not
@@ -708,7 +711,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._remember_position()
-        self.manuscript_view.cancel_background_work()
+        self.manuscript_view.cancel_background_work(clear_recovery_draft=True)
         super().closeEvent(event)
 
     # -- settings ----------------------------------------------------------

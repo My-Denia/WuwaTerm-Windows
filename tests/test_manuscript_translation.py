@@ -523,3 +523,165 @@ def test_a_failed_run_that_writes_nothing_puts_the_real_verdict_back(qapp) -> No
             view.close()
 
     asyncio.run(scenario())
+
+
+def test_reopened_continuity_retranslate_and_recovery_banner(qapp, tmp_path) -> None:
+    """Reopened untranslated segments batch-resume with alignments preserved,
+    single-segment retranslate + undo restores prior text/alignments, and
+    startup recovery banner offers restore/discard."""
+    from wuwaterm_client.recovery import load_recovery, save_recovery
+
+    async def scenario():
+        p1 = "甲一。" + "文" * 980
+        p2 = "甲二。" + "文" * 980
+        p3 = "甲三。" + "文" * 980
+        sep = "\n\n"
+        source = f"{p1}{sep}{p2}{sep}{p3}"
+        target = "Alpha one." + "x" * 980
+        s1_end = len(p1)
+        s2_start = s1_end + len(sep)
+        s2_end = s2_start + len(p2)
+        s3_start = s2_end + len(sep)
+        s3_end = s3_start + len(p3)
+        alignments = [
+            {"source": {"start": 0, "end": s1_end, "text": p1}, "target": {"start": 0, "end": len(target), "text": target}},
+            {"source": {"start": s2_start, "end": s2_end, "text": p2}, "target": None},
+            {"source": {"start": s3_start, "end": s3_end, "text": p3}, "target": None},
+        ]
+        rec_path = tmp_path / "recovery" / "draft.json"
+        client = ApiClient("https://example.invalid", token_provider=lambda: "test-token",
+                           _test_transport=httpx.MockTransport(Transport()))
+        view = ManuscriptView(client, recovery_path=rec_path)
+        view.resize(1280, 800)
+        view.show()
+        try:
+            value = empty_workfile()
+            value.update(source=source, target=target, direction="en", alignments=alignments)
+            view._set_payload(value)
+            view._saved_payload = value.copy()
+            view._update_controls()
+            assert view.translate_button.text() == strings.MANUSCRIPT_TRANSLATE_RESUME
+
+            view.translate_button.click()
+            await settle(view)
+            t2 = f"[{p2}]"
+            t3 = f"[{p3}]"
+            assert view._payload["target"] == f"{target}\n\n{t2}\n\n{t3}"
+            assert len(view._payload["alignments"]) == 3
+            assert view._payload["alignments"][1]["target"]["text"] == t2
+            assert view._payload["alignments"][2]["target"]["text"] == t3
+            # Immediate recovery snapshot written on dirty translation.
+            assert load_recovery(rec_path).status == "valid"
+
+            # Single-segment retranslate + undo restores prior target and alignments.
+            view._show_track(TRACK_SEGMENTS)
+            view.segment_list.setCurrentRow(0)
+            qapp.processEvents()
+            assert view.translate_segment_button.isVisible()
+            assert view.translate_segment_button.text() == strings.MANUSCRIPT_RETRANSLATE_SEGMENT
+            view.translate_segment_button.click()
+            await settle(view)
+            t1 = f"[{p1}]"
+            assert view._payload["target"] == f"{t1}\n\n{t2}\n\n{t3}"
+            assert view._payload["alignments"][0]["target"]["text"] == t1
+            assert view._payload["alignments"][1]["target"]["text"] == t2
+            view._undo_replace()
+            assert view._payload["target"] == f"{target}\n\n{t2}\n\n{t3}"
+            assert view._payload["alignments"][0]["target"]["text"] == target
+            assert view._payload["alignments"][1]["target"]["text"] == t2
+        finally:
+            view.close()
+
+        # Simulate crash restart with draft.json present on disk.
+        saved_draft = empty_workfile()
+        saved_draft.update(source="甲一。", target="Recovered target.", direction="en")
+        save_recovery(rec_path, saved_draft)
+        restarted = ManuscriptView(client, recovery_path=rec_path)
+        try:
+            assert restarted.recovery_banner.is_showing()
+            assert strings.RECOVERY_RESTORE_BUTTON in [
+                btn.text() for btn in restarted.recovery_banner._actions_host.findChildren(type(restarted.undo_button))
+            ]
+            # Trigger restore action on recovery banner.
+            restore_btn = next(
+                btn for btn in restarted.recovery_banner._actions_host.findChildren(type(restarted.undo_button))
+                if btn.text() == strings.RECOVERY_RESTORE_BUTTON
+            )
+            restore_btn.click()
+            assert not restarted.recovery_banner.is_showing()
+            assert restarted._payload["target"] == "Recovered target."
+            assert restarted.document_dirty
+            restarted._discard_recovery_draft()
+            assert load_recovery(rec_path).status == "missing"
+        finally:
+            restarted.close()
+
+        # Corrupt draft banner shows without crashing and can be discarded cleanly.
+        rec_path.write_text("{corrupt", encoding="utf-8")
+        corrupt_view = ManuscriptView(client, recovery_path=rec_path)
+        try:
+            assert corrupt_view.recovery_banner.is_showing()
+            assert corrupt_view.recovery_banner.message_text == strings.RECOVERY_DRAFT_CORRUPT_BANNER
+            discard_btn = next(
+                btn for btn in corrupt_view.recovery_banner._actions_host.findChildren(type(corrupt_view.undo_button))
+                if btn.text() == strings.RECOVERY_DISCARD_BUTTON
+            )
+            discard_btn.click()
+            assert not corrupt_view.recovery_banner.is_showing()
+            assert load_recovery(rec_path).status == "missing"
+        finally:
+            corrupt_view.close()
+            await client.aclose()
+
+        # Pending startup recovery draft MUST survive a clean window close when the user never acted on the banner.
+        save_recovery(rec_path, saved_draft)
+        untouched_view = ManuscriptView(client, recovery_path=rec_path)
+        try:
+            assert untouched_view._recovery_pending
+            untouched_view.cancel_background_work(clear_recovery_draft=True)
+            assert load_recovery(rec_path).status == "valid"
+        finally:
+            untouched_view.close()
+
+        # _replace_one on aligned target remaps alignments cleanly + _save_recovery_snapshot survives WorkfileError.
+        rep_view = ManuscriptView(client, recovery_path=rec_path)
+        try:
+            p_a = "今汐。" + "文" * 980
+            p_b = "第二。" + "文" * 980
+            t_a = "Someone." + "x" * 980
+            t_b = "Two." + "y" * 980
+            rep_src = f"{p_a}\n\n{p_b}"
+            rep_tgt = f"{t_a}\n\n{t_b}"
+            rep_payload = empty_workfile()
+            rep_payload.update(
+                source=rep_src,
+                target=rep_tgt,
+                direction="en",
+                alignments=[
+                    {"source": {"start": 0, "end": len(p_a), "text": p_a}, "target": {"start": 0, "end": len(t_a), "text": t_a}},
+                    {"source": {"start": len(p_a) + 2, "end": len(rep_src), "text": p_b}, "target": {"start": len(t_a) + 2, "end": len(rep_tgt), "text": t_b}},
+                ],
+            )
+            rep_view._set_payload(rep_payload)
+            rep_view._report = {
+                "findings": [{"target_span": {"start": 0, "end": 7, "text": "Someone"}}],
+            }
+            rep_view.findings.addItem("f0")
+            rep_view.findings.setCurrentRow(0)
+            rep_view.replacement_edit.setText("Jinhsi")
+            rep_view._replace_one()
+            t_a_new = "Jinhsi." + "x" * 980
+            assert rep_view._payload["target"] == f"{t_a_new}\n\n{t_b}"
+            assert rep_view._payload["alignments"][0]["target"]["text"] == t_a_new
+            assert rep_view._payload["alignments"][1]["target"]["text"] == t_b
+            rep_view._undo_replace()
+            assert rep_view._payload["alignments"][0]["target"]["text"] == t_a
+
+            # _save_recovery_snapshot never raises WorkfileError (even with invalid choices).
+            rep_view._payload["choices"] = [{"source": "bad"}]  # type: ignore[list-item]
+            rep_view._save_recovery_snapshot()
+        finally:
+            rep_view.close()
+            await client.aclose()
+
+    asyncio.run(scenario())
