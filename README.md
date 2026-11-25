@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.6.5**（`2026-11-25T03:11:21Z` 发布，即北京时间 2026-11-25，发布日期与资产见下文「发布」一节的发布记录；下载步骤以它为例）。这次维护版对齐跨端 3-pass 重复源段位置归属规则（MY-350，#43）并将 `contracts/sources.json` 固定的契约源码更新至 Core `0.12.0` 与 Web `v0.4.4`（#44）。稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。它有自己的版本号，与服务端的版本号分开走。
+当前版本 **0.6.6**（`2026-11-25T20:27:31Z` 发布，即北京时间 2026-11-26，发布日期与资产见下文「发布」一节的发布记录；下载步骤以它为例）。这个版本加入长稿续译与单段重译、未保存稿件的恢复草稿、按服务器地址分开保存设备令牌、重复选择冲突时的一步移除并保存，以及不跨边界编辑时保留段落对应（#46 至 #48），并将 `contracts/sources.json` 固定的契约源码更新至 Core `0.13.0` 与 Web `v0.4.5`（#49）。稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。它有自己的版本号，与服务端的版本号分开走。
 
 这个客户端说的是 HTTP 接口的 **`v1`** 版本 —— 也就是 `/v1/*` 这组路径,以及
 `GET /v1/meta` 回复里的 `api_version` 字段。稿件审校还需要服务端支持 `review-v2`;语义审校和翻译
@@ -35,11 +35,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载 `WuwaTerm-0.6.5-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
+1. 下载 `WuwaTerm-0.6.6-windows-x64.zip` 和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.6.5-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.6.6-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
@@ -70,7 +70,7 @@ Get-FileHash .\WuwaTerm-0.6.5-windows-x64.zip -Algorithm SHA256
 
 ## 它能做什么
 
-以下为 0.6.5 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
+以下为 0.6.6 的能力;0.3.0 及更早的客户端包不含稿件内语义审校、翻译上下文与分段审校,请以对应发布说明为准。
 
 - 通过共享的「词典优先」流水线翻译文本(`POST /v1/translations`),方向可自动判定,
   也可强制指定。
@@ -178,9 +178,11 @@ Get-FileHash .\WuwaTerm-0.6.5-windows-x64.zip -Algorithm SHA256
 一份没改过的稿件再审校只花一次请求,稿件也不会因此变成未保存。依据变了(例如服务更新了匹配规则)
 的段落标为"待复核"并重新核对,完成标记保留。服务端升级到 Core 0.13.0 就是这样一次:匹配器版本从
 `wuwaterm-cjk-matcher-v9` 变为 `wuwaterm-cjk-matcher-v10`(依据里的 `matcher_revision` 变为
-`57428b88978597d95840f56ba0080a4f8fb11d4860fe8ea5532d3c1e7c6a918a`),判定本身没变,只有记录依据的版本标签变了,
-所以此前以 v9 保存的长稿(v3/v4)逐段结果重开后标为"待复核",下次审校逐段重新核对;这次重新核对会
-消耗审校额度,结论与原来相同。编辑正文时只有改到的那一段变为"待审"并去掉它的
+`57428b88978597d95840f56ba0080a4f8fb11d4860fe8ea5532d3c1e7c6a918a`),判定本身没变,只有记录依据的版本标签变了。
+此前以 v9 保存的长稿(v3/v4)重开时,各段仍显示"已保存，待核对":此刻客户端还没有服务当前的依据,
+不会把它们标为待复核。按「审校」后,客户端先发一次核对请求拿到服务当前的依据,发现这些段落保存时的
+`matcher_revision` 与它不同,才把它们标为"待复核"并逐段重新核对;这次重新核对会消耗审校额度,结论
+与原来相同。编辑正文时只有改到的那一段变为"待审"并去掉它的
 完成标记,其他段落的结果照常可用;撤销和重做会连同各段记录一起恢复。改用「使用自动对应」或编辑
 清除了旧的段落对应时,状态栏会说明有几段术语结果需要重新核对。某段请求失败时只有这一段标为
 "未完成",其他段落不受影响,下次「审校」从它接着补审。
@@ -567,6 +569,7 @@ gh release view vX.Y.Z --repo My-Denia/WuwaTerm-Windows --json isDraft,targetCom
 
 ### 发布记录
 
+- v0.6.6（2026-11-26，发布时间 `2026-11-25T20:27:31Z`）：长稿翻译可以续译：译文已有内容、原文还有尚未翻译的段落时，「翻译」变为「续译余下段落」，只翻译这些段落；在「段落」里选中已配对的段落可用「重译此段」替换这一段的译文，写入后可以撤销（#46）。未保存的稿件在每次编辑停下约 1.5 秒后原子写入恢复草稿 `%APPDATA%\WuwaTerm\recovery\draft.json`，程序异常退出后重新启动时可以恢复或丢弃（#46）。设备令牌按服务器地址的来源（协议、主机和端口）分别保存在 Windows 凭据管理器里，启动时把旧版本留下的不分地址的那一条一次性移到当前地址名下，保存或遗忘令牌之前要先有有效的服务器地址（#47）。正文修改后多条历史选择落到同一处时，可以按「移除冲突的历史选择并保存」一步处理，也可以「仅导出当前正文 (.txt)」（#47）。编辑正文时，不跨对应边界的修改会平移或伸缩原有的段落对应，只有跨边界、删光原文对应或只改翻译方向才清除；翻译超时默认值从 60 秒改为 100 秒，长于服务端 90 秒的请求截止，默认下先到期的是服务端的 504；「翻译」与「审校」按稿件状态切换主按钮，语义疑点列表把未处理的排在前面（#48）。包版本升至 `0.6.6`，并将 `contracts/sources.json` 固定的契约源码更新至 Core `0.13.0`（`e5b7f1a8`）与 Web `v0.4.5`（`6d1084fe`）（#49）；Core 0.13.0 的匹配器升到 `wuwaterm-cjk-matcher-v10`，以 v9 保存的长稿重开后，按「审校」时逐段重新核对，消耗审校额度，结论不变。稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）与 HTTP API 合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.6)，源码提交 `05304ea3c3962c7aa555951bc990f8343321c396`（树对象 `d4ceb362e7986cf93334531a01e78331f3622682`），发布 CI 校验的 main push 运行 45689068139，依赖审计运行 45689067421，发布构建运行 45693339755。匿名下载全部公开资产并经 `sha256sum -c SHA256SUMS` 校验通过：`WuwaTerm-0.6.6-windows-x64.zip` 为 57,349,553 字节，SHA-256 为 `2b625b86d7678b9aaf5dd6cd9c716181fef95b7b8242fce80f272596de89b050`；`manifest.json` 为 283 字节，SHA-256 为 `470af6809fee74317a4050353865d0f3bea278e00a169a894ccec7fa0ff5f175`；`SHA256SUMS` 为 97 字节，SHA-256 为 `61ee6dfe590f3c9ca53ecdb35e49d0fdd0f9df28b4792813825d68428294fa62`。在 Windows 本机用隔离的 `APPDATA` 核对：ZIP 的哈希与 `SHA256SUMS` 一致，`WuwaTerm.exe` 的 `FileVersion` 与 `ProductVersion` 均为 `0.6.6`，`FileDescription` 为 `WuwaTerm desktop client`，离屏 `--self-check` 退出码为 0，带窗口启动后 4 秒仍在运行。未做 Windows 代码签名。
 - v0.6.5（2026-11-25，发布时间 `2026-11-25T03:11:21Z`）：将 `segment_records.normalize` 的重复源段位置归属进一步与 3-pass 全局配对 `SPEC` 及 Web 对齐（`a45dbf2`，#43，MY-350），随后将包版本升至 `0.6.5` 并将 `contracts/sources.json` 固定的契约源码更新至 Core `0.12.0`（`6fb4d8a4`）与 Web `v0.4.4`（`d702328e`）（#44）；稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）与 HTTP API 合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.5)，源码提交 `502ac8293979ab730f5d0c16bd1c59cb958ef76d`（树对象 `7606db96aa0f5fb853a2b502281249d29bb7a261`），发布 CI 校验的 main push 运行 45423607436，依赖审计运行 45423606923，发布构建运行 45439299768。匿名下载全部公开资产并经 `sha256sum -c SHA256SUMS` 校验通过：`WuwaTerm-0.6.5-windows-x64.zip` 为 57,322,359 字节，SHA-256 为 `aced40fc28561df5037b491133b74d271650450037ace903684978aad5aa7c25`；`manifest.json` 为 283 字节，SHA-256 为 `692e90a63ffc82bd7ea87e4a1333c5bff7d394251fdeb9cca1b3aa2a7810a9fc`；`SHA256SUMS` 为 97 字节，SHA-256 为 `df935027553a985fd13fb978beec6c47103235937b85d7eeb28619c5b731fd45`。未做 Windows 代码签名。
 - v0.6.4（2026-11-22，发布时间 `2026-11-22T11:17:04Z`）：修复工作台六处桌面缺陷（#40），每处都有不修就失败的测试。两端读法相同的段落不再互相换掉自己的选择与结果——`segment_records.normalize` 原先在哈希相同的记录间取第一个未用的，文件顺序于是在编辑、拆分或改朝向后决定了哪条记录落到哪一段；现在改按源／目标区间是否就在当前这对段落的位置上判定，先看区间重叠、再看区间距离、最后才看记录顺序，哈希不同的记录映射不变，固定的 `contracts/workbench-state/cases.json` 状态也不变（MY-350，Windows 客户端侧加固同源段位置归属；跨端 Web 与 SPEC 的一致性另行跟进）。翻译进行中不再把还无法判定的段落报成「需要手动切分」，而是显示「翻译中，等待配对」，运行结束后恢复真实的配对诊断，翻译状态变化时由 `DocumentRunController` 自己刷新分段列表。150% 缩放下列表行改为换行而不是省略，字数与状态两个数字不再被省略号取代。关于对话框显示正在运行的客户端版本。数值框的上／下箭头改用内嵌的 Lucide chevron 图标（新增 `chevron-up.svg`，在图标 `SHA256SUMS` 中固定并列入 `WuwaTerm.spec`），不再用 Qt 会渲染成短横条的 CSS 边框三角形。首次显示时按 Qt 实际给出的边框贴合桌面，在分数设备像素比下让出一个逻辑像素，窗口不再越出 150% 桌面右／下边缘。`contracts/sources.json` 固定的契约源码保持 v0.6.3 的 Core `9a4f680f` 与 Web `ba8d01b2`；稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.4)，源码提交 `8c0c4a9f87742b97a6bfa0496dc5100336393861`（树对象 `69f0965d46ea9aadc58f0605d60f97117d0d770c`），发布 CI 校验的 main push 运行 45014621283，发布构建运行 45015537107。匿名下载全部公开资产并经 `sha256sum -c SHA256SUMS` 校验通过：`WuwaTerm-0.6.4-windows-x64.zip` 为 57,324,001 字节，SHA-256 为 `63fb9750d28ea984fdd14949e543c01ec18b47456cd52a2c1f985a7c1f62acbf`；`manifest.json` 为 283 字节，SHA-256 为 `1742ef481c1de1e89cece4b13d05c76644a9d7e407ec7e45f2f36bf90907c5b5`；`SHA256SUMS` 为 97 字节，SHA-256 为 `710fa1907181bd6b454469bfb9c8d6ec8913d47d6e68134c98eb4ecb12a035e4`。未做 Windows 代码签名。
 - v0.6.3（2026-11-22，发布时间 `2026-11-21T20:46:18Z`）：从 `ManuscriptView` 拆出纯 Python 的 `DocumentRunController`（#36），新增窄接口 `WorkbenchApiClient` Protocol 与类型化的 `ReviewReport`/`SemanticReviewReport` 结构并将编辑、撤销、术语选择与语义决定命令移入纯 Python 模块 `document_edits.py`（#37），随后升级版本至 `0.6.3` 并将 `contracts/sources.json` 固定的 Web 契约源码更新到 `WuwaTerm-Web v0.4.3`（`ba8d01b2`）（#38）；稿件格式（`wuwaterm-manuscript-v1` 至 `v4`）和接口合同不变。[Release](https://github.com/My-Denia/WuwaTerm-Windows/releases/tag/v0.6.3)，源码提交 `d0bd6c4b2b4c6e55315dc1b804d379c02aebb854`（树对象 `738a8d41ba1580284b64a49ef440b2e6656f32f7`），发布 CI 校验的 main push 运行 44942744840，发布构建运行 44943730174。匿名下载全部公开资产并经 `sha256sum -c SHA256SUMS` 校验通过：`WuwaTerm-0.6.3-windows-x64.zip` 为 57,318,522 字节，SHA-256 为 `1242766292883790ff034f1900aaed4be600e33cf76c193442e0fe94eff9148a`；`manifest.json` 为 283 字节，SHA-256 为 `38ec860cc010163a312f94ae5a5df841f7479dc286b7c9c09527eb13d2f5c7b1`；`SHA256SUMS` 为 97 字节，SHA-256 为 `8541e1caad92530e0e45c111de19431ca79d4224e5fb5b322e1d1d9215361809`。未做 Windows 代码签名。
