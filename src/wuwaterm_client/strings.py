@@ -768,7 +768,8 @@ MANUSCRIPT_NOT_EVALUATED_UNKNOWN = "未评估原因：{reason}"
 # review; layer 3 is a reserved place that sends and stores nothing.
 MANUSCRIPT_LAYERS_TITLE = "分层审校"
 MANUSCRIPT_L1_TITLE = "第一层 · 确定性结构核查（不调用模型、不写入稿件）"
-MANUSCRIPT_L1_NOTE = (
+MANUSCRIPT_L1_NOTE = "逐段检查空译文、数字、占位符与标签、段落和换行；某段改动后，这一段的结果随即失效。"
+MANUSCRIPT_L1_NOTE_DETAIL = (
     "逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
     "结果只在本次打开时显示，不写入稿件文件、导出或撤销历史；某段文本改动后，这一段的结果随即失效。"
 )
@@ -821,11 +822,13 @@ MANUSCRIPT_AMBIGUOUS_NOTE = (
 )
 MANUSCRIPT_AMBIGUOUS_ITEM = "“{text}” · 第 {number} 段"
 MANUSCRIPT_AMBIGUOUS_ITEM_DOCUMENT = "“{text}” · 原文 {start}–{end}"
-MANUSCRIPT_AMBIGUOUS_ADOPT = "采纳 {zh} / {en}"
+MANUSCRIPT_AMBIGUOUS_CANDIDATE = "候选词对"
+MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON = "采纳这对词"
 MANUSCRIPT_AMBIGUOUS_IGNORE = "忽略（按普通字处理）"
 MANUSCRIPT_AMBIGUOUS_ADOPTED = "已采纳 {zh} / {en}，下次审校时按这对词判断。"
 MANUSCRIPT_AMBIGUOUS_IGNORED = "已标记“{text}”不是术语，下次审校时按普通字处理。"
 MANUSCRIPT_AMBIGUOUS_STAGED = "下次审校时发送"
+MANUSCRIPT_AMBIGUOUS_NONE = "还没有选择。采纳或忽略后，下次审校时一并交给服务核对。"
 MANUSCRIPT_AMBIGUOUS_LIST = "歧义单字"
 
 MANUSCRIPT_TRANSLATED_MISMATCH = (

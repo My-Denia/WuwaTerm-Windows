@@ -283,8 +283,10 @@ def test_ambiguous_names_are_folded_after_the_judged_findings_and_not_counted(qa
         second = AMBIGUOUS_SOURCE.index("椿", 1)
         assert view.ambiguous_list.item(0).text() == strings.MANUSCRIPT_AMBIGUOUS_ITEM_DOCUMENT.format(
             text="椿", start=second + 1, end=second + 1)
-        [adopt] = view._ambiguous_adopt_buttons
-        assert adopt.text() == strings.MANUSCRIPT_AMBIGUOUS_ADOPT.format(zh="椿", en="Camellya")
+        adopt = view.ambiguous_adopt_button
+        assert view.ambiguous_combo.count() == 1 and view.ambiguous_combo.currentData() == CANDIDATE["candidate_id"]
+        assert "椿" in view.ambiguous_combo.currentText() and "Camellya" in view.ambiguous_combo.currentText()
+        assert adopt.text() == strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON
         assert adopt.isEnabled() and view.ambiguous_ignore_button.isEnabled()
         # Adopt: staged in the manuscript, the report stays listed.
         adopt.click()
@@ -386,3 +388,40 @@ def test_the_new_text_meets_contrast_in_both_themes(qapp, scheme) -> None:
     for name in names:
         for background in ("bg-surface", "bg-sunken"):
             assert contrast(tokens[colour[name]], tokens[background]) >= 4.5, (scheme, name, background)
+
+
+@pytest.mark.parametrize("scheme", [theme.SCHEME_LIGHT, theme.SCHEME_DARK])
+def test_every_layer_open_never_widens_the_inspector(qapp, scheme) -> None:
+    """All three layers filled, both folds open: nothing pushes the inspector
+    into a horizontal scroll (the width the My terms panel test uses)."""
+    from PySide6.QtWidgets import QScrollArea
+
+    async def scenario():
+        server = Server(capabilities=(AMB, "semantic-review-v1", STRUCTURE), issues=layered_issues)
+        source, target = NUMBER_SOURCE + "椿在城楼。椿点头。", NUMBER_TARGET + " Camellya waited. She nodded."
+        view = make_view(server, source, target)
+        view.resize(1100, 700)
+        view.show()
+        view._start_review()
+        await settle(view)
+        view.l1_run_button.click()
+        await settle(view)
+        view.l3_check.setChecked(True)
+        view.ambiguous_toggle.setChecked(True)
+        view.ambiguous_list.setCurrentRow(0)
+        view.low_toggle.setChecked(True)
+        for track in (0, TRACK_SEMANTIC):
+            view._show_track(track)
+            for _ in range(3):
+                QApplication.processEvents()
+            assert view.l1_list.count() and view.ambiguous_list.count() and view._issue_rows
+            assert view.inspector.findChild(QScrollArea).horizontalScrollBar().maximum() == 0, (scheme, track)
+        view._saved_payload = view._payload
+        view.close()
+
+    previous = qapp.styleSheet()
+    qapp.setStyleSheet(theme.load_stylesheet(scheme))
+    try:
+        asyncio.run(scenario())
+    finally:
+        qapp.setStyleSheet(previous)

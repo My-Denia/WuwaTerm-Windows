@@ -1241,6 +1241,65 @@ class ManuscriptView(QWidget):
         self.term_groups.hide()
         term_details.addWidget(self.term_groups)
         term_details.addWidget(self.findings)
+        # Ambiguous one-character names: after the judged findings, folded,
+        # never counted with them.
+        self.ambiguous_toggle = QPushButton(term_page)
+        self.ambiguous_toggle.setObjectName("commandButton")
+        self.ambiguous_toggle.setCheckable(True)
+        self.ambiguous_toggle.setIconSize(QSize(16, 16))
+        self.ambiguous_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.ambiguous_toggle.toggled.connect(self._ambiguous_toggled)
+        self.ambiguous_toggle.hide()
+        term_details.addWidget(self.ambiguous_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.ambiguous_area = QWidget(term_page)
+        self.ambiguous_area.setObjectName("inspectorBody")
+        ambiguous = QVBoxLayout(self.ambiguous_area)
+        ambiguous.setContentsMargins(0, 0, 0, 0)
+        ambiguous.setSpacing(6)
+        self.ambiguous_note = QLabel(strings.MANUSCRIPT_AMBIGUOUS_NOTE, self.ambiguous_area)
+        self.ambiguous_note.setObjectName("secondaryText")
+        self.ambiguous_note.setWordWrap(True)
+        ambiguous.addWidget(self.ambiguous_note)
+        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area)
+        self.ambiguous_list.setMinimumHeight(52)
+        self.ambiguous_list.setMaximumHeight(140)
+        self.ambiguous_list.setWordWrap(True)
+        self.ambiguous_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.ambiguous_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ambiguous_list.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_LIST)
+        self.ambiguous_list.currentRowChanged.connect(self._select_ambiguous)
+        ambiguous.addWidget(self.ambiguous_list)
+        # The candidate pair (Core offers the official name or names; long ones
+        # elide instead of widening the inspector), then adopt or ordinary word.
+        self.ambiguous_actions = QWidget(self.ambiguous_area)
+        self.ambiguous_actions.setObjectName("inspectorBody")
+        actions = QVBoxLayout(self.ambiguous_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(6)
+        self.ambiguous_combo = ChevronComboBox(self.ambiguous_actions)
+        self.ambiguous_combo.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_CANDIDATE)
+        self.ambiguous_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.ambiguous_combo.setMinimumContentsLength(8)
+        self.ambiguous_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        actions.addWidget(self.ambiguous_combo)
+        self.ambiguous_adopt_button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON, self.ambiguous_actions)
+        self.ambiguous_adopt_button.clicked.connect(self._adopt_ambiguous)
+        self.ambiguous_ignore_button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
+        self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
+        for button in (self.ambiguous_adopt_button, self.ambiguous_ignore_button):
+            # Keep an IME composition in the editor when an action is clicked.
+            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+            # One per line: side by side they are wider than the narrowest inspector.
+            actions.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+        ambiguous.addWidget(self.ambiguous_actions)
+        self.ambiguous_state = QLabel(self.ambiguous_area)
+        self.ambiguous_state.setObjectName("secondaryText")
+        self.ambiguous_state.setTextFormat(Qt.TextFormat.PlainText)
+        self.ambiguous_state.setWordWrap(True)
+        ambiguous.addWidget(self.ambiguous_state)
+        self.ambiguous_area.hide()
+        term_details.addWidget(self.ambiguous_area)
         summary = QHBoxLayout()
         pair = QVBoxLayout()
         self.finding_title = QLabel(strings.MANUSCRIPT_FINDING_PROMPT, inspector_body)
@@ -1342,54 +1401,6 @@ class ManuscriptView(QWidget):
         replacement.addWidget(self.replace_button)
         self.replace_toggle.toggled.connect(self.replacement_area.setVisible)
         term_details.addWidget(self.replacement_area)
-        # Ambiguous one-character names: after the judged findings, folded,
-        # never counted with them.
-        self.ambiguous_toggle = QPushButton(term_page)
-        self.ambiguous_toggle.setObjectName("commandButton")
-        self.ambiguous_toggle.setCheckable(True)
-        self.ambiguous_toggle.setIconSize(QSize(16, 16))
-        self.ambiguous_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.ambiguous_toggle.toggled.connect(self._ambiguous_toggled)
-        self.ambiguous_toggle.hide()
-        term_details.addWidget(self.ambiguous_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-        self.ambiguous_area = QWidget(term_page)
-        self.ambiguous_area.setObjectName("inspectorBody")
-        ambiguous = QVBoxLayout(self.ambiguous_area)
-        ambiguous.setContentsMargins(0, 0, 0, 0)
-        ambiguous.setSpacing(6)
-        self.ambiguous_note = QLabel(strings.MANUSCRIPT_AMBIGUOUS_NOTE, self.ambiguous_area)
-        self.ambiguous_note.setObjectName("secondaryText")
-        self.ambiguous_note.setWordWrap(True)
-        ambiguous.addWidget(self.ambiguous_note)
-        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area)
-        self.ambiguous_list.setMinimumHeight(52)
-        self.ambiguous_list.setMaximumHeight(140)
-        self.ambiguous_list.setWordWrap(True)
-        self.ambiguous_list.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.ambiguous_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.ambiguous_list.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_LIST)
-        self.ambiguous_list.currentRowChanged.connect(self._select_ambiguous)
-        ambiguous.addWidget(self.ambiguous_list)
-        # One button per candidate (Core offers the official name or names).
-        self.ambiguous_actions = QWidget(self.ambiguous_area)
-        self.ambiguous_actions.setObjectName("inspectorBody")
-        self._ambiguous_actions_layout = QVBoxLayout(self.ambiguous_actions)
-        self._ambiguous_actions_layout.setContentsMargins(0, 0, 0, 0)
-        self._ambiguous_actions_layout.setSpacing(4)
-        self._ambiguous_adopt_buttons: list[QPushButton] = []
-        self.ambiguous_ignore_button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
-        self.ambiguous_ignore_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.ambiguous_ignore_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
-        self._ambiguous_actions_layout.addWidget(self.ambiguous_ignore_button, 0, Qt.AlignmentFlag.AlignLeft)
-        ambiguous.addWidget(self.ambiguous_actions)
-        self.ambiguous_state = QLabel(self.ambiguous_area)
-        self.ambiguous_state.setObjectName("secondaryText")
-        self.ambiguous_state.setTextFormat(Qt.TextFormat.PlainText)
-        self.ambiguous_state.setWordWrap(True)
-        ambiguous.addWidget(self.ambiguous_state)
-        self.ambiguous_area.hide()
-        term_details.addWidget(self.ambiguous_area)
         term_details.addStretch(1)
         self.track_stack.addWidget(term_page)
         self.track_stack.addWidget(self.semantic_page)
@@ -1826,10 +1837,12 @@ class ManuscriptView(QWidget):
         self.l1_title = QLabel(strings.MANUSCRIPT_L1_TITLE, card)
         self.l1_title.setObjectName("statusText")
         self.l1_title.setWordWrap(True)
+        self.l1_title.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
         layout.addWidget(self.l1_title)
         self.l1_note = QLabel(strings.MANUSCRIPT_L1_NOTE, card)
         self.l1_note.setObjectName("secondaryText")
         self.l1_note.setWordWrap(True)
+        self.l1_note.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
         layout.addWidget(self.l1_note)
         self.l1_run_button = QPushButton(strings.MANUSCRIPT_L1_RUN.format(count=0), card)
         self.l1_run_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -1843,7 +1856,7 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.l1_status)
         self.l1_list = _WrappedListWidget(card)
         self.l1_list.setMinimumHeight(52)
-        self.l1_list.setMaximumHeight(160)
+        self.l1_list.setMaximumHeight(124)
         self.l1_list.setWordWrap(True)
         self.l1_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.l1_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1851,13 +1864,13 @@ class ManuscriptView(QWidget):
         self.l1_list.currentRowChanged.connect(self._select_l1_row)
         self.l1_list.hide()
         layout.addWidget(self.l1_list)
-        self.l2_overview = QPushButton(card)
-        self.l2_overview.setObjectName("commandButton")
-        self.l2_overview.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.l2_overview.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.l2_overview.clicked.connect(lambda: self._shortcut_track(TRACK_SEMANTIC))
+        # A label, not a button: it wraps, so it never widens the inspector.
+        self.l2_overview = QLabel(card)
+        self.l2_overview.setObjectName("secondaryText")
+        self.l2_overview.setTextFormat(Qt.TextFormat.PlainText)
+        self.l2_overview.setWordWrap(True)
         self.l2_overview.hide()
-        layout.addWidget(self.l2_overview, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.l2_overview)
         # Component state only: never saved, never sent.
         self.l3_check = QCheckBox(strings.MANUSCRIPT_L3_TITLE, card)
         self.l3_check.setChecked(False)
@@ -1926,7 +1939,7 @@ class ManuscriptView(QWidget):
                 lines.append(strings.MANUSCRIPT_L1_UNCHECKED.format(count=summary.unchecked))
         elif not running and not unavailable and state.phase != "failed" and pairs is not None:
             lines.append(strings.MANUSCRIPT_L1_NOT_RUN)
-        if batches and not running and not unavailable:
+        if batches and not running and not unavailable and not summary.checked:
             lines.append(strings.MANUSCRIPT_L1_COST.format(count=len(batches)))
         if skipped:
             lines.append(strings.MANUSCRIPT_L1_SKIPPED.format(count=len(skipped)))
@@ -3644,6 +3657,10 @@ class ManuscriptView(QWidget):
         self.ambiguous_list.setCurrentRow(row if 0 <= row < count else (0 if count else -1))
         self.ambiguous_list.blockSignals(False)
         self.ambiguous_area.setVisible(bool(count) and expanded)
+        if count:
+            # As tall as its rows (a usual report has one or two), at most 140 px.
+            rows = sum(self.ambiguous_list.sizeHintForRow(i) for i in range(count))
+            self.ambiguous_list.setMaximumHeight(max(52, min(140, rows + 2 * self.ambiguous_list.frameWidth() + 4)))
         self._render_ambiguous_actions()
 
     def _current_ambiguous(self) -> tuple[dict, tuple[int, int, int] | None] | None:
@@ -3660,44 +3677,50 @@ class ManuscriptView(QWidget):
         return latest is not None and not latest["report"]["truncated"]
 
     def _render_ambiguous_actions(self) -> None:
-        for button in self._ambiguous_adopt_buttons:
-            self._ambiguous_actions_layout.removeWidget(button)
-            button.deleteLater()
-        self._ambiguous_adopt_buttons = []
         current = self._current_ambiguous()
         self.ambiguous_actions.setVisible(current is not None)
+        self.ambiguous_combo.blockSignals(True)
+        self.ambiguous_combo.clear()
         if current is None:
+            self.ambiguous_combo.blockSignals(False)
             self.ambiguous_state.clear()
             self.ambiguous_state.hide()
             return
         finding, ref = current
-        free = self._ambiguous_choosable(ref)
-        for position, candidate in enumerate(finding["candidates"]):
-            button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT.format(zh=candidate["zh"], en=candidate["en"]),
-                                 self.ambiguous_actions)
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-            button.setEnabled(free)
-            button.clicked.connect(lambda _checked=False, c=candidate: self._choose_ambiguous(c))
-            self._ambiguous_actions_layout.insertWidget(position, button, 0, Qt.AlignmentFlag.AlignLeft)
-            self._ambiguous_adopt_buttons.append(button)
-        self.ambiguous_ignore_button.setEnabled(free)
         choice = self._ambiguous_choice(finding, ref)
+        for candidate in finding["candidates"]:
+            self.ambiguous_combo.addItem(self._candidate_text(candidate), candidate["candidate_id"])
+        chosen = (choice or {}).get("candidate") or {}
+        at = self.ambiguous_combo.findData(chosen.get("candidate_id"))
+        self.ambiguous_combo.setCurrentIndex(max(0, at))
+        self.ambiguous_combo.blockSignals(False)
+        self._update_ambiguous_actions()
+        free = self._ambiguous_choosable(ref)
         if not free and (ref is None or self._term_basis is None):
             state = strings.MANUSCRIPT_TERM_CHOICE_WAIT
         elif choice is None:
-            state = strings.MANUSCRIPT_TERM_CHOICE_NONE
+            state = strings.MANUSCRIPT_AMBIGUOUS_NONE
         else:
             state = strings.MANUSCRIPT_TERM_CHOICE_CHOSEN.format(choice=self._describe_choice(choice))
         self.ambiguous_state.setText(state)
         self.ambiguous_state.show()
 
     def _update_ambiguous_actions(self) -> None:
-        """Only the enabled state; the buttons themselves follow the selection."""
+        """Only the enabled state; the candidates follow the selection."""
         current = self._current_ambiguous()
         free = current is not None and self._ambiguous_choosable(current[1])
-        for button in (*self._ambiguous_adopt_buttons, self.ambiguous_ignore_button):
-            button.setEnabled(free)
+        self.ambiguous_combo.setEnabled(free and self.ambiguous_combo.count() > 0)
+        self.ambiguous_adopt_button.setEnabled(free and self.ambiguous_combo.count() > 0)
+        self.ambiguous_ignore_button.setEnabled(free)
+
+    def _adopt_ambiguous(self) -> None:
+        current = self._current_ambiguous()
+        if current is None:
+            return
+        wanted = self.ambiguous_combo.currentData()
+        candidate = next((c for c in current[0]["candidates"] if c["candidate_id"] == wanted), None)
+        if candidate is not None:
+            self._choose_ambiguous(candidate)
 
     def _select_ambiguous(self, _row: int) -> None:
         self._render_ambiguous_actions()
