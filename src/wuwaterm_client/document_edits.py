@@ -22,6 +22,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from . import manuscript
+
 # The editable keys of a draft, in the order a draft is written.
 DRAFT_KEYS = ("source", "target", "direction", "alignments", "choices")
 # The keys a review's answer depends on: a change to one makes the report stale.
@@ -190,3 +192,72 @@ class EditHistory:
 
     def can_redo(self) -> bool:
         return bool(self.redo)
+
+
+def remap_alignments_for_target_splice(
+    alignments: list[dict[str, Any]] | None,
+    source: str,
+    next_target: str,
+    start: int,
+    end: int,
+    replacement_len: int,
+    *,
+    fill_source_span: tuple[int, int] | None = None,
+    fill_target_span: tuple[int, int] | None = None,
+    fill_pair_source_span: tuple[int, int] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Remap explicit ``alignments`` after splicing ``target[start:end]`` to ``replacement_len`` scalars.
+
+    Preserves automatic correspondence (``None``), fills an explicit
+    ``target: null`` region when requested, shifts trailing regions by the
+    length delta, resizes an enclosing region (for localized edits or single-
+    segment re-translation), and falls back to ``[]`` if the splice crosses a
+    region boundary, leaves a requested fill unmatched, or fails schema
+    validation.
+    """
+    if alignments is None:
+        return None
+    if not alignments:
+        return []
+    delta = replacement_len - (end - start)
+    remapped: list[dict[str, Any]] = []
+    matched_fills = 0
+    for region in alignments:
+        s_span = copy.deepcopy(region["source"])
+        t_span = region["target"]
+        if t_span is None:
+            matches_fill = (
+                fill_source_span is not None
+                and fill_target_span is not None
+                and (
+                    (s_span["start"], s_span["end"]) == fill_source_span
+                    or (
+                        fill_pair_source_span is not None
+                        and fill_pair_source_span[0] <= s_span["start"]
+                        and s_span["end"] <= fill_pair_source_span[1]
+                    )
+                )
+            )
+            if matches_fill:
+                assert fill_target_span is not None
+                fs, fe = fill_target_span
+                new_t = {"start": fs, "end": fe, "text": next_target[fs:fe]} if fe > fs else None
+                matched_fills += 1
+            else:
+                new_t = None
+        else:
+            ts, te = int(t_span["start"]), int(t_span["end"])
+            if te <= start:
+                new_t = copy.deepcopy(t_span)
+            elif ts >= end:
+                ns, ne = ts + delta, te + delta
+                new_t = {"start": ns, "end": ne, "text": next_target[ns:ne]}
+            elif ts <= start and end <= te:
+                ne = te + delta
+                new_t = None if ne <= ts else {"start": ts, "end": ne, "text": next_target[ts:ne]}
+            else:
+                return []
+        remapped.append({"source": s_span, "target": new_t})
+    if fill_source_span is not None and matched_fills != 1:
+        return []
+    return remapped if manuscript._alignments(remapped, source, next_target) else []
