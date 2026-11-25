@@ -897,6 +897,7 @@ class ManuscriptView(QWidget):
         # whether the pairing last rendered had anything to send.
         self._l1_rows: list[tuple[int, dict]] = []
         self._l1_sendable = False
+        self._l1_views: list = []
         # Layer 2: issues left out because Layer 1 covers them, and folded
         # low-confidence ones.
         self._covered_count = 0
@@ -1902,15 +1903,22 @@ class ManuscriptView(QWidget):
         state = controller.structure
         running = controller.structure_running()
         pairs = self._cached_pairs()
+        if pairs is None:
+            # The text changed and its pairing comes after the pause: no row
+            # may describe text that is gone, so the list empties now and the
+            # results still valid come back with the pairing.
+            self._derived_timer.start()
+            if self._l1_rows or self.l1_list.count():
+                self._l1_rows = []
+                self.l1_list.clear()
+                self.l1_list.hide()
+            return
         configured = self._api_client.is_configured
         unavailable = controller.structure_known_unavailable()
         lines: list[str] = []
-        if pairs is None:
-            self._derived_timer.start()
-            items, batches, skipped, views = [], [], [], []
-        else:
-            items, batches, skipped = controller.structure_plan()
-            views = controller.structure_views(pairs)
+        items, batches, skipped = controller.structure_plan()
+        views = controller.structure_views(pairs)
+        self._l1_views = views
         summary = l1.summary(views)
         sendable = len(items) - len(skipped)
         if running:
@@ -1925,7 +1933,7 @@ class ManuscriptView(QWidget):
             lines.append(strings.MANUSCRIPT_L1_UNAVAILABLE)
         elif state.phase == "failed" and state.error is not None:
             lines.append(strings.MANUSCRIPT_L1_FAILED.format(reason=state.error[0]))
-        if pairs is not None and not items:
+        if not items:
             lines.append(strings.MANUSCRIPT_L1_NONE)
         elif summary.checked:
             if summary.findings == 0 and summary.omitted == 0:
@@ -1937,7 +1945,7 @@ class ManuscriptView(QWidget):
                 lines.append(strings.MANUSCRIPT_L1_OMITTED.format(count=summary.omitted))
             if summary.unchecked:
                 lines.append(strings.MANUSCRIPT_L1_UNCHECKED.format(count=summary.unchecked))
-        elif not running and not unavailable and state.phase != "failed" and pairs is not None:
+        elif not running and not unavailable and state.phase != "failed":
             lines.append(strings.MANUSCRIPT_L1_NOT_RUN)
         if batches and not running and not unavailable and not summary.checked:
             lines.append(strings.MANUSCRIPT_L1_COST.format(count=len(batches)))
@@ -2457,14 +2465,15 @@ class ManuscriptView(QWidget):
         if not issues or not self._controller.structure.results:
             return list(issues), 0
         pairs = self._cached_pairs()
-        if pairs is None:
-            return list(issues), 0
-        views = self._controller.structure_views(pairs)
+        # While a fresh edit waits for its pairing, the last views decide, so
+        # the list does not flicker on every keystroke.
+        views = self._controller.structure_views(pairs) if pairs is not None else self._l1_views
+        pairs = pairs if pairs is not None else self._controller.pairs
         listed, covered = [], 0
         for issue in issues:
             if self._issue_state(issue) in sessions.UNHANDLED:
                 index = self._issue_pair(issue, pairs)
-                view = views[index] if index is not None else None
+                view = views[index] if index is not None and index < len(views) else None
                 if l1.covered_by(issue.issue["category"], issue.source_span, issue.target_span, view):
                     covered += 1
                     continue
