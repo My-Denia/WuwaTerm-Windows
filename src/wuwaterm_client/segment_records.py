@@ -1,9 +1,10 @@
-"""Resumable long-manuscript term review: the v3/v4 segment records at runtime.
+"""Resumable long-manuscript term review: the v3 to v5 segment records at runtime.
 
 The contract is the public Web ``contracts/manuscript-v3/SPEC.md``; v4 raises the
 same records' caps without changing their shape
-(``contracts/manuscript-v4/SPEC.md``), and quoted section names refer to v3.
-Pure Python: no Qt, no HTTP.
+(``contracts/manuscript-v4/SPEC.md``), v5 adds review features and gap-tolerant
+records (``contracts/manuscript-v5/SPEC.md``), and quoted section names refer
+to v3. Pure Python: no Qt, no HTTP.
 
 State. The manuscript payload carries the v3 parts ``segments``,
 ``segment_choice_history`` and ``progress`` in their file shapes: record
@@ -25,13 +26,24 @@ request only when
    record's ``source_hash`` and ``target_hash``;
 3. the record's ``direction`` and ``alignment_input`` equal what a request for
    these cores would send now; and
-4. its basis is the same as the session's current basis in all six values.
+4. its basis is the same as the session's current basis in all six values;
+5. its review features (v5 SPEC "Review features") equal the session's: the
+   ones the next request asks Core for.
 
-1 to 3 make a *reuse candidate* (``reuse_candidate``); with 4 the result is
-*current* (``is_current``). Before the session has a basis nothing is current:
-a candidate shows as saved, no resolutions are sent, and the first check
+1 to 3 make a *reuse candidate* (``reuse_candidate``); with 4 and 5 the result
+is *current* (``is_current``). Before the session has a basis, or while the
+session's features are unknown (``None``: the service capabilities are not
+known yet), nothing is current: a candidate whose features do not contradict
+the session shows as saved, no resolutions are sent, and the first check
 (``next_index``) is the probe that supplies the basis. Every other record is
 checked again (``plan_request``, ``apply_response``).
+
+A record's features are its runtime ``features`` key, set when a response is
+stored (never written: the manuscript writer turns them into the file's
+``review_features``); a record read from a file has that file's
+``review_features`` (the payload key of that name), and a v1 to v4 file has
+none. So a v4 file opened against a service that lists
+``ambiguous-mention-v1`` is checked again once, segment by segment.
 
 A record is ``done`` only while its result was computed with exactly its
 confirmed choices as resolutions. When the confirmed choices change after the
@@ -69,7 +81,8 @@ from typing import Any, NamedTuple
 
 from . import manuscript, strings
 from .manuscript import (ALIGNMENT_AUTOMATIC, MAX_CORE_SCALARS, MAX_SEGMENT_CHOICE_HISTORY, MAX_SEGMENTS,
-                         MAX_V4_CHOICES, SEGMENTATION_VERSION, WorkfileError)
+                         MAX_V4_CHOICES, REVIEW_FEATURE_VALUES, SEGMENTATION_VERSION, WorkfileError,
+                         is_ambiguous_mention, record_features)
 from .segmentation import STATUS_READY, _sentence_pieces, pair_is_sendable
 from . import semantic_session as sessions
 from .semantic_session import _shift
@@ -89,6 +102,23 @@ class Parts(NamedTuple):
     segments: list
     history: list   # segment_choice_history, oldest first
     progress: dict
+
+
+def review_feature_set(tokens: Any) -> tuple[str, ...]:
+    """The sorted, known review features of a list (``REVIEW_FEATURE_VALUES``);
+    anything else is dropped."""
+    return tuple(sorted({t for t in tokens or () if isinstance(t, str) and t in REVIEW_FEATURE_VALUES}))
+
+
+def session_review_features(capabilities: Collection[str] | None) -> tuple[str, ...] | None:
+    """The review features a session asks Core for: ``ambiguous-mention-v1``
+    when the service lists it; ``None`` while the capabilities are unknown."""
+    return None if capabilities is None else review_feature_set(capabilities)
+
+
+def features_of(record: Mapping, payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """The features a record's result was made with (see the module docstring)."""
+    return review_feature_set(record_features(record, payload.get("review_features") or ()))
 
 
 def _empty_progress() -> dict:
@@ -233,7 +263,9 @@ def compact_result(report: Mapping, source_core: str, target_core: str) -> dict 
             findings.append(item)
         result = {"truncated": report["truncated"], "evaluated": report["coverage"]["evaluated"],
                   "not_evaluated": report["coverage"]["not_evaluated"], "findings": findings}
-        manuscript._check_result_shape(result, v4=True)
+        # v5 limits: an ``ambiguous_mention`` finding is stored only because the
+        # request asked for it (the API client refuses it otherwise).
+        manuscript._check_result_shape(result, v5=True)
     except (KeyError, TypeError, WorkfileError):
         return None
     seen: set[tuple[int, int]] = set()
@@ -412,15 +444,19 @@ class RecordView:
         return self.state in ("pending", "stale")
 
 
-def record_view(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> RecordView:
-    """Derive the same freshness for display, grouping and review planning."""
+def record_view(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None,
+                features: Sequence[str] | None = ()) -> RecordView:
+    """Derive the same freshness for display, grouping and review planning.
+    ``features``: the session's review features, ``None`` while unknown."""
     if record["result"] is None:
         return RecordView("pending", False)
     content = content_current(record, payload)
     if (record["status"] != "done" or not content
             or _input_now(record, payload) != record["alignment_input"]):
         return RecordView("stale", content)
-    if basis is None:
+    if features is not None and features_of(record, payload) != review_feature_set(features):
+        return RecordView("stale", content)
+    if basis is None or features is None:
         return RecordView("saved", content)
     return RecordView("current" if same_basis(record["basis"], basis) else "stale", content)
 
@@ -432,27 +468,31 @@ class RecordViews:
         self._key: tuple | None = None
         self._views: dict[int, tuple[Mapping, RecordView]] = {}
 
-    def get(self, record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> RecordView:
-        key = (payload["source"], payload["target"], payload["alignments"], payload["direction"], basis)
-        if (self._key is None or any(a is not b for a, b in zip(self._key, key))
-                or self._key[3] != key[3]):
+    def get(self, record: Mapping, payload: Mapping[str, Any], basis: Mapping | None,
+            features: Sequence[str] | None = ()) -> RecordView:
+        key = (payload["source"], payload["target"], payload["alignments"], payload["direction"], basis,
+               None if features is None else tuple(features), payload.get("review_features"))
+        if (self._key is None or any(a is not b for a, b in zip(self._key[:5], key[:5]))
+                or self._key[3] != key[3] or self._key[5:] != key[5:]):
             self._key = key
             self._views.clear()
         hit = self._views.get(id(record))
         if hit is None or hit[0] is not record:
-            hit = record, record_view(record, payload, basis)
+            hit = record, record_view(record, payload, basis, features)
             self._views[id(record)] = hit
         return hit[1]
 
 
-def is_current(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> bool:
+def is_current(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None,
+               features: Sequence[str] | None = ()) -> bool:
     """The whole reuse rule (step 5); never while the session has no basis."""
-    return record_view(record, payload, basis).state == "current"
+    return record_view(record, payload, basis, features).state == "current"
 
 
-def needs_check(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None) -> bool:
+def needs_check(record: Mapping, payload: Mapping[str, Any], basis: Mapping | None,
+                features: Sequence[str] | None = ()) -> bool:
     """Without a basis yet: not a reuse candidate. With one: not current."""
-    return record_view(record, payload, basis).needs_check
+    return record_view(record, payload, basis, features).needs_check
 
 
 @dataclass(frozen=True)
@@ -463,7 +503,8 @@ class TermPlan:
 
 
 def term_plan(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None,
-              skip: Collection[int] = (), views: RecordViews | None = None) -> TermPlan:
+              skip: Collection[int] = (), views: RecordViews | None = None,
+              features: Sequence[str] | None = ()) -> TermPlan:
     """Plan sendable term checks and the single first live-basis probe."""
     parts = parts_of(payload)
     if len(parts.segments) != len(pairs) or any(
@@ -473,7 +514,7 @@ def term_plan(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
     source, target = payload["source"], payload["target"]
     views = views if views is not None else RecordViews()
     ready = [i for i, pair in enumerate(pairs) if i not in skip and pair_is_sendable(pair, source, target)]
-    due = tuple(i for i in ready if views.get(parts.segments[i], payload, basis).needs_check)
+    due = tuple(i for i in ready if views.get(parts.segments[i], payload, basis, features).needs_check)
     probe = None
     if basis is None and ready:
         current = parts.progress["current"]
@@ -484,14 +525,14 @@ def term_plan(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
 
 
 def next_index(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None,
-               skip: Collection[int] = ()) -> int | None:
+               skip: Collection[int] = (), features: Sequence[str] | None = ()) -> int | None:
     """The next segment to check among the sendable pairs not in ``skip``.
 
     With a basis: the first segment that needs a check. Without one (step 4,
     the probe): the segment at ``progress.current`` if it needs a check, else
     the first that does, else ``progress.current`` or the first sendable
     segment, because the probe must still supply the basis."""
-    plan = term_plan(payload, pairs, basis, skip)
+    plan = term_plan(payload, pairs, basis, skip, features=features)
     return plan.order[0] if plan.order else None
 
 
@@ -511,12 +552,13 @@ class NextReview:
 
 def next_review(payload: Mapping[str, Any], pairs: Sequence, term_basis: Mapping | None,
                 session: sessions.Session, semantic_basis: sessions.Basis, *, terms: bool,
-                attempted: Collection[tuple] = (), views: RecordViews | None = None) -> NextReview | None:
+                attempted: Collection[tuple] = (), views: RecordViews | None = None,
+                features: Sequence[str] | None = ()) -> NextReview | None:
     """Combine term and semantic work, giving the first term-basis probe priority."""
     source, target = payload["source"], payload["target"]
     skip = {i for i, pair in enumerate(pairs) if pair_key(pair, source, target) in attempted}
     views = views if views is not None else RecordViews()
-    plan = term_plan(payload, pairs, term_basis, skip, views) if terms else None
+    plan = term_plan(payload, pairs, term_basis, skip, views, features) if terms else None
     term = plan.order[0] if plan and plan.order else None
     if plan is not None and plan.probe is not None:
         index = plan.probe
@@ -527,7 +569,8 @@ def next_review(payload: Mapping[str, Any], pairs: Sequence, term_basis: Mapping
         if not indexes:
             return None
         index = min(indexes)
-    need_term = terms and (term_basis is None or views.get(parts_of(payload).segments[index], payload, term_basis).needs_check)
+    need_term = terms and (term_basis is None or views.get(
+        parts_of(payload).segments[index], payload, term_basis, features).needs_check)
     need_semantic = semantic_basis.needs(session.result_for(pairs[index], source, target))
     return NextReview(index, need_term, need_semantic)
 
@@ -569,10 +612,11 @@ class Request:
     resolutions: list              # [] when none are sent
     resolution_context: dict | None
     realign: bool                  # step 6, second case: realign every choice against the response
+    features: tuple[str, ...] = ()  # the review features asked for; stored with the result
 
 
 def plan_request(payload: Mapping[str, Any], index: int, basis: Mapping | None, *,
-                 allow_resolutions: bool = True) -> Request:
+                 allow_resolutions: bool = True, features: Sequence[str] | None = ()) -> Request:
     """Step 6. The record's confirmed choices go out as resolutions when its source
     hash, direction and basis are unchanged; otherwise none go out and the
     response realigns every choice. Before the session has a basis, nothing
@@ -596,7 +640,7 @@ def plan_request(payload: Mapping[str, Any], index: int, basis: Mapping | None, 
                    alignments=items, alignment_input=ALIGNMENT_AUTOMATIC if items is None else _digest(items),
                    resolutions=resolutions,
                    resolution_context=resolution_context(source_hash, basis) if resolutions else None,
-                   realign=not carry)
+                   realign=not carry, features=review_feature_set(features))
 
 
 @dataclass(frozen=True)
@@ -646,7 +690,7 @@ def apply_response(payload: Mapping[str, Any], request: Request, report: Mapping
     if request.index >= len(segments) or not _matches(segments[request.index], payload, request):
         return Applied(parts, current, "discarded")
     record = segments[request.index]
-    if is_current(record, payload, current):
+    if is_current(record, payload, current, request.features):
         return Applied(parts, current, "current")
     result = compact_result(report, request.source, request.target)
     if result is None:
@@ -669,6 +713,11 @@ def apply_response(payload: Mapping[str, Any], request: Request, report: Mapping
               "status": status, "direction": request.direction, "alignment_input": request.alignment_input,
               "basis": new_basis, "result": result, "choices": choices}
     stored.pop(PRIOR, None)
+    # A record states its features only where they are not the file's own, so
+    # memory and the written file stay alike in the usual case.
+    stored.pop("features", None)
+    if request.features != review_feature_set(payload.get("review_features") or ()):
+        stored["features"] = request.features
     return Applied(_replace(parts, request.index, stored), current, "stored", again=status == "stale")
 
 
@@ -771,17 +820,20 @@ def without_records(payload: Mapping[str, Any], *, check_limits: bool = True) ->
     return Parts([], history, _empty_progress())
 
 
-def _new_record(index: int, core: tuple, hashes: tuple[str, str]) -> dict:
+def _new_record(index: int, core: tuple, hashes: tuple[str, str], version: str = SEGMENTATION_VERSION) -> dict:
     (a, b), (c, d) = core
-    return {"index": index, "segmentation_version": SEGMENTATION_VERSION, "source_start": a, "source_end": b,
+    return {"index": index, "segmentation_version": version, "source_start": a, "source_end": b,
             "target_start": c, "target_end": d, "source_hash": hashes[0], "target_hash": hashes[1],
             "status": "pending", "direction": None, "alignment_input": None, "basis": None, "result": None,
             "choices": []}
 
 
 def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None = None, *,
-              check_limits: bool = True) -> Parts:
-    """The parts mapped to ``pairs``, the current segmentation-v1 pairing of the payload.
+              check_limits: bool = True, version: str = SEGMENTATION_VERSION) -> Parts:
+    """The parts mapped to ``pairs``, the current pairing of the payload, and
+    labelled ``version`` (``segmentation-v1``, or ``segmentation-v1-gaps`` when
+    explicit alignments leave text uncovered: v5 SPEC "Gap-tolerant segment
+    records"). The label says how the ranges were cut; it never decides reuse.
 
     In long mode there is one record per pair, in order. Records map by position
     when the counts and all core ranges are equal; otherwise matching runs in
@@ -867,7 +919,7 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
     for j, i in enumerate(match):
         core, now = cores[j], hashes[j]
         if i is None:
-            records.append(_new_record(j, core, now))
+            records.append(_new_record(j, core, now, version))
             continue
         record = old[i]
         (a, b), (c, d) = core
@@ -896,8 +948,8 @@ def normalize(payload: Mapping[str, Any], pairs: Sequence, basis: Mapping | None
                 status = "stale"
             if status != record["status"] or len(choices) != len(record["choices"]):
                 record = {**record, "status": status, "choices": choices}
-        updates = {"index": j, "source_start": a, "source_end": b, "target_start": c, "target_end": d,
-                   "source_hash": now[0], "target_hash": now[1]}
+        updates = {"index": j, "segmentation_version": version, "source_start": a, "source_end": b,
+                   "target_start": c, "target_end": d, "source_hash": now[0], "target_hash": now[1]}
         if any(record[key] != value for key, value in updates.items()):
             record = {**record, **updates}
         records.append(record)
@@ -1259,11 +1311,13 @@ def _record_freshness(
     direction: str,
     alignments: Sequence[Mapping] | None,
     basis: Mapping | None,
+    features: Sequence[str] | None = (),
+    file_features: Sequence[str] | None = None,
 ) -> str | None:
     """``current``, ``saved`` or ``stale`` when the record's content hashes and
     direction match the current cores; ``None`` when pending or content-diverged."""
     view = record_view(record, {"source": source, "target": target, "direction": direction,
-                                "alignments": alignments}, basis)
+                                "alignments": alignments, "review_features": file_features}, basis, features)
     return view.state if view.content_current else None
 
 
@@ -1290,11 +1344,20 @@ def group_term_occurrences(
     *,
     alignments: Sequence[Mapping] | None = None,
     basis: Mapping | None = None,
+    features: Sequence[str] | None = (),
+    file_features: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Aggregate findings across non-pending content-current (current/saved/stale)
     segment records by source surface (merging English singular/plural surfaces
     sharing candidate sets), with per-occurrence spans, ~28–40 scalar context
     snippets, rendering distribution and group status.
+
+    Ambiguous one-character names (``ambiguous_mention``) are no place in any
+    group and take no ``finding_index``: they are not evaluated and not a
+    problem until the user resolves them, so a caller lists them apart, after
+    the groups. ``features`` is the session's review
+    feature set (``None`` while unknown), ``file_features`` the
+    ``review_features`` of the file the records were read from.
 
     A ready segment with no usable record yet is not a place in any group, but
     its source core may hold one of a group's spellings: ``unverified_segments``
@@ -1314,7 +1377,8 @@ def group_term_occurrences(
         seg_index = record.get("index", fallback_idx)
         if pairs and 0 <= seg_index < len(pairs) and getattr(pairs[seg_index], "status", STATUS_READY) != STATUS_READY:
             continue
-        freshness = _record_freshness(record, source, target, direction, alignments, basis)
+        freshness = _record_freshness(record, source, target, direction, alignments, basis, features,
+                                      file_features)
         if freshness is None:
             continue
         checked.add(seg_index)
@@ -1325,6 +1389,8 @@ def group_term_occurrences(
         choices_by_place = {_place(c): c for c in record.get("choices") or ()}
 
         for finding in expanded["findings"]:
+            if is_ambiguous_mention(finding):
+                continue
             core_s = finding["source_span"]
             core_t = finding["target_span"]
             doc_s = {
@@ -1510,3 +1576,14 @@ def group_term_occurrences(
     for g in groups:
         g.pop("_order", None)
     return groups
+
+
+def adopt_file_features(payload: Mapping[str, Any], features: Sequence[str]) -> tuple[Parts, tuple[str, ...]]:
+    """After a save: the file's ``review_features`` become the payload's, and a
+    record whose own features equal them no longer states them."""
+    file_features = review_feature_set(features)
+    parts = parts_of(payload)
+    segments = [{k: v for k, v in record.items() if k != "features"}
+                if "features" in record and review_feature_set(record["features"]) == file_features else record
+                for record in parts.segments]
+    return parts._replace(segments=_shared(parts.segments, segments)), file_features

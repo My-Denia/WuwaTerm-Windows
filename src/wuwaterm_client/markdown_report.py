@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .manuscript import recover_span
@@ -325,11 +325,18 @@ def scope_of(alignments: list | None, span: Mapping) -> str:
 
 
 def reconcile_choices(choices: Sequence[Mapping], draft: Mapping, fresh: Mapping | None, *,
-                      imported: bool = True, submits: bool = False) -> list[dict]:
+                      imported: bool = True, submits: bool = False,
+                      own: Callable[[Mapping], bool] | None = None) -> list[dict]:
     """Web ``reconcileChoices``. ``fresh`` is the latest snapshot with its
     ``trusted`` flag. Windows short manuscripts never submit a file's choices,
-    so unless ``submits``, an applicable choice is reported as pending."""
+    so unless ``submits``, an applicable choice is reported as pending.
+    ``own`` names the choices made in this session: those are not imported and
+    are submitted (an ambiguous one-character name's choice), whatever
+    ``imported`` and ``submits`` say for the rest."""
     def one(choice: Mapping) -> dict:
+        mine = own is not None and own(choice)
+        imported_here = imported and not mine
+        submits_here = submits or mine
         span = recover_span(choice["source"], choice["source_span"], draft["source"])
 
         def pending(code: str) -> dict:
@@ -349,7 +356,7 @@ def reconcile_choices(choices: Sequence[Mapping], draft: Mapping, fresh: Mapping
         if finding is None or fresh["report"]["truncated"]:
             return pending("finding_missing_or_truncated")
         if choice["choice"] == "not_a_term":
-            if imported:
+            if imported_here:
                 return pending("imported_not_a_term")
             code = "user_not_a_term"
         else:
@@ -359,7 +366,7 @@ def reconcile_choices(choices: Sequence[Mapping], draft: Mapping, fresh: Mapping
                        for c in finding["candidates"]):
                 return pending("candidate_gone")
             code = "candidate_partial_visible" if finding["candidates_truncated"] else "position_basis_match"
-        if not submits:
+        if not submits_here:
             return pending("desktop_not_submitted")
         return {"status": "applicable", "code": code, "reason": CHOICE_REASONS[code], "span": span}
     results = [one(choice) for choice in choices]

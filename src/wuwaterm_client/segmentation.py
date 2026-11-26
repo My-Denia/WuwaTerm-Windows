@@ -7,6 +7,12 @@ reference implementation at commit 7122ea7cb41e5987aac80b23fc27bd071fcfa22b
 fixtures in Core's ``contracts/segmentation-v1.json`` decide any
 disagreement between this module, the rule text and the reference.
 
+``pair_segments_with_gaps`` is the gap-tolerant pairing of the public Web
+``contracts/manuscript-v5/SPEC.md`` ("Gap-tolerant segment records", Web
+``lib/segmentation.ts`` ``pairSegmentsWithGaps``): explicit alignments that
+leave text outside every span keep their own regions, and only the uncovered
+text becomes gap regions, instead of one whole-document manual pair.
+
 All offsets are Unicode scalar indices (Python str indices). Qt uses UTF-16
 offsets; convert with ``utf16_index`` / ``scalar_index``. Standard library only.
 """
@@ -18,6 +24,10 @@ from dataclasses import dataclass
 
 import re
 
+SEGMENTATION_VERSION = "segmentation-v1"
+# The pairing label of a draft whose explicit alignments leave text outside
+# every span (manuscript-v5 SPEC "Gap-tolerant segment records").
+GAP_SEGMENTATION_VERSION = "segmentation-v1-gaps"
 SEGMENT_LIMIT = 1800
 HARD_CUT_WINDOW = 200
 BOUNDARY_PUNCTUATION = "，、；：,;:"
@@ -327,10 +337,10 @@ def _has_non_ws(text: str, start: int, end: int) -> bool:
     return any(ch not in WHITESPACE for ch in text[start:end])
 
 
-def _alignment_region_pairs(
+def _alignment_spans(
     source: str, target: str, alignments: Sequence[Mapping]
-) -> list[tuple[int, int, int, int]] | None:
-    """Region pairs from alignments; None when non-WS text lies outside them."""
+) -> tuple[list[tuple[int, int]], list[tuple[int, int] | None]]:
+    """The checked source and target spans of an alignment list, in order."""
     src_spans: list[tuple[int, int]] = []
     tgt_spans: list[tuple[int, int] | None] = []
     prev_s = 0
@@ -351,6 +361,14 @@ def _alignment_region_pairs(
             prev_t = t_span[1]
         src_spans.append(s_span)
         tgt_spans.append(t_span)
+    return src_spans, tgt_spans
+
+
+def _alignment_region_pairs(
+    source: str, target: str, alignments: Sequence[Mapping]
+) -> list[tuple[int, int, int, int]] | None:
+    """Region pairs from alignments; None when non-WS text lies outside them."""
+    src_spans, tgt_spans = _alignment_spans(source, target, alignments)
 
     # Non-WS scalars outside every span make the whole alignment untrustworthy.
     pos = 0
@@ -541,6 +559,12 @@ def pair_segments(
             aligned = False
             pairs = _classify_region_pair(source, target, whole, limit, aligned)
 
+    return _finish_pairs(source, target, pairs, limit)
+
+
+def _finish_pairs(source: str, target: str, pairs: Sequence[_Pair], limit: int) -> list[SegmentPair]:
+    """The common tail of both pairings: adjacent small ready pairs merge,
+    indexes are assigned, and the partition is checked."""
     # Greedy merge of adjacent ready, non-hard pairs.
     merged: list[_Pair] = []
     for pair in pairs:
@@ -578,6 +602,130 @@ def pair_segments(
         )
     _validate_pairs(source, target, result, limit)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Gap-tolerant pairing (manuscript-v5 SPEC "Gap-tolerant segment records")
+# ---------------------------------------------------------------------------
+
+
+def alignments_leave_gaps(source: str, target: str, alignments: Sequence[Mapping] | None) -> bool:
+    """Explicit alignments that leave a non-WS scalar outside every span on
+    either side: the case segmentation-v1 pairs as one whole-document pair."""
+    if not alignments:
+        return False
+    if not _has_non_ws(source, 0, len(source)) and not _has_non_ws(target, 0, len(target)):
+        return False
+    return _alignment_region_pairs(source, target, alignments) is None
+
+
+def _gap_extent(text: str, start: int, end: int) -> tuple[int, int] | None:
+    return _core(text, start, end) if _has_non_ws(text, start, end) else None
+
+
+_Item = tuple[str, "tuple[int, int] | None", "tuple[int, int] | None"]  # (kind, source extent, target extent)
+
+
+def _gap_items(
+    source: str,
+    target: str,
+    src: Sequence[tuple[int, int]],
+    tgt: Sequence[tuple[int, int] | None],
+) -> list[_Item]:
+    """The items of a gapped alignment list, in text order. Between two
+    alignments that have a target (anchors), the source gaps of the slots in
+    between and the one target gap there become: with no target gap, one
+    source-only gap item per source gap (untranslated), the null-target
+    alignments unchanged; with a target gap, no null-target alignment and at
+    most one source gap, one gap item holding both; otherwise one gap item over
+    everything between the two anchors, null-target alignments included,
+    because nothing says which part of the target belongs to which."""
+    n = len(src)
+    items: list[_Item] = []
+
+    def source_gap(k: int) -> tuple[int, int] | None:
+        return _gap_extent(source, src[k - 1][1] if k > 0 else 0, src[k][0] if k < n else len(source))
+
+    anchors = [i for i, span in enumerate(tgt) if span is not None]
+    prev = -1
+    for b in [*anchors, n]:
+        t_from = tgt[prev][1] if prev >= 0 else 0  # type: ignore[index]
+        t_to = tgt[b][0] if b < n else len(target)  # type: ignore[index]
+        t_gap = _gap_extent(target, t_from, t_to)
+        slots = list(range(prev + 1, b + 1))
+        source_gaps = [k for k in slots if source_gap(k) is not None]
+        null_targets = b - prev - 1
+        if t_gap is None:
+            for k in slots:
+                gap = source_gap(k)
+                if gap is not None:
+                    items.append(("gap", gap, None))
+                if k < b:
+                    items.append(("aligned", src[k], None))
+        elif null_targets == 0 and len(source_gaps) <= 1:
+            items.append(("gap", source_gap(source_gaps[0]) if source_gaps else None, t_gap))
+        else:
+            items.append(("gap", _gap_extent(source, src[prev][1] if prev >= 0 else 0,
+                                             src[b][0] if b < n else len(source)), t_gap))
+        if b < n:
+            items.append(("aligned", src[b], tgt[b]))
+        prev = b
+    return items
+
+
+def pair_segments_with_gaps(
+    source: str,
+    target: str,
+    limit: int = SEGMENT_LIMIT,
+    alignments: Sequence[Mapping] | None = None,
+) -> tuple[list[SegmentPair], str]:
+    """Pairs of a draft under its pairing label, and that label.
+
+    Without explicit alignments, or when they cover the text, this is
+    ``pair_segments`` (segmentation-v1). When they leave text outside every
+    span, every alignment keeps its own region and only the uncovered text
+    becomes gap regions (``GAP_SEGMENTATION_VERSION``): a gap with text on both
+    sides needs a manual split, a source-only gap is untranslated and a
+    target-only gap is an unpaired target. A gap is never ready: its pairing is
+    a guess."""
+    if alignments is not None and (
+        not isinstance(alignments, Sequence)
+        or isinstance(alignments, (str, bytes, bytearray))
+    ):
+        raise ValueError("alignments must be an array")
+    if not alignments_leave_gaps(source, target, alignments):
+        return pair_segments(source, target, limit, alignments), SEGMENTATION_VERSION
+    src, tgt = _alignment_spans(source, target, alignments)  # type: ignore[arg-type]
+    items = _gap_items(source, target, src, tgt)
+    m = len(items)
+
+    def bounds(side: int, length: int) -> list[int]:
+        out = [0] * (m + 1)
+        out[m] = length
+        for i in range(m - 1, 0, -1):
+            extent = items[i][side]
+            out[i] = extent[0] if extent is not None else out[i + 1]  # type: ignore[index]
+        return out
+
+    s_b, t_b = bounds(1, len(source)), bounds(2, len(target))
+    # As segmentation-v1: a region whose two cores are empty (an all-WS
+    # alignment span) joins the region before it, or after it when first.
+    kept = [(items[i][0], (s_b[i], s_b[i + 1], t_b[i], t_b[i + 1])) for i in range(m)]
+    kept = [(kind, r) for kind, r in kept if _core_len(source, r[0], r[1]) or _core_len(target, r[2], r[3])]
+    pairs: list[_Pair] = []
+    for k, (kind, r) in enumerate(kept):
+        last = k + 1 >= len(kept)
+        region = (0 if k == 0 else r[0], len(source) if last else kept[k + 1][1][0],
+                  0 if k == 0 else r[2], len(target) if last else kept[k + 1][1][2])
+        if kind == "aligned":
+            pairs.extend(_classify_region_pair(source, target, region, limit, True))
+            continue
+        s_len = _core_len(source, region[0], region[1])
+        t_len = _core_len(target, region[2], region[3])
+        status = (STATUS_NEEDS_MANUAL_SPLIT if s_len and t_len
+                  else STATUS_UNTRANSLATED if s_len else STATUS_UNPAIRED_TARGET)
+        pairs.append(_Pair(status, False, *region))
+    return _finish_pairs(source, target, pairs, limit), GAP_SEGMENTATION_VERSION
 
 
 # ---------------------------------------------------------------------------

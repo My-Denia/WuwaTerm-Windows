@@ -19,7 +19,11 @@ from a superseded run is dropped instead of shown:
   bad segment from a bad service;
 * one translation run (``start_translation``/``run_translation``): piece by
   piece, resumable from the first unfinished piece, writing what it finished as
-  one undoable edit.
+  one undoable edit;
+* the Layer 1 structure check (``start_structure_check``/``run_structure_check``,
+  Core ``POST /v1/structure-checks``): deterministic, user-triggered, and kept
+  in ``structure`` only - never in the payload, an undo step, a recovery draft
+  or an export.
 
 The document's own commands live here too, because they commit to the same
 state the runs commit to and through the same checks: ``apply_edit`` and the
@@ -54,8 +58,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
+from . import markdown_report as mdr
 from . import segment_records as sr, semantic, strings
 from . import semantic_session as sessions
+from . import structure
 from .document_edits import (
     TYPING_COALESCE_MS, AlignmentRemap, HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome,
     PART_KEYS, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED,
@@ -69,12 +75,13 @@ from .errors import (
     ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
 )
 from .manuscript import (
-    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, ReviewReport, WorkfileError,
-    empty_workfile, sanitize_duplicate_choices, semantic_payload_fits, serialize_workfile,
+    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, MAX_V4_CHOICES, ReviewReport, WorkfileError,
+    empty_workfile, recover_span, sanitize_duplicate_choices, semantic_payload_fits, serialize_workfile,
 )
 from .segmentation import (
-    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
-    _core as seg_core, _paragraph_ranges as seg_paragraph_ranges, pair_is_sendable, pair_segments, segment_text,
+    SEGMENT_LIMIT, SEGMENTATION_VERSION, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
+    _core as seg_core, _paragraph_ranges as seg_paragraph_ranges, pair_is_sendable, pair_segments,
+    pair_segments_with_gaps, segment_text,
 )
 
 # The whole-manuscript term review keeps its historical request shape; above
@@ -96,6 +103,11 @@ TRANSLATION_IDLE = "idle"
 # The draft primitives (``copy_payload``, ``normalize_semantic``, ``PART_KEYS``)
 # live in ``document_edits``: the runs and the commands commit through them,
 # and they are imported here so this module's surface does not move with them.
+
+
+def _features_kw(features: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """``review_pair``'s ``features`` argument, only when there are features."""
+    return {"features": tuple(features)} if features else {}
 
 
 def blank(text: str) -> bool:
@@ -159,13 +171,19 @@ class WorkbenchApiClient(Protocol):
     async def get_capabilities(self) -> frozenset[str]:
         """The optional capabilities the server lists (empty when it lists none)."""
 
+    async def structure_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        """One Layer 1 batch (``structure-check-v1``), checked for exactly these segments."""
+
     async def review_pair(
         self, source: str, target: str, direction: str, *,
         alignments: list[dict[str, Any]] | None = None,
         resolutions: list[dict[str, Any]] | None = None,
         resolution_context: dict[str, str] | None = None,
+        features: Sequence[str] = (),
     ) -> ReviewReport:
-        """One term check (``review-v2``): the report for exactly these sides."""
+        """One term check (``review-v2``): the report for exactly these sides.
+        ``features``: the recorded review features to ask for (sent only when
+        there are any, so a stand-in without them keeps working)."""
 
     async def semantic_review(
         self, source: str, target: str, direction: str, *,
@@ -240,6 +258,9 @@ class WorkbenchHost(Protocol):
     def selected_segment(self):
         """The segment the owner has selected, as a pair, or None."""
 
+    def render_structure(self) -> None:
+        """Show the Layer 1 state (``DocumentRunController.structure``)."""
+
     def apply_target_write(
         self,
         changed: str,
@@ -313,6 +334,20 @@ class DocumentRunController:
         # The pairing of the current text, cached by the text it was made from.
         self.pairs_key: tuple | None = None
         self.pairs: list = []
+        # The pairing label of ``pairs``: segmentation-v1, or segmentation-v1-gaps
+        # when explicit alignments leave text uncovered (manuscript v5).
+        self.pairs_version = SEGMENTATION_VERSION
+        # Layer 1 structure checks: session state only, never saved anywhere.
+        self.structure = structure.State()
+        self.structure_generation = 0
+        self.structure_task: asyncio.Task | None = None
+        # Document-mode choices made in this session (by identity): only these
+        # go out as resolutions; a file's choices stay on file (Windows short
+        # manuscripts never submit them).
+        self.session_choices: list[dict] = []
+        # Document reports checked in this session (by equality): only these
+        # can be the basis of a document choice or of the resolutions it sends.
+        self.trusted_snapshots: list[dict] = []
         # Counts every payload change the document's title and dirty flag see.
         self.document_revision = 0
         # Translation of the target side.
@@ -339,11 +374,13 @@ class DocumentRunController:
         key = self.pairs_key_now()
         if key != self.pairs_key:
             try:
-                pairs = pair_segments(source, target, SEGMENT_LIMIT, alignments)
+                # Explicit alignments that leave text uncovered keep every
+                # aligned region; only the gap needs a manual split (MY-496).
+                pairs, version = pair_segments_with_gaps(source, target, SEGMENT_LIMIT, alignments)
             except (ValueError, TypeError, AssertionError):
                 # Alignments the rule cannot use fall back to automatic pairing.
-                pairs = pair_segments(source, target, SEGMENT_LIMIT, None)
-            self.pairs_key, self.pairs = key, pairs
+                pairs, version = pair_segments(source, target, SEGMENT_LIMIT, None), SEGMENTATION_VERSION
+            self.pairs_key, self.pairs, self.pairs_version = key, pairs, version
         return self.pairs
 
     def cached_pairs(self) -> list | None:
@@ -384,7 +421,8 @@ class DocumentRunController:
                     *(payload.get(key) for key in PART_KEYS))
         seen = self.records_seen
         if seen is None or seen[-1] != payload["direction"] or any(a is not b for a, b in zip(seen, now())):
-            self.put_parts(sr.normalize(payload, pairs, self.term_basis, check_limits=False))
+            self.put_parts(sr.normalize(payload, pairs, self.term_basis, check_limits=False,
+                                        version=self.pairs_version if long else SEGMENTATION_VERSION))
             self.records_seen = (*now(), payload["direction"])
         return payload.get("segments") or [] if long else None
 
@@ -394,6 +432,17 @@ class DocumentRunController:
 
     def semantic_available(self) -> bool:
         return self.capabilities is not None and semantic.CAPABILITY_SEMANTIC_REVIEW in self.capabilities
+
+    def review_features(self) -> tuple[str, ...] | None:
+        """The review features this session asks Core for (manuscript-v5 SPEC
+        "Review features"): ``ambiguous-mention-v1`` when the server lists it,
+        ``None`` while the capabilities are unknown. A saved result is current
+        only under the features it was made with."""
+        return sr.session_review_features(self.capabilities)
+
+    def structure_known_unavailable(self) -> bool:
+        """The server answered its capabilities without structure-check-v1."""
+        return self.capabilities is not None and structure.CAPABILITY_STRUCTURE_CHECK not in self.capabilities
 
     def alignments_for(self, source_core: tuple[int, int], target_core: tuple[int, int]) -> list | None:
         """The owner's correspondence for one segment's term request
@@ -420,10 +469,15 @@ class DocumentRunController:
                                            payload["source"], payload["target"])
 
     def reset_term_session(self) -> None:
-        """A new document or service: no term basis yet, so nothing saved is current."""
+        """A new document or service: no term basis yet, so nothing saved is current.
+        Layer 1 results and this session's document choices belong to it too."""
         self.term_basis = None
         self.records_seen = None
-        self.pairs_key, self.pairs = None, []
+        self.pairs_key, self.pairs, self.pairs_version = None, [], SEGMENTATION_VERSION
+        self.cancel_structure_check()
+        self.structure = structure.State()
+        self.session_choices = []
+        self.trusted_snapshots = []
 
     def reset_known_texts(self, value: dict | None = None) -> None:
         """The texts on-file decisions usually refer to; kept across edits.
@@ -728,6 +782,92 @@ class DocumentRunController:
         history = [entry for number, entry in enumerate(parts.history) if number != position]
         return self.apply_parts_edit(parts._replace(history=history))
 
+    # Document-mode choices: only an ambiguous one-character name
+    # (``ambiguous_mention``) is resolved here. The choice is staged in the
+    # manuscript and goes out as a resolution with the next document check;
+    # choices read from a file are never sent (``markdown_report``'s
+    # ``desktop_not_submitted``).
+
+    def latest_trusted(self) -> dict | None:
+        """The newest document report checked in this session for the text as it
+        is now: the basis a document choice is made against."""
+        history = self.payload["history"]
+        latest = history[-1] if history else None
+        if (latest is None or latest not in self.trusted_snapshots
+                or latest["source"] != self.payload["source"] or latest["direction"] != self.payload["direction"]):
+            return None
+        return latest
+
+    def document_choice_at(self, finding: Mapping[str, Any]) -> dict | None:
+        """The manuscript's document choice whose span now reads this finding's place."""
+        span = finding["source_span"]
+        for choice in self.payload["choices"]:
+            recovered = recover_span(choice["source"], choice["source_span"], self.payload["source"])
+            if recovered is not None and sr.mention_id(recovered) == sr.mention_id(span):
+                return choice
+        return None
+
+    def is_session_choice(self, choice: Mapping[str, Any] | None) -> bool:
+        return choice is not None and choice in self.session_choices
+
+    def choose_document(self, finding: Mapping[str, Any], candidate: Mapping[str, Any] | None, *,
+                        view_state: dict | None = None) -> CommandOutcome:
+        """Adopt ``candidate`` (an official pair) or mark the place not a term,
+        at a finding of the latest report checked in this session (Web
+        ``choose``). It replaces any choice at the same place, is one undoable
+        edit, and goes out as a resolution with the next document check. A
+        short manuscript holds up to 128 choices, as v4/v5 files and Core's
+        ``resolutions`` do."""
+        latest = self.latest_trusted()
+        if latest is None or latest["report"]["truncated"]:
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        span = recover_span(latest["source"], finding["source_span"], self.payload["source"])
+        if span is None or (candidate is not None and not any(
+                c["candidate_id"] == candidate["candidate_id"] for c in finding["candidates"])):
+            return CommandOutcome(reason=REASON_NOT_APPLICABLE)
+        report = latest["report"]
+        made = {
+            "source": self.payload["source"], "direction": self.payload["direction"], "source_span": dict(span),
+            "scope": mdr.scope_of(self.payload["alignments"], span),
+            "choice": sr.OFFICIAL_PAIR if candidate is not None else sr.NOT_A_TERM,
+            "candidate": None if candidate is None else {key: candidate[key] for key in (
+                "candidate_id", "zh", "en", "category")},
+            "basis": mdr.basis_of(report),
+        }
+        value = self.draft_snapshot()
+        existing = self.document_choice_at({"source_span": span})
+        choices = [c for c in value["choices"] if c != existing]
+        if existing is None and len(choices) >= MAX_V4_CHOICES:
+            return CommandOutcome(reason=REASON_FULL)
+        value["choices"] = [*choices, made]
+        self.session_choices = [c for c in self.session_choices if c != existing] + [copy.deepcopy(made)]
+        return CommandOutcome(True, edit=self.apply_edit(value, view_state=view_state))
+
+    def document_resolutions(self) -> tuple[list[dict], dict | None]:
+        """The resolutions and their context the next document check sends: this
+        session's choices that still apply to the latest trusted report (Web
+        ``reconcileChoices``), nothing else."""
+        latest = self.latest_trusted()
+        own = [c for c in self.payload["choices"] if self.is_session_choice(c)]
+        if latest is None or not own:
+            return [], None
+        report = latest["report"]
+        reconciled = mdr.reconcile_choices(own, self.payload, {**latest, "trusted": True},
+                                           imported=False, submits=True)
+        resolutions = []
+        for choice, item in zip(own, reconciled, strict=True):
+            if item["status"] != "applicable":
+                continue
+            resolution = {"mention_id": sr.mention_id(item["span"]), "choice": choice["choice"]}
+            if choice["choice"] == sr.OFFICIAL_PAIR:
+                resolution["candidate_id"] = choice["candidate"]["candidate_id"]
+            resolutions.append(resolution)
+        if not resolutions or "matcher_revision" not in report or "revision" not in report["dictionary"]:
+            return [], None
+        return resolutions, {"source_revision": report["source_revision"], "rule_version": report["rule_version"],
+                             "dictionary_revision": report["dictionary"]["revision"],
+                             "matcher_revision": report["matcher_revision"]}
+
     def remove_choice(self, index: int) -> CommandOutcome:
         """Drop one document-mode choice (the save refused it as a conflict)."""
         value = self.draft_snapshot()
@@ -926,22 +1066,34 @@ class DocumentRunController:
 
     async def run_document_review(self, generation: int, source: str, target: str, direction: str,
                                   alignments: list | None) -> bool:
-        try:
-            report = await self.api_client.review_pair(source, target, direction, alignments=alignments)
-        except ClientError as exc:
-            if generation == self.generation:
-                self.set_review_state("error", detail=exc.message, request_id=exc.request_id)
-            return False
-        except asyncio.CancelledError:
-            if generation == self.generation:
-                self.set_review_state("cancelled")
-            return False
+        features = tuple(self.review_features() or ())
+        resolutions, context = self.document_resolutions()
+        while True:
+            try:
+                report = await self.api_client.review_pair(
+                    source, target, direction, alignments=alignments, resolutions=resolutions or None,
+                    resolution_context=context if resolutions else None, **_features_kw(features))
+            except ClientError as exc:
+                if (exc.code == ERROR_INVALID_REQUEST and resolutions and generation == self.generation):
+                    # Core no longer reports a finding a resolution names (another
+                    # service, or one without ambiguous-mention-v1): check once more
+                    # without them; the choices stay and wait for a matching report.
+                    resolutions, context = [], None
+                    continue
+                if generation == self.generation:
+                    self.set_review_state("error", detail=exc.message, request_id=exc.request_id)
+                return False
+            except asyncio.CancelledError:
+                if generation == self.generation:
+                    self.set_review_state("cancelled")
+                return False
+            break
         if generation != self.generation:
             return False
-        # The resolutions this check sent: a short manuscript sends none, and
-        # [] (not unknown) lets the next check compare with it, as on the Web.
+        # The resolutions this check sent: only this session's own choices,
+        # and [] (not unknown) lets the next check compare with it, as on the Web.
         snapshot = {"source": source, "target": target, "direction": direction,
-                    "alignments": alignments, "report": report, "resolutions": []}
+                    "alignments": alignments, "report": report, "resolutions": list(resolutions)}
         candidate = copy_payload(self.payload)
         candidate["history"] = (candidate["history"] + [snapshot])[-2:]
         try:
@@ -952,6 +1104,7 @@ class DocumentRunController:
                 self.host.report_unstorable_report(exc.code)
             return False
         self.payload = candidate
+        self.trusted_snapshots.append(copy.deepcopy(snapshot))
         self.host.trust_review_snapshot(snapshot)
         self.document_revision += 1
         # The phase is the controller's, so a run that commits says so even when
@@ -987,6 +1140,80 @@ class DocumentRunController:
         self.cancel_pending()
         self.set_review_state("cancelled")
         self.host.update_controls()
+
+    # -- Layer 1: deterministic structure checks ------------------------------
+    # User-triggered, deterministic and never saved: results live in
+    # ``self.structure`` only, keyed by the hashes of the cores they were made
+    # for, so an edit hides a segment's result at once and nothing reaches the
+    # payload, an undo step, the recovery draft or an export.
+
+    def structure_running(self) -> bool:
+        return self.structure_task is not None and not self.structure_task.done()
+
+    def structure_plan(self) -> tuple[list, list[dict], list[str]]:
+        """The items of the current pairing, their batches and the skipped ids."""
+        return structure.plan(self.current_pairs(), self.payload["source"], self.payload["target"])
+
+    def structure_views(self, pairs: Sequence | None = None) -> list[structure.View]:
+        pairs = self.current_pairs() if pairs is None else pairs
+        return structure.views(pairs, self.payload["source"], self.payload["target"], self.structure)
+
+    def cancel_structure_check(self) -> None:
+        self.structure_generation += 1
+        task, self.structure_task = self.structure_task, None
+        if task is not None and not task.done():
+            task.cancel()
+        if self.structure.phase == "running":
+            self.structure.phase = "idle"
+
+    def start_structure_check(self) -> bool:
+        """Check every checkable segment of the text as it is now."""
+        if self.structure_running() or self.structure_known_unavailable():
+            return False
+        self.cancel_structure_check()
+        generation = self.structure_generation
+        self.structure.phase, self.structure.error = "running", None
+        self.structure_task = asyncio.ensure_future(self.run_structure_check(generation))
+        self.host.render_structure()
+        return True
+
+    async def run_structure_check(self, generation: int) -> None:
+        try:
+            if self.capabilities is None:
+                # Asked for now, when the owner pressed the button; never at startup.
+                self.capabilities = await self.api_client.get_capabilities()
+                if generation != self.structure_generation:
+                    return
+                self.host.update_controls()
+            if structure.CAPABILITY_STRUCTURE_CHECK not in self.capabilities:
+                self.structure.phase = "failed"
+                self.structure.error = (strings.MANUSCRIPT_L1_UNAVAILABLE, None)
+                return
+            items, batches, skipped = self.structure_plan()
+            keys = {item.segment_id: item.key for item in items}
+            self.structure.skipped = len(skipped)
+            for body in batches:
+                response = await self.api_client.structure_check(body)
+                if generation != self.structure_generation:
+                    return
+                # Keyed by content: a result whose texts were edited meanwhile is
+                # stored under the old hashes and so never shown for the new text.
+                structure.store(self.structure, body, response, keys)
+                self.host.render_structure()
+            if generation == self.structure_generation:
+                self.structure.phase = "done"
+        except ClientError as exc:
+            if generation == self.structure_generation:
+                self.structure.phase = "failed"
+                self.structure.error = (exc.message, exc.request_id)
+        except asyncio.CancelledError:
+            if generation == self.structure_generation:
+                self.structure.phase = "idle"
+        finally:
+            if generation == self.structure_generation:
+                self.structure_task = None
+                self.host.render_structure()
+                self.host.update_controls()
 
     # -- segmented term and semantic run -------------------------------------
     def semantic_running(self) -> bool:
@@ -1037,7 +1264,8 @@ class DocumentRunController:
         pairs = self.current_pairs()
         terms = self.term_mode == "segments" and self.records() is not None
         return sr.next_review(self.payload, pairs, self.term_basis, self.session, self.basis(),
-                              terms=terms, attempted=attempted, views=self.record_views)
+                              terms=terms, attempted=attempted, views=self.record_views,
+                              features=self.review_features())
 
     def ready_pair_for(self, result: sessions.SegmentResult):
         source, target = self.payload["source"], self.payload["target"]
@@ -1061,7 +1289,8 @@ class DocumentRunController:
         None when the record is current or holds the new result, ``"changed"``
         when the text moved on while the request was out, ``"not_storable"``,
         or the error."""
-        request = sr.plan_request(self.payload, index, self.term_basis)
+        features = self.review_features()
+        request = sr.plan_request(self.payload, index, self.term_basis, features=features)
         fell_back = False
 
         def still_there() -> bool:
@@ -1078,14 +1307,16 @@ class DocumentRunController:
             try:
                 report = await self.api_client.review_pair(
                     request.source, request.target, request.direction, alignments=request.alignments,
-                    resolutions=request.resolutions or None, resolution_context=request.resolution_context)
+                    resolutions=request.resolutions or None, resolution_context=request.resolution_context,
+                    **_features_kw(request.features))
             except ClientError as exc:
                 if (exc.code == ERROR_INVALID_REQUEST and request.resolutions and not fell_back
                         and generation == self.semantic_generation):
                     fell_back = True
                     if not still_there():
                         return "changed"
-                    request = sr.plan_request(self.payload, index, self.term_basis, allow_resolutions=False)
+                    request = sr.plan_request(self.payload, index, self.term_basis, allow_resolutions=False,
+                                              features=features)
                     continue
                 return exc
             if generation != self.semantic_generation:
@@ -1100,7 +1331,7 @@ class DocumentRunController:
                 return "not_storable"
             if not applied.again:
                 return None
-            request = sr.plan_request(self.payload, index, self.term_basis)
+            request = sr.plan_request(self.payload, index, self.term_basis, features=features)
         return None
 
     async def run_segments(self, generation: int) -> None:

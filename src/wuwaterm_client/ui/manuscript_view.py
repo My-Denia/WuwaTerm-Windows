@@ -24,12 +24,14 @@ from PySide6.QtGui import QIcon, QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionButton, QStylePainter,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import markdown_report as mdr
 from .. import segment_records as sr
 from .. import semantic, strings
+from .. import structure as l1
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .error_presentation import SEVERITY_INFO, SEVERITY_WARN
 from .. import semantic_session as sessions
@@ -43,8 +45,8 @@ from ..document_edits import (
     normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_splice,
 )
 from ..manuscript import (
-    MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, load_workfile,
-    parse_workfile, sanitize_duplicate_choices, save_workfile, serialize_workfile,
+    MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
+    load_workfile, parse_workfile, sanitize_duplicate_choices, save_workfile, serialize_workfile,
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
@@ -660,19 +662,73 @@ class _WordWrapDelegate(QStyledItemDelegate):
 
 
 class _WrappedListWidget(QListWidget):
-    """Recompute wrapped item heights whenever the list is shown or resized."""
+    """Recompute wrapped item heights whenever the list is shown or resized.
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    With ``fit_rows`` set, the list is at most as tall as that many whole rows
+    (fewer when it has fewer), so no row is cut in half at any scale."""
+
+    def __init__(self, parent: QWidget | None = None, *, fit_rows: int | None = None) -> None:
         super().__init__(parent)
         self.setItemDelegate(_WordWrapDelegate(self))
+        self.fit_rows = fit_rows
+
+    def fit_height(self) -> None:
+        if not self.fit_rows or not self.count():
+            return
+        rows = sum(self.sizeHintForRow(i) for i in range(min(self.count(), self.fit_rows)))
+        height = max(self.minimumHeight(), rows + 2 * self.frameWidth())
+        if self.maximumHeight() != height:
+            self.setMaximumHeight(height)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self.scheduleDelayedItemsLayout()
+        self.fit_height()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.scheduleDelayedItemsLayout()
+        if event.size().width() != event.oldSize().width():
+            self.fit_height()
+
+
+class _ElidingButton(QPushButton):
+    """A button that may be narrower than its text, so it never widens the
+    inspector: short of room it draws the text elided. Its own sizeHint is the
+    whole text, so it is shown whole whenever there is room; its accessible
+    name and tooltip keep the whole text."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+        self.setSizePolicy(policy)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        metrics = self.fontMetrics()
+        icon = self.iconSize().width() + 6 if not self.icon().isNull() else 0
+        # Room for the first character and an ellipsis, and the padding.
+        least = icon + metrics.horizontalAdvance(self.text()[:1] + "…") + 26
+        return QSize(min(hint.width(), least), hint.height())
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if self.width() >= self.sizeHint().width():
+            # Room for the whole text: drawn exactly as any button.
+            super().paintEvent(event)
+            return
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        contents = self.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, self)
+        room = contents.width() - (option.iconSize.width() + 6 if not option.icon.isNull() else 0)
+        lines = option.text.split("\n")
+        elided = "\n".join(option.fontMetrics.elidedText(line, Qt.TextElideMode.ElideRight, max(0, room))
+                           for line in lines)
+        if elided == option.text:
+            super().paintEvent(event)
+            return
+        option.text = elided
+        QStylePainter(self).drawControl(QStyle.ControlElement.CE_PushButton, option)
 
 
 class _ElidedDocumentLabel(QLabel):
@@ -762,6 +818,9 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         view.status_label.setText(strings.MANUSCRIPT_TRANSLATED_MISMATCH.format(count=mismatched) if mismatched
                                   else strings.MANUSCRIPT_TRANSLATED)
         view._update_controls()
+
+    def render_structure(self) -> None:
+        self._view._render_structure()
 
     def trust_review_snapshot(self, snapshot: dict) -> None:
         self._view._session_snapshots.append(snapshot)
@@ -885,6 +944,21 @@ class ManuscriptView(QWidget):
         self._mismatch_prompt_active = False
         # The save-failure list shows history choices instead of conflicts.
         self._history_removal = False
+        # Ambiguous one-character names (ambiguous_mention) of the listed
+        # report, kept apart from the judged findings and folded by default:
+        # (finding with whole-text spans, (record, start, end) or None).
+        self._ambiguous: list[tuple[dict, tuple[int, int, int] | None]] = []
+        # Layer 1 rows listed: (pair index, finding with whole-text spans), and
+        # whether the pairing last rendered had anything to send.
+        self._l1_rows: list[tuple[int, dict]] = []
+        self._l1_sendable = False
+        self._l1_views: list = []
+        # Layer 2: issues left out because Layer 1 covers them, and folded
+        # low-confidence ones.
+        self._covered_count = 0
+        self._low_rows: list[sessions.LiveIssue] = []
+        # Every issue Layer 2 lists, folded low-confidence ones included.
+        self._layer2_listed: list[sessions.LiveIssue] = []
 
         self.source_edit = LosslessEditor(self)
         self.target_edit = LosslessEditor(self)
@@ -993,6 +1067,7 @@ class ManuscriptView(QWidget):
         self.translate_button = QPushButton(self)
         self.translate_button.clicked.connect(self._translate)
         self._build_semantic_widgets()
+        self._build_layer_widgets()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1160,6 +1235,7 @@ class ManuscriptView(QWidget):
         self.my_terms.manage_requested.connect(self.show_termbase_dialog)
         details.addWidget(self.my_terms)
         self._refresh_my_terms()
+        details.addWidget(self.layers_card)
         tracks = QHBoxLayout()
         tracks.setSpacing(4)
         for button in (self.terms_track_button, self.semantic_track_button, self.segments_track_button):
@@ -1221,6 +1297,64 @@ class ManuscriptView(QWidget):
         self.term_groups.hide()
         term_details.addWidget(self.term_groups)
         term_details.addWidget(self.findings)
+        # Ambiguous one-character names: after the judged findings, folded,
+        # never counted with them.
+        self.ambiguous_toggle = _ElidingButton(parent=term_page)
+        self.ambiguous_toggle.setObjectName("commandButton")
+        self.ambiguous_toggle.setCheckable(True)
+        self.ambiguous_toggle.setIconSize(QSize(16, 16))
+        self.ambiguous_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.ambiguous_toggle.toggled.connect(self._ambiguous_toggled)
+        self.ambiguous_toggle.hide()
+        term_details.addWidget(self.ambiguous_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self.ambiguous_area = QWidget(term_page)
+        self.ambiguous_area.setObjectName("inspectorBody")
+        ambiguous = QVBoxLayout(self.ambiguous_area)
+        ambiguous.setContentsMargins(0, 0, 0, 0)
+        ambiguous.setSpacing(6)
+        self.ambiguous_note = QLabel(strings.MANUSCRIPT_AMBIGUOUS_NOTE, self.ambiguous_area)
+        self.ambiguous_note.setObjectName("secondaryText")
+        self.ambiguous_note.setWordWrap(True)
+        ambiguous.addWidget(self.ambiguous_note)
+        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area, fit_rows=3)
+        self.ambiguous_list.setMinimumHeight(52)
+        self.ambiguous_list.setWordWrap(True)
+        self.ambiguous_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.ambiguous_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ambiguous_list.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_LIST)
+        self.ambiguous_list.currentRowChanged.connect(self._select_ambiguous)
+        ambiguous.addWidget(self.ambiguous_list)
+        # The candidate pair (Core offers the official name or names; long ones
+        # elide instead of widening the inspector), then adopt or ordinary word.
+        self.ambiguous_actions = QWidget(self.ambiguous_area)
+        self.ambiguous_actions.setObjectName("inspectorBody")
+        actions = QVBoxLayout(self.ambiguous_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(6)
+        self.ambiguous_combo = ChevronComboBox(self.ambiguous_actions)
+        self.ambiguous_combo.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_CANDIDATE)
+        self.ambiguous_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.ambiguous_combo.setMinimumContentsLength(8)
+        self.ambiguous_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        actions.addWidget(self.ambiguous_combo)
+        self.ambiguous_adopt_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON, self.ambiguous_actions)
+        self.ambiguous_adopt_button.clicked.connect(self._adopt_ambiguous)
+        self.ambiguous_ignore_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
+        self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
+        for button in (self.ambiguous_adopt_button, self.ambiguous_ignore_button):
+            # Keep an IME composition in the editor when an action is clicked.
+            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+            # One per line: side by side they are wider than the narrowest inspector.
+            actions.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
+        ambiguous.addWidget(self.ambiguous_actions)
+        self.ambiguous_state = QLabel(self.ambiguous_area)
+        self.ambiguous_state.setObjectName("secondaryText")
+        self.ambiguous_state.setTextFormat(Qt.TextFormat.PlainText)
+        self.ambiguous_state.setWordWrap(True)
+        ambiguous.addWidget(self.ambiguous_state)
+        self.ambiguous_area.hide()
+        term_details.addWidget(self.ambiguous_area)
         summary = QHBoxLayout()
         pair = QVBoxLayout()
         self.finding_title = QLabel(strings.MANUSCRIPT_FINDING_PROMPT, inspector_body)
@@ -1273,9 +1407,9 @@ class ManuscriptView(QWidget):
         self.choice_combo.setMinimumContentsLength(8)
         self.choice_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         choice_label.setBuddy(self.choice_combo)
-        self.choice_button = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_RECORD, self.choice_area)
+        self.choice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECORD, self.choice_area)
         self.choice_button.clicked.connect(self._choose_term)
-        self.unchoice_button = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, self.choice_area)
+        self.unchoice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, self.choice_area)
         self.unchoice_button.clicked.connect(self._unchoose_term)
         choice_buttons = QHBoxLayout()
         choice_buttons.setSpacing(6)
@@ -1295,11 +1429,11 @@ class ManuscriptView(QWidget):
         choice_layout.addWidget(self.choice_state)
         self.choice_area.hide()
         term_details.addWidget(self.choice_area)
-        self.lookup_button = QPushButton(strings.NAV_ITEM_TERMS, inspector_body)
+        self.lookup_button = _ElidingButton(strings.NAV_ITEM_TERMS, inspector_body)
         self.lookup_button.setIcon(icon("external-link"))
         self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.lookup_button.clicked.connect(self._request_lookup)
-        self.replace_toggle = QPushButton(strings.MANUSCRIPT_REPLACE, inspector_body)
+        self.replace_toggle = _ElidingButton(strings.MANUSCRIPT_REPLACE, inspector_body)
         self.replace_toggle.setCheckable(True)
         self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         term_actions = QHBoxLayout()
@@ -1532,9 +1666,11 @@ class ManuscriptView(QWidget):
         list so long manuscripts can be navigated and their gaps explained."""
         self.track_group = QButtonGroup(self)
         self.track_group.setExclusive(True)
-        self.terms_track_button = QPushButton(self)
-        self.semantic_track_button = QPushButton(self)
-        self.segments_track_button = QPushButton(self)
+        # They elide rather than widen the inspector when the counts and a wide
+        # system font do not fit side by side.
+        self.terms_track_button = _ElidingButton(parent=self)
+        self.semantic_track_button = _ElidingButton(parent=self)
+        self.segments_track_button = _ElidingButton(parent=self)
         for index, button in enumerate((self.terms_track_button, self.semantic_track_button,
                                         self.segments_track_button)):
             button.setObjectName("activityItem")
@@ -1552,10 +1688,24 @@ class ManuscriptView(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        self.l2_title = QLabel(strings.MANUSCRIPT_L2_TITLE, page)
+        self.l2_title.setObjectName("secondaryText")
+        self.l2_title.setWordWrap(True)
+        layout.addWidget(self.l2_title)
         self.semantic_badge = QLabel(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL, page)
         self.semantic_badge.setObjectName("experimentalBadge")
         self.semantic_badge.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
         layout.addWidget(self.semantic_badge, 0, Qt.AlignmentFlag.AlignLeft)
+        self.l2_note = QLabel(strings.MANUSCRIPT_L2_NOTE, page)
+        self.l2_note.setObjectName("secondaryText")
+        self.l2_note.setWordWrap(True)
+        layout.addWidget(self.l2_note)
+        # How many issues Layer 1 already shows (ADR 0022: Layer 1 wins an overlap).
+        self.l2_covered = QLabel(page)
+        self.l2_covered.setObjectName("secondaryText")
+        self.l2_covered.setWordWrap(True)
+        self.l2_covered.hide()
+        layout.addWidget(self.l2_covered)
         self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
         self.semantic_note.setObjectName("secondaryText")
         self.semantic_note.setWordWrap(True)
@@ -1602,14 +1752,14 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.issue_alternative_button, 0, Qt.AlignmentFlag.AlignLeft)
         actions = QHBoxLayout()
         actions.setSpacing(6)
-        self.accept_button = QPushButton(strings.MANUSCRIPT_ACCEPT, page)
+        self.accept_button = _ElidingButton(strings.MANUSCRIPT_ACCEPT, page)
         self.accept_button.setObjectName("primaryButton")
         self.accept_button.setToolTip(f"{strings.MANUSCRIPT_ACCEPT}（Ctrl+Enter）")
         self.accept_button.clicked.connect(self._accept_current)
-        self.adjust_button = QPushButton(strings.MANUSCRIPT_ADJUST, page)
+        self.adjust_button = _ElidingButton(strings.MANUSCRIPT_ADJUST, page)
         self.adjust_button.setToolTip(f"{strings.MANUSCRIPT_ADJUST}（Ctrl+Shift+E）")
         self.adjust_button.clicked.connect(self._adjust_current)
-        self.ignore_button = QPushButton(strings.MANUSCRIPT_IGNORE, page)
+        self.ignore_button = _ElidingButton(strings.MANUSCRIPT_IGNORE, page)
         self.ignore_button.setToolTip(f"{strings.MANUSCRIPT_IGNORE}（Ctrl+Shift+I）")
         self.ignore_button.clicked.connect(self._ignore_current)
         for button in (self.accept_button, self.adjust_button, self.ignore_button):
@@ -1642,6 +1792,15 @@ class ManuscriptView(QWidget):
         self.semantic_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEMANTIC.format(count="").strip())
         self.semantic_list.currentRowChanged.connect(self._select_issue)
         layout.addWidget(self.semantic_list)
+        # Low-confidence issues are folded at the end of the list until opened.
+        self.low_toggle = _ElidingButton(parent=page)
+        self.low_toggle.setObjectName("commandButton")
+        self.low_toggle.setCheckable(True)
+        self.low_toggle.setIconSize(QSize(16, 16))
+        self.low_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.low_toggle.toggled.connect(self._low_toggled)
+        self.low_toggle.hide()
+        layout.addWidget(self.low_toggle, 0, Qt.AlignmentFlag.AlignLeft)
         self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
         self.shortcuts_label.setObjectName("captionText")
         self.shortcuts_label.setWordWrap(True)
@@ -1678,9 +1837,9 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.segment_hint)
         segment_actions = QHBoxLayout()
         segment_actions.setSpacing(6)
-        self.finish_button = QPushButton(strings.MANUSCRIPT_SEGMENT_FINISH, page)
+        self.finish_button = _ElidingButton(strings.MANUSCRIPT_SEGMENT_FINISH, page)
         self.finish_button.clicked.connect(self._toggle_finished)
-        self.next_pending_button = QPushButton(strings.MANUSCRIPT_NEXT_PENDING, page)
+        self.next_pending_button = _ElidingButton(strings.MANUSCRIPT_NEXT_PENDING, page)
         self.next_pending_button.clicked.connect(self._next_pending)
         for button in (self.finish_button, self.next_pending_button):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -1699,9 +1858,9 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.segment_choices)
         choice_actions = QHBoxLayout()
         choice_actions.setSpacing(6)
-        self.segment_choice_action = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_RECONFIRM, page)
+        self.segment_choice_action = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECONFIRM, page)
         self.segment_choice_action.clicked.connect(self._segment_choice_primary)
-        self.segment_choice_remove = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, page)
+        self.segment_choice_remove = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, page)
         self.segment_choice_remove.clicked.connect(self._segment_choice_removed)
         for button in (self.segment_choice_action, self.segment_choice_remove):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -1710,12 +1869,231 @@ class ManuscriptView(QWidget):
         choice_actions.addStretch(1)
         layout.addLayout(choice_actions)
         self._segment_choice_rows: list[tuple] = []
-        self.translate_segment_button = QPushButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
+        self.translate_segment_button = _ElidingButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
         self.translate_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.translate_segment_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.translate_segment_button.clicked.connect(self._translate_segment)
         layout.addWidget(self.translate_segment_button)
         layout.addStretch(1)
+
+    def _build_layer_widgets(self) -> None:
+        """The layered review card above the tracks: Layer 1 deterministic
+        structure checks (user-triggered, never saved), a line that sums up
+        Layer 2 (the semantic track), and the reserved Layer 3 switch (off by
+        default; it sends and stores nothing)."""
+        card = QFrame(self)
+        card.setObjectName("reviewStatus")
+        card.setProperty("tone", "neutral")
+        self.layers_card = card
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 8, 12, 10)
+        layout.setSpacing(6)
+        self.layers_title = QLabel(strings.MANUSCRIPT_LAYERS_TITLE, card)
+        self.layers_title.setObjectName("sectionTitle")
+        layout.addWidget(self.layers_title)
+        self.l1_title = QLabel(strings.MANUSCRIPT_L1_TITLE, card)
+        self.l1_title.setObjectName("statusText")
+        self.l1_title.setWordWrap(True)
+        self.l1_title.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
+        layout.addWidget(self.l1_title)
+        self.l1_note = QLabel(strings.MANUSCRIPT_L1_NOTE, card)
+        self.l1_note.setObjectName("secondaryText")
+        self.l1_note.setWordWrap(True)
+        self.l1_note.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
+        layout.addWidget(self.l1_note)
+        self.l1_run_button = _ElidingButton(strings.MANUSCRIPT_L1_RUN.format(count=0), card)
+        self.l1_run_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.l1_run_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.l1_run_button.clicked.connect(self._run_structure_check)
+        layout.addWidget(self.l1_run_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.l1_status = QLabel(strings.MANUSCRIPT_L1_NOT_RUN, card)
+        self.l1_status.setObjectName("secondaryText")
+        self.l1_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.l1_status.setWordWrap(True)
+        layout.addWidget(self.l1_status)
+        self.l1_list = _WrappedListWidget(card, fit_rows=3)
+        self.l1_list.setMinimumHeight(52)
+        self.l1_list.setWordWrap(True)
+        self.l1_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.l1_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.l1_list.setAccessibleName(strings.MANUSCRIPT_L1_LIST)
+        self.l1_list.currentRowChanged.connect(self._select_l1_row)
+        self.l1_list.hide()
+        layout.addWidget(self.l1_list)
+        # A label, not a button: it wraps, so it never widens the inspector.
+        self.l2_overview = QLabel(card)
+        self.l2_overview.setObjectName("secondaryText")
+        self.l2_overview.setTextFormat(Qt.TextFormat.PlainText)
+        self.l2_overview.setWordWrap(True)
+        self.l2_overview.hide()
+        layout.addWidget(self.l2_overview)
+        # The title wraps; the switch beside it has a short label, so neither
+        # widens the inspector. Component state only: never saved, never sent.
+        self.l3_title = QLabel(strings.MANUSCRIPT_L3_TITLE, card)
+        self.l3_title.setObjectName("statusText")
+        self.l3_title.setWordWrap(True)
+        layout.addWidget(self.l3_title)
+        self.l3_check = QCheckBox(strings.MANUSCRIPT_L3_TOGGLE, card)
+        self.l3_check.setChecked(False)
+        self.l3_check.setAccessibleName(strings.MANUSCRIPT_L3_TITLE)
+        self.l3_check.toggled.connect(self._style_toggled)
+        layout.addWidget(self.l3_check)
+        self.l3_note = QLabel(strings.MANUSCRIPT_L3_OFF, card)
+        self.l3_note.setObjectName("secondaryText")
+        self.l3_note.setWordWrap(True)
+        layout.addWidget(self.l3_note)
+
+    def _style_toggled(self, on: bool) -> None:
+        """Layer 3 is a reserved place: switching it on sends and stores nothing."""
+        self.l3_note.setText(strings.MANUSCRIPT_L3_ON if on else strings.MANUSCRIPT_L3_OFF)
+
+    # -- Layer 1: deterministic structure checks -------------------------------
+    def _run_structure_check(self) -> None:
+        if not self._input_ready() or not self._api_client.is_configured:
+            return
+        if self._controller.start_structure_check():
+            self.status_label.setText(strings.MANUSCRIPT_L1_RUNNING)
+
+    def _render_structure(self) -> None:
+        """The Layer 1 card from the controller's session state. Results follow
+        the text: one whose cores changed is no longer listed, and while the
+        pairing of a fresh edit is pending nothing old is shown."""
+        controller = self._controller
+        state = controller.structure
+        running = controller.structure_running()
+        pairs = self._cached_pairs()
+        if pairs is None:
+            # The text changed and its pairing comes after the pause: no row
+            # may describe text that is gone, so the list empties now and the
+            # results still valid come back with the pairing.
+            self._derived_timer.start()
+            if self._l1_rows or self.l1_list.count():
+                self._l1_rows = []
+                self.l1_list.clear()
+                self.l1_list.hide()
+            return
+        configured = self._api_client.is_configured
+        unavailable = controller.structure_known_unavailable()
+        lines: list[str] = []
+        items, batches, skipped = controller.structure_plan()
+        views = controller.structure_views(pairs)
+        self._l1_views = views
+        summary = l1.summary(views)
+        sendable = len(items) - len(skipped)
+        if running:
+            self.l1_run_button.setText(strings.MANUSCRIPT_L1_RUNNING)
+        else:
+            self.l1_run_button.setText((strings.MANUSCRIPT_L1_RERUN if summary.checked else strings.MANUSCRIPT_L1_RUN)
+                                       .format(count=sendable))
+        self._l1_sendable = bool(batches)
+        self.l1_run_button.setEnabled(configured and not running and not unavailable and bool(batches)
+                                      and not self._translating())
+        if unavailable:
+            lines.append(strings.MANUSCRIPT_L1_UNAVAILABLE)
+        elif state.phase == "failed" and state.error is not None:
+            lines.append(strings.MANUSCRIPT_L1_FAILED.format(reason=state.error[0]))
+        if not items:
+            lines.append(strings.MANUSCRIPT_L1_NONE)
+        elif summary.checked:
+            if summary.findings == 0 and summary.omitted == 0:
+                lines.append(strings.MANUSCRIPT_L1_CLEAN.format(checked=summary.checked))
+            else:
+                lines.append(strings.MANUSCRIPT_L1_SUMMARY.format(
+                    checked=summary.checked, segments=summary.with_findings, count=summary.findings + summary.omitted))
+            if summary.omitted:
+                lines.append(strings.MANUSCRIPT_L1_OMITTED.format(count=summary.omitted))
+            if summary.unchecked:
+                lines.append(strings.MANUSCRIPT_L1_UNCHECKED.format(count=summary.unchecked))
+        elif not running and not unavailable and state.phase != "failed":
+            lines.append(strings.MANUSCRIPT_L1_NOT_RUN)
+        if batches and not running and not unavailable and not summary.checked:
+            lines.append(strings.MANUSCRIPT_L1_COST.format(count=len(batches)))
+        if skipped:
+            lines.append(strings.MANUSCRIPT_L1_SKIPPED.format(count=len(skipped)))
+        self.l1_status.setText("\n".join(lines))
+        self.l1_status.setVisible(bool(lines))
+        # A service that does not offer the check: the feature is hidden
+        # (ADR 0022), and only the line saying so stays.
+        self.l1_note.setVisible(not unavailable)
+        self.l1_run_button.setVisible(not unavailable)
+        rows: list[tuple[int, dict]] = []
+        texts: list[str] = []
+        for view in views:
+            if not view.flagged:
+                continue
+            number = view.index + 1
+            layout = view.result["layout"]
+            if view.layout_differs:
+                rows.append((view.index, {"rule_id": None, "source_span": None, "target_span": None}))
+                texts.append(strings.MANUSCRIPT_L1_LAYOUT.format(
+                    number=number, sp=layout["source_paragraphs"], tp=layout["target_paragraphs"],
+                    sl=layout["source_lines"], tl=layout["target_lines"]))
+            for finding in view.result["findings"]:
+                rule = strings.MANUSCRIPT_L1_RULES.get(finding["rule_id"], finding["rule_id"])
+                span = finding["source_span"] or finding["target_span"]
+                rows.append((view.index, finding))
+                if span is None:
+                    texts.append(strings.MANUSCRIPT_L1_ITEM_SEGMENT.format(number=number, rule=rule))
+                else:
+                    side = strings.MANUSCRIPT_L1_SOURCE if finding["source_span"] else strings.MANUSCRIPT_L1_TARGET
+                    texts.append(strings.MANUSCRIPT_L1_ITEM.format(number=number, rule=rule, side=side,
+                                                                   text=span["text"]))
+        if rows != self._l1_rows or self.l1_list.count() != len(rows):
+            self._l1_rows = rows
+            self.l1_list.blockSignals(True)
+            self.l1_list.clear()
+            for row, text in enumerate(texts):
+                self.l1_list.addItem(text)
+                item = self.l1_list.item(row)
+                item.setToolTip(text)
+                review_states.mark(item, review_states.NEEDS_CHECK)
+            self.l1_list.setCurrentRow(-1)
+            self.l1_list.blockSignals(False)
+        self.l1_list.setVisible(bool(rows) and not unavailable)
+        self.l1_list.fit_height()
+        self._render_layer_overview()
+        if self._covered_count or (state.results and self._session.issues()):
+            # What Layer 1 covers decides which semantic issues are listed,
+            # folded low-confidence ones included (they are not in _issue_rows).
+            self._refresh_semantic()
+
+    def _select_l1_row(self, row: int) -> None:
+        """Locate a Layer 1 finding: its span, or the whole segment when the
+        finding is about the segment (empty translation, layout counts)."""
+        if not 0 <= row < len(self._l1_rows):
+            return
+        index, finding = self._l1_rows[row]
+        pairs = self._cached_pairs() or []
+        with self.scroll_sync.suspended():
+            if finding["source_span"] is not None:
+                located = self.source_edit.select_raw_span(finding["source_span"])
+                self.target_edit.setExtraSelections([])
+            elif finding["target_span"] is not None:
+                located = self.target_edit.select_raw_span(finding["target_span"])
+                self.source_edit.setExtraSelections([])
+            elif 0 <= index < len(pairs):
+                self._select_cores(pairs[index])
+                return
+            else:
+                located = False
+        self.status_label.setText(strings.MANUSCRIPT_LOCATED if located else strings.MANUSCRIPT_PARTIAL_LOCATION)
+
+    def _render_layer_overview(self) -> None:
+        """The card's Layer 2 line: high and medium issues listed, low folded."""
+        if not self._semantic_available() and not self._session.issues():
+            self.l2_overview.hide()
+            return
+        counts = {"high": 0, "medium": 0, "low": 0}
+        for issue in self._layer2_listed:
+            if self._issue_state(issue) in sessions.UNHANDLED:
+                confidence = issue.issue.get("confidence")
+                if confidence in counts:
+                    counts[confidence] += 1
+        text = strings.MANUSCRIPT_L2_OVERVIEW.format(**counts)
+        if self._covered_count:
+            text += "\n" + strings.MANUSCRIPT_L2_COVERED.format(count=self._covered_count)
+        self.l2_overview.setText(text)
+        self.l2_overview.setVisible(True)
 
     def _build_shortcuts(self) -> None:
         self._manuscript_shortcuts: list[QShortcut] = []
@@ -1993,6 +2371,7 @@ class ManuscriptView(QWidget):
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._refresh_segments()
         self._render_mismatch_prompt()
+        self._render_structure()
         self._update_tracks()
         self._render_semantic_progress()
         self.workbenchStatusChanged.emit()
@@ -2022,7 +2401,8 @@ class ManuscriptView(QWidget):
         return self._controller.records()
 
     def _term_state(self, record: dict) -> str:
-        return self._record_views.get(record, self._payload, self._term_basis).state
+        return self._record_views.get(record, self._payload, self._term_basis,
+                                      self._controller.review_features()).state
 
     def _has_results(self) -> bool:
         return bool(self._session.results) or any(r["status"] != "pending" for r in self._payload.get("segments") or ())
@@ -2086,10 +2466,24 @@ class ManuscriptView(QWidget):
         if self._refreshing_lists:
             return
         current = self._current_issue()
-        rows = sorted(self._session.issues(), key=lambda issue: (
+        listed, covered = self._layer2_rows()
+        low = [issue for issue in listed if issue.issue.get("confidence") == "low"]
+        open_low = self.low_toggle.isChecked()
+        # High and medium first; low-confidence issues are folded at the end
+        # of the list until the owner opens them.
+        rows = sorted([issue for issue in listed if open_low or issue.issue.get("confidence") != "low"],
+                      key=lambda issue: (
+            1 if issue.issue.get("confidence") == "low" else 0,
             0 if self._issue_state(issue) in sessions.UNHANDLED else 1,
             issue.segment_index,
             (issue.source_span or issue.target_span or {"start": 0})["start"]))
+        self._covered_count, self._low_rows, self._layer2_listed = covered, low, listed
+        self.l2_covered.setText(strings.MANUSCRIPT_L2_COVERED.format(count=covered))
+        self.l2_covered.setVisible(bool(covered))
+        self.low_toggle.setText((strings.MANUSCRIPT_L2_LOW_HIDE if open_low else strings.MANUSCRIPT_L2_LOW_SHOW)
+                                .format(count=len(low)))
+        self.low_toggle.setIcon(icon("chevron-down" if open_low else "chevron-right"))
+        self.low_toggle.setVisible(bool(low))
         same = len(rows) == len(self._issue_rows) and all(a is b for a, b in zip(rows, self._issue_rows))
         visible = self.track_stack.currentIndex() == TRACK_SEMANTIC
         self._refreshing_lists = True
@@ -2125,6 +2519,47 @@ class ManuscriptView(QWidget):
         self.semantic_list.setVisible(bool(rows))
         self._render_issue(self._current_issue())
         self._render_semantic_progress()
+        self._render_layer_overview()
+
+    def _layer2_rows(self) -> tuple[list[sessions.LiveIssue], int]:
+        """The semantic issues Layer 2 lists, and how many it leaves out because
+        a Layer 1 finding of the same segment already describes the same break
+        (ADR 0022 "Layer 1 wins an overlap"). Only an unhandled issue is left
+        out; decisions and the saved manuscript are untouched."""
+        issues = self._session.issues()
+        if not issues or not self._controller.structure.results:
+            return list(issues), 0
+        pairs = self._cached_pairs()
+        # While a fresh edit waits for its pairing, the last views decide, so
+        # the list does not flicker on every keystroke.
+        views = self._controller.structure_views(pairs) if pairs is not None else self._l1_views
+        pairs = pairs if pairs is not None else self._controller.pairs
+        listed, covered = [], 0
+        for issue in issues:
+            if self._issue_state(issue) in sessions.UNHANDLED:
+                index = self._issue_pair(issue, pairs)
+                view = views[index] if index is not None and index < len(views) else None
+                if l1.covered_by(issue.issue["category"], issue.source_span, issue.target_span, view):
+                    covered += 1
+                    continue
+            listed.append(issue)
+        return listed, covered
+
+    @staticmethod
+    def _issue_pair(issue: sessions.LiveIssue, pairs: list) -> int | None:
+        """The current pair whose core holds the issue (its source span, else its target span)."""
+        span, side = (issue.source_span, "source") if issue.source_span is not None else (issue.target_span, "target")
+        if span is None:
+            return None
+        for pair in pairs:
+            region = getattr(pair, side)
+            if region.core_start <= span["start"] and span["end"] <= region.core_end:
+                return pair.index
+        return None
+
+    def _low_toggled(self, _open: bool) -> None:
+        self._refresh_semantic()
+        self._update_tracks()
 
     def _render_semantic_progress(self) -> None:
         if self._semantic_state == "error" and not self._semantic_running():
@@ -2146,6 +2581,7 @@ class ManuscriptView(QWidget):
             return  # refreshed shortly by the derived-state timer
         done, total = progress
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        pending = max(0, pending - self._covered_count)  # Layer 1 shows those
         tone, bar = "neutral", None
         if self._semantic_running():
             # Name the segment actually in flight, numbered as in the segment
@@ -2676,7 +3112,9 @@ class ManuscriptView(QWidget):
 
     def _update_tracks(self) -> None:
         term_total = len(self._report["findings"]) if self._report is not None else 0
+        # Issues Layer 1 already shows are not counted again (folded low ones are).
         pending = sum(1 for issue in self._session.issues() if self._issue_state(issue) in sessions.UNHANDLED)
+        pending = max(0, pending - self._covered_count)
         for button, text in (
             (self.terms_track_button, strings.MANUSCRIPT_TRACK_TERMS.format(count=term_total)),
             (self.semantic_track_button, strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=pending)),
@@ -3244,6 +3682,161 @@ class ManuscriptView(QWidget):
         self._finish_choice(self._controller.choose_term(*ref, choice, candidate_id or None),
                             strings.MANUSCRIPT_TERM_CHOICE_RECORDED)
 
+    # -- ambiguous one-character names (ambiguous-mention-v1) -----------------
+    def _ambiguous_toggled(self, _open: bool) -> None:
+        self._render_ambiguous()
+
+    def _ambiguous_choice(self, finding: dict, ref: tuple[int, int, int] | None) -> dict | None:
+        """The owner's choice at an ambiguous name: the segment choice there, or
+        the document choice whose span now reads it."""
+        if ref is not None:
+            segments = self._payload.get("segments") or []
+            if ref[0] >= len(segments):
+                return None
+            return next((c for c in segments[ref[0]]["choices"]
+                         if (c["source_span"]["start"], c["source_span"]["end"]) == ref[1:]), None)
+        return self._controller.document_choice_at(finding)
+
+    def _ambiguous_row_text(self, finding: dict, ref: tuple[int, int, int] | None) -> str:
+        span = finding["source_span"]
+        if ref is not None:
+            text = strings.MANUSCRIPT_AMBIGUOUS_ITEM.format(text=span["text"], number=ref[0] + 1)
+        else:
+            text = strings.MANUSCRIPT_AMBIGUOUS_ITEM_DOCUMENT.format(text=span["text"], start=span["start"] + 1,
+                                                                    end=span["end"])
+        choice = self._ambiguous_choice(finding, ref)
+        if choice is not None:
+            staged = (strings.MANUSCRIPT_FINDING_CHOSEN if ref is not None and choice["confirmed"]
+                      else strings.MANUSCRIPT_FINDING_RECONFIRM if ref is not None
+                      else strings.MANUSCRIPT_AMBIGUOUS_STAGED)
+            text += f"\n{self._describe_choice(choice)} · {staged}"
+        return text
+
+    def _render_ambiguous(self) -> None:
+        """The folded list of ambiguous names, after the judged findings."""
+        items = self._ambiguous
+        count = len(items)
+        expanded = self.ambiguous_toggle.isChecked()
+        self.ambiguous_toggle.setText((strings.MANUSCRIPT_AMBIGUOUS_HIDE if expanded
+                                       else strings.MANUSCRIPT_AMBIGUOUS_SHOW).format(count=count))
+        self.ambiguous_toggle.setIcon(icon("chevron-down" if expanded else "chevron-right"))
+        self.ambiguous_toggle.setVisible(bool(count))
+        row = self.ambiguous_list.currentRow()
+        self.ambiguous_list.blockSignals(True)
+        self.ambiguous_list.clear()
+        for index, (finding, ref) in enumerate(items):
+            self.ambiguous_list.addItem(self._ambiguous_row_text(finding, ref))
+            review_states.mark(self.ambiguous_list.item(index), review_states.UNEVALUATED,
+                               label=strings.MANUSCRIPT_VERDICT_NOT_EVALUATED)
+        self.ambiguous_list.setCurrentRow(row if 0 <= row < count else (0 if count else -1))
+        self.ambiguous_list.blockSignals(False)
+        self.ambiguous_area.setVisible(bool(count) and expanded)
+        # As tall as its rows (a usual report has one or two), at most three.
+        self.ambiguous_list.fit_height()
+        self._render_ambiguous_actions()
+
+    def _current_ambiguous(self) -> tuple[dict, tuple[int, int, int] | None] | None:
+        row = self.ambiguous_list.currentRow()
+        return self._ambiguous[row] if 0 <= row < len(self._ambiguous) else None
+
+    def _ambiguous_choosable(self, ref: tuple[int, int, int] | None) -> bool:
+        composing = self.source_edit._ime_active or self.target_edit._ime_active
+        if composing or self._translating():
+            return False
+        if ref is not None:
+            return self._term_basis is not None
+        latest = self._controller.latest_trusted()
+        return latest is not None and not latest["report"]["truncated"]
+
+    def _render_ambiguous_actions(self) -> None:
+        current = self._current_ambiguous()
+        self.ambiguous_actions.setVisible(current is not None)
+        self.ambiguous_combo.blockSignals(True)
+        self.ambiguous_combo.clear()
+        if current is None:
+            self.ambiguous_combo.blockSignals(False)
+            self.ambiguous_state.clear()
+            self.ambiguous_state.hide()
+            return
+        finding, ref = current
+        choice = self._ambiguous_choice(finding, ref)
+        for candidate in finding["candidates"]:
+            self.ambiguous_combo.addItem(self._candidate_text(candidate), candidate["candidate_id"])
+        chosen = (choice or {}).get("candidate") or {}
+        at = self.ambiguous_combo.findData(chosen.get("candidate_id"))
+        self.ambiguous_combo.setCurrentIndex(max(0, at))
+        self.ambiguous_combo.blockSignals(False)
+        self._update_ambiguous_actions()
+        free = self._ambiguous_choosable(ref)
+        if not free and (ref is None or self._term_basis is None):
+            state = strings.MANUSCRIPT_TERM_CHOICE_WAIT
+        elif choice is None:
+            state = strings.MANUSCRIPT_AMBIGUOUS_NONE
+        else:
+            state = strings.MANUSCRIPT_TERM_CHOICE_CHOSEN.format(choice=self._describe_choice(choice))
+        self.ambiguous_state.setText(state)
+        self.ambiguous_state.show()
+
+    def _update_ambiguous_actions(self) -> None:
+        """Only the enabled state; the candidates follow the selection."""
+        current = self._current_ambiguous()
+        free = current is not None and self._ambiguous_choosable(current[1])
+        self.ambiguous_combo.setEnabled(free and self.ambiguous_combo.count() > 0)
+        self.ambiguous_adopt_button.setEnabled(free and self.ambiguous_combo.count() > 0)
+        self.ambiguous_ignore_button.setEnabled(free)
+
+    def _adopt_ambiguous(self) -> None:
+        current = self._current_ambiguous()
+        if current is None:
+            return
+        wanted = self.ambiguous_combo.currentData()
+        candidate = next((c for c in current[0]["candidates"] if c["candidate_id"] == wanted), None)
+        if candidate is not None:
+            self._choose_ambiguous(candidate)
+
+    def _select_ambiguous(self, _row: int) -> None:
+        self._render_ambiguous_actions()
+        current = self._current_ambiguous()
+        if current is None:
+            return
+        with self.scroll_sync.suspended():
+            located = self.source_edit.select_raw_span(current[0]["source_span"])
+        self.target_edit.setExtraSelections([])
+        self.status_label.setText(strings.MANUSCRIPT_LOCATED if located else strings.MANUSCRIPT_PARTIAL_LOCATION)
+
+    def _choose_ambiguous(self, candidate: dict | None) -> None:
+        """Adopt a candidate pair, or mark the character an ordinary word. The
+        choice goes out as a resolution with the next check."""
+        current = self._current_ambiguous()
+        if current is None or not self._input_ready():
+            return
+        finding, ref = current
+        if not self._ambiguous_choosable(ref):
+            return
+        span = finding["source_span"]
+        message = (strings.MANUSCRIPT_AMBIGUOUS_ADOPTED.format(zh=candidate["zh"], en=candidate["en"])
+                   if candidate is not None else strings.MANUSCRIPT_AMBIGUOUS_IGNORED.format(text=span["text"]))
+        row = self.ambiguous_list.currentRow()
+        if ref is not None:
+            choice = sr.OFFICIAL_PAIR if candidate is not None else sr.NOT_A_TERM
+            self._finish_choice(self._controller.choose_term(
+                *ref, choice, candidate["candidate_id"] if candidate is not None else None), message)
+        else:
+            latest = self._controller.latest_trusted()
+            outcome = self._controller.choose_document(finding, candidate, view_state=self._editor_state())
+            if outcome.reason == REASON_FULL:
+                self.status_label.setText(strings.MANUSCRIPT_TERM_CHOICE_FAILED)
+                return
+            if not outcome.committed or latest is None:
+                return
+            self._commit(outcome, editors=False)
+            # The text is what the report was made for: it stays listed, and
+            # the staged choice goes out with the next check.
+            self._show_term_report(latest["report"], state="current", refs=None)
+            self.status_label.setText(message)
+        if 0 <= row < self.ambiguous_list.count():
+            self.ambiguous_list.setCurrentRow(row)
+
     def _unchoose_term(self) -> None:
         if not self._input_ready():
             return
@@ -3319,6 +3912,10 @@ class ManuscriptView(QWidget):
         self.export_prose_button.setEnabled(not composing)
         self._update_choice_actions()
         self._update_segment_actions()
+        self.l1_run_button.setEnabled(bool(
+            self._l1_sendable and self._api_client.is_configured and not composing and not self._translating()
+            and not self._controller.structure_running() and not self._controller.structure_known_unavailable()))
+        self._update_ambiguous_actions()
         self.save_label.setText(strings.MANUSCRIPT_SAVED if self._payload == self._saved_payload else strings.MANUSCRIPT_UNSAVED)
         source_language, target_language = (("EN", "ZH") if self._payload["direction"] == "zh" else ("ZH", "EN"))
         self.source_header_label.setText(f"{strings.INPUT_LABEL} · {source_language}")
@@ -3417,6 +4014,8 @@ class ManuscriptView(QWidget):
             self.status_label.setText(notice)
         if self._conflict_mode:
             self._refresh_conflicts()
+        # Layer 1 results follow the text: an edited segment's result goes at once.
+        self._render_structure()
         self._refresh_semantic()
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._derived_timer.start()
@@ -3497,6 +4096,8 @@ class ManuscriptView(QWidget):
         self._cancel_pending()
         self._stop_semantic()
         self._stop_translation()
+        # A Layer 1 check in flight would otherwise answer into a closed view.
+        self._controller.cancel_structure_check()
 
     @staticmethod
     def _has_recovery_content(payload: dict) -> bool:
@@ -3602,6 +4203,8 @@ class ManuscriptView(QWidget):
         self._report = None
         self._finding_refs, self._finding_recheck, self._finding_saved = [], [], []
         self._term_groups_data, self._finding_group_status = [], []
+        self._ambiguous = []
+        self._render_ambiguous()
         self.findings.clear()
         self.term_groups.clear()
         self.term_toolbar.hide()
@@ -3632,6 +4235,7 @@ class ManuscriptView(QWidget):
         self._controller.reset_term_session()
         self._segment_cursor = cursor if isinstance(cursor, int) else None
         self.segment_list.setCurrentRow(-1)
+        self._render_structure()
 
     def _on_edit(self, *_args, edit: tuple | None = None) -> None:
         if self._updating:
@@ -3688,11 +4292,25 @@ class ManuscriptView(QWidget):
                                           (record["target_start"], record["target_end"])) != record["alignment_input"])
 
     def _show_term_report(self, report: dict, *, state: str = "current", refs: list | None = None,
-                          recheck: list | None = None, saved: list | None = None) -> None:
+                          recheck: list | None = None, saved: list | None = None,
+                          ambiguous: list | None = None) -> None:
         """List a report's findings. ``refs``, ``recheck`` and ``saved`` belong to a
         long manuscript's findings: their records, whether each awaits a re-check,
         and whether each comes from a saved result whose basis this session has
-        not checked against the live server yet."""
+        not checked against the live server yet; ``ambiguous`` holds its
+        ambiguous one-character names. A document report's ambiguous names are
+        taken out here: they are listed apart, folded, and never counted with
+        the judged findings (manuscript-v5 SPEC "Reason ambiguous_mention")."""
+        if refs is None:
+            held = [f for f in report["findings"] if is_ambiguous_mention(f)]
+            if held:
+                coverage = report.get("coverage") or {}
+                report = {**report, "findings": [f for f in report["findings"] if not is_ambiguous_mention(f)]}
+                if isinstance(coverage.get("not_evaluated"), int):
+                    report["coverage"] = {**coverage, "not_evaluated": max(0, coverage["not_evaluated"] - len(held))}
+            self._ambiguous = [(finding, None) for finding in held]
+        else:
+            self._ambiguous = list(ambiguous or [])
         row = self.findings.currentRow()
         prev_ref = self._finding_record(row) if row >= 0 else self._quiet_ref
         # Rebuilt from the records (after an edit, an action or a segment of a
@@ -3740,6 +4358,7 @@ class ManuscriptView(QWidget):
                 records, self._current_pairs(),
                 self._payload["source"], self._payload["target"], self._payload["direction"],
                 alignments=self._payload["alignments"], basis=self._term_basis,
+                features=self._controller.review_features(), file_features=self._payload.get("review_features"),
             )
         else:
             groups = self._build_document_term_groups(report)
@@ -3764,6 +4383,7 @@ class ManuscriptView(QWidget):
 
         preferred = row if 0 <= row < len(report["findings"]) and (quiet or self._term_mode == "segments") else -1
         self._refresh_term_lists(quiet=quiet, preferred_index=preferred)
+        self._render_ambiguous()
 
     def _show_segment_term_report(self) -> None:
         """Long manuscripts: one display report from every segment record whose
@@ -3775,19 +4395,27 @@ class ManuscriptView(QWidget):
             return
         payload = self._payload
         source, target, basis = payload["source"], payload["target"], self._term_basis
-        findings, refs, recheck, saved_flags = [], [], [], []
+        findings, refs, recheck, saved_flags, ambiguous = [], [], [], [], []
         evaluated = not_evaluated = shown = 0
         truncated = False
+        features = self._controller.review_features()
         for index, record in enumerate(records):
-            view = self._record_views.get(record, payload, basis)
+            view = self._record_views.get(record, payload, basis, features)
             state = view.state
             if not view.content_current:
                 continue
             report = sr.expand_result(record, source, target)
             for finding in report["findings"]:
-                findings.append({**finding, "source_span": _offset(finding["source_span"], record["source_start"]),
-                                 "target_span": _offset(finding["target_span"], record["target_start"])})
-                refs.append((index, finding["source_span"]["start"], finding["source_span"]["end"]))
+                placed = {**finding, "source_span": _offset(finding["source_span"], record["source_start"]),
+                          "target_span": _offset(finding["target_span"], record["target_start"])}
+                ref = (index, finding["source_span"]["start"], finding["source_span"]["end"])
+                if is_ambiguous_mention(finding):
+                    # Listed apart, folded, never counted with the judged findings.
+                    ambiguous.append((placed, ref))
+                    not_evaluated -= 1
+                    continue
+                findings.append(placed)
+                refs.append(ref)
                 recheck.append(state == "stale")
                 saved_flags.append(state == "saved")
             evaluated += report["coverage"]["evaluated"]
@@ -3798,9 +4426,11 @@ class ManuscriptView(QWidget):
             return
         self._show_term_report({
             "request_id": None, "findings": findings,
-            "coverage": {"evaluated": evaluated, "not_evaluated": not_evaluated, "rules": list(sr.COVERAGE_RULES)},
+            "coverage": {"evaluated": evaluated, "not_evaluated": max(0, not_evaluated),
+                         "rules": list(sr.COVERAGE_RULES)},
             "truncated": truncated,
-        }, state="saved" if basis is None else "current", refs=refs, recheck=recheck, saved=saved_flags)
+        }, state="saved" if basis is None else "current", refs=refs, recheck=recheck, saved=saved_flags,
+            ambiguous=ambiguous)
 
     def _cancel_review(self) -> None:
         """The cancel button: pause what is in flight, in the order a press means
@@ -4209,6 +4839,14 @@ class ManuscriptView(QWidget):
                 self._payload[key] = written[key]
             else:
                 self._payload.pop(key, None)
+        # The review features the file records are now the manuscript's own.
+        parts, features = sr.adopt_file_features(self._payload, written.get("review_features") or ())
+        if features:
+            self._payload["review_features"] = list(features)
+        else:
+            self._payload.pop("review_features", None)
+        if parts.segments is not sr.parts_of(self._payload).segments:
+            self._put_parts(parts)
         self._conflict_mode = False
         self._refresh_conflicts()
         self._path = path
@@ -4406,7 +5044,10 @@ class ManuscriptView(QWidget):
         return {
             "draft": draft, "latest": latest, "previous": previous, "currency": currency,
             "choices": payload["choices"],
-            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest),
+            # This session's own choices (an ambiguous name adopted or marked an
+            # ordinary word) are the ones a document check sends.
+            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest,
+                                                own=self._controller.is_session_choice),
             "comparison": mdr.compare_reports(previous, latest) if latest and previous else None,
             "semantic": semantic_part, "segment_terms": segment_terms,
             "segment_choice_history": len(payload.get("segment_choice_history") or []),
