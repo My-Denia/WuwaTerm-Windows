@@ -1679,6 +1679,11 @@ def test_replacing_one_occurrence_never_leaves_a_header_claiming_the_term_is_set
     try:
         assert [g["status"] for g in view._term_groups_data] == ["confirmed"]
         assert [g["count"] for g in view._term_groups_data] == [2]
+        # Default "仅看未处理" filter hides confirmed groups until switched to "all".
+        assert view.term_filter_combo.currentData() == "unhandled"
+        assert view.term_groups.count() == 0
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
+        qapp.processEvents()
 
         parts = sr.parts_of(view._payload)
         for index in (0, 1):
@@ -1788,15 +1793,18 @@ def test_a_reopened_saved_manuscript_shows_its_terms_as_pending_not_confirmed(qa
     handler = _one_place_term_handler(candidate, verdict="verified_constraint", matcher=matcher)
     client, view = _long_term_workbench(qapp, source, target, handler)
     try:
-        # 1) Checked basis: the place is verified and the header may say 已核.
+        # 1) Checked basis: the place is verified (hidden under default "unhandled", shown under "all").
         assert view._term_basis is not None
+        assert view.term_groups.count() == 0
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
+        qapp.processEvents()
         headers, places = _term_rows(view)
         assert len(headers) == 1 and len(places) == 1
         assert "已核" in headers[0] and "Camellya ×1" in headers[0]
         assert strings.MANUSCRIPT_TERM_SAVED_NOTE not in headers[0]
         assert "约束已核" in places[0]
 
-        # 2) Reopened before any check: saved results, listed, and never 已核.
+        # 2) Reopened before any check: saved results, listed under default "unhandled", and never 已核.
         _reopen_saved(view, tmp_path, "saved-terms.json")
         assert view._term_basis is None
         qapp.processEvents()
@@ -1836,7 +1844,7 @@ def test_a_reopened_saved_manuscript_shows_its_terms_as_pending_not_confirmed(qa
         # The occurrence detail names the check, not 约束已核.
         assert view.finding_verdict.text() == strings.MANUSCRIPT_TERM_GROUP_STATUS_SAVED
 
-        # 3) The live check restores 已核: the same place, now verified.
+        # 3) The live check restores 已核: hidden under "unhandled", shown under "all".
         _run_review(view)
         qapp.processEvents()
         assert view._term_basis is not None
@@ -1892,6 +1900,7 @@ def test_a_saved_not_a_term_choice_is_recorded_but_never_已核_before_the_check
         assert [(c["choice"], c["confirmed"]) for c in record["choices"]] == [("not_a_term", True)]
         assert record["status"] == "done"
         assert [g["status"] for g in view._term_groups_data] == ["confirmed"]
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
         view.term_view_combo.setCurrentIndex(view.term_view_combo.findData("grouped"))
         qapp.processEvents()
         headers, places = _term_rows(view)
@@ -2130,5 +2139,70 @@ def test_on_edit_two_sided_fallback_preserves_non_crossing_alignments(qapp) -> N
             {"source": {"start": 3, "end": 9, "text": "Alpha."}, "target": {"start": 2, "end": 4, "text": "甲。"}},
             {"source": {"start": 10, "end": 15, "text": "Beta."}, "target": {"start": 5, "end": 7, "text": "乙。"}},
         ]
+    finally:
+        view.close()
+
+
+def test_find_and_replace_bar_shortcuts_navigation_scoped_replace_and_undo(qapp) -> None:
+    from wuwaterm_client import strings
+
+    view = ManuscriptView(ApiClient(None))
+    try:
+        view.resize(1100, 800)
+        view.show()
+        source = "段一：椿。\n\n段二：椿与椿。"
+        target = "Para 1: 😀 Camelia.\n\nPara 2: Camelia and Camelia."
+        value = empty_workfile()
+        value.update(source=source, target=target, direction="en")
+        view._set_payload(value)
+        view._update_controls()
+        qapp.processEvents()
+
+        # Ctrl+F opens Find bar without expanding Replace row
+        view.target_edit.setFocus()
+        QTest.keyClick(view.target_edit, Qt.Key.Key_F, Qt.KeyboardModifier.ControlModifier)
+        qapp.processEvents()
+        assert view.find_bar.isVisible() and not view.find_replace_row.isVisible()
+        assert view.find_side_combo.currentData() == "target"
+
+        view.find_query_edit.setText("camelia")
+        qapp.processEvents()
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=3)
+        assert view.target_edit.textCursor().selectedText() == "Camelia"
+
+        # Enter -> next match, Shift+Enter -> previous match
+        QTest.keyClick(view.find_query_edit, Qt.Key.Key_Return)
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=2, total=3)
+        QTest.keyClick(view.find_query_edit, Qt.Key.Key_Return, Qt.KeyboardModifier.ShiftModifier)
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=3)
+
+        # Ctrl+H expands Replace row; single replace updates only match #1 and supports Undo
+        QTest.keyClick(view.find_query_edit, Qt.Key.Key_H, Qt.KeyboardModifier.ControlModifier)
+        qapp.processEvents()
+        assert view.find_replace_row.isVisible()
+        view.find_replace_edit.setText("Camellya")
+        view.find_replace_one_button.click()
+        qapp.processEvents()
+        assert view._payload["target"] == "Para 1: 😀 Camellya.\n\nPara 2: Camelia and Camelia."
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=2)
+
+        # Scoped segment replace replaces only segment #2's occurrences (after moving caret to segment 2)
+        view.target_edit.set_raw_cursor_offset(view._payload["target"].index("Para 2"))
+        view._refresh_find_matches(preserve_current=False)
+        view.find_replace_segment_button.click()
+        qapp.processEvents()
+        assert view._payload["target"] == "Para 1: 😀 Camellya.\n\nPara 2: Camellya and Camellya."
+
+        # Undo steps back cleanly through scoped replace and single replace
+        view._undo_replace()
+        assert view._payload["target"] == "Para 1: 😀 Camellya.\n\nPara 2: Camelia and Camelia."
+        view._undo_replace()
+        assert view._payload["target"] == target
+
+        # Esc closes Find bar and clears extra selections
+        QTest.keyClick(view.find_query_edit, Qt.Key.Key_Escape)
+        qapp.processEvents()
+        assert not view.find_bar.isVisible()
+        assert view.target_edit.extraSelections() == []
     finally:
         view.close()

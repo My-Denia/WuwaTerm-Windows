@@ -347,6 +347,10 @@ def test_ambiguous_names_are_folded_after_the_judged_findings_and_not_counted(qa
         # One judged finding is listed and counted; the ambiguous one is apart.
         assert view.findings.count() == 1
         assert view.terms_track_button.text() == strings.MANUSCRIPT_TRACK_TERMS.format(count=1)
+        # Confirmed findings are hidden by the default "仅看未处理" filter until "全部" is selected.
+        assert view.term_filter_combo.currentData() == "unhandled"
+        assert view.finding_count.text() == strings.MANUSCRIPT_FINDING_COUNT.format(current=0, total=1)
+        view.term_filter_combo.setCurrentIndex(view.term_filter_combo.findData("all"))
         assert view.finding_count.text() == strings.MANUSCRIPT_FINDING_COUNT.format(current=1, total=1)
         assert view.ambiguous_toggle.isVisibleTo(view) and not view.ambiguous_toggle.isChecked()
         assert view.ambiguous_toggle.text() == strings.MANUSCRIPT_AMBIGUOUS_SHOW.format(count=1)

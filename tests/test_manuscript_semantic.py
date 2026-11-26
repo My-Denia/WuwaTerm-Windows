@@ -263,6 +263,9 @@ def test_accept_advances_and_undo_redo_restore_text_and_decision(qapp) -> None:
         assert states == ["pending", "pending"]
         view._redo_edit()
         assert view._payload["target"] == accepted
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending"]
+        assert view.handled_toggle.isVisibleTo(view)
+        view.handled_toggle.click()
         assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "accepted"]
     asyncio.run(scenario())
 
@@ -413,8 +416,11 @@ def test_decisions_persist_in_v2_and_re_review_applies_the_merge_rules(qapp, tmp
         assert view.save_document()
         assert json.loads(path.read_text(encoding="utf-8"))["format"] == WORKFILE_FORMAT_V2
 
-        # Same texts and spans, one issue with that fingerprint: the ignore carries over.
+        # Same texts and spans, one issue with that fingerprint: the ignore carries over
+        # (hidden by default until handled issues are expanded).
         reopened, _ = await review_reopened()
+        assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending"]
+        reopened.handled_toggle.click()
         assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending", "ignored_carried"]
 
         # An edit on another line: the saved old text lets the ignore recover.
@@ -426,6 +432,7 @@ def test_decisions_persist_in_v2_and_re_review_applies_the_merge_rules(qapp, tmp
         saved = load_workfile(path)
         assert [t["revision"] for t in saved["semantic_texts"]] == [digest(TARGET)]
         edited, _ = await review_reopened()
+        edited.handled_toggle.click()
         assert [edited._issue_state(i) for i in edited._issue_rows] == ["pending", "ignored_carried"]
 
         # A change inside the reported line: the old decision is only a reference.
@@ -712,6 +719,8 @@ def test_deciding_one_identical_occurrence_leaves_the_others_pending(qapp) -> No
         view._show_track(TRACK_SEMANTIC)
         view.semantic_list.setCurrentRow(0)
         view.ignore_button.click()
+        assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "pending"]
+        view.handled_toggle.click()
         assert [view._issue_state(i) for i in view._issue_rows] == ["pending", "pending", "ignored"]
         view.semantic_list.setCurrentRow(1)
         view.ignore_button.click()
@@ -1003,6 +1012,8 @@ def test_an_ignore_survives_reopening_and_an_unrelated_edit_before_the_next_revi
         reopened.target_edit.insertPlainText("Intro.\n")
         reopened._start_review()
         await settle(reopened)
+        assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending"]
+        reopened.handled_toggle.click()
         assert [reopened._issue_state(i) for i in reopened._issue_rows] == ["pending", "ignored_carried"]
     asyncio.run(scenario())
 
@@ -1239,6 +1250,8 @@ def test_accepting_one_issue_leaves_the_other_issues_of_its_segment_executable(q
         view.accept_button.click()
         both = TARGET.replace("second", "third").replace("will leave", "will not leave")
         assert view._payload["target"] == both
+        assert view._issue_rows == []
+        view.handled_toggle.click()
         assert [view._issue_state(i) for i in view._issue_rows] == ["accepted", "accepted"]
         view._undo_replace()
         assert view._payload["target"] == TARGET.replace("second", "third")
@@ -1295,8 +1308,9 @@ def test_status_queries_stay_fast_with_many_issues_and_decisions(qapp) -> None:
     view = _many_issues_view()
     view._show_track(TRACK_SEMANTIC)
     # Every issue here is low confidence, which Layer 2 folds by default; open
-    # the fold so the rebuild still lists all 1,024.
+    # the fold and handled toggle so the rebuild still lists all 1,024.
     view.low_toggle.setChecked(True)
+    view.hide_handled = False
     started = time.perf_counter()
     view._issue_rows = []  # force a full rebuild
     view._refresh_semantic()

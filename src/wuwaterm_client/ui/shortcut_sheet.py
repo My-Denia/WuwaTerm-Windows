@@ -34,6 +34,9 @@ SHORTCUTS: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
     ("Ctrl+Shift+C", ("Ctrl+Shift+C",), "复制译文", "Copy the translation"),
     ("Ctrl+1 / 2 / 3 / 4", ("Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4"),
      "术语查词 / 文本翻译 / 服务状态 / 稿件审校", "Terms / translate / status / manuscript"),
+    ("Ctrl+F / Ctrl+H", ("Ctrl+F", "Ctrl+H"), "查找 / 查找与替换", "Find / find and replace"),
+    ("Enter / Shift+Enter", (), "下一个 / 上一个匹配（查找栏内）", "Next / previous match (in find bar)"),
+    ("Esc", (), "关闭查找栏", "Close find bar"),
     ("Ctrl+K", ("Ctrl+K",), "聚焦当前区域的输入框", "Focus the current input"),
     ("F1", ("F1",), "打开本速查表", "Open this sheet"),
 )
