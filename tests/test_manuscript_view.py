@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from PySide6.QtCore import QCoreApplication, QMimeData, QPoint, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QMimeData, QPoint, QPointF, Qt
 from PySide6.QtGui import QInputMethodEvent, QTextCursor, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QScrollArea
@@ -578,6 +578,8 @@ def test_mouse_save_during_preedit_keeps_focus_and_does_not_save(qapp, tmp_path,
             await client.aclose()
             await window_api.aclose()
             window.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            qapp.processEvents()
     asyncio.run(scenario())
 
 

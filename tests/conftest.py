@@ -8,9 +8,58 @@ credential and error tests do not need Qt or its event loop.
 from __future__ import annotations
 
 import os
+import sys
+
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def _parentless_windows() -> set:
+    """Top-level widgets that nothing else will destroy.
+
+    Reads PySide6 only when a test has already imported it: this file also
+    runs in the contract job, where desktop dependencies are absent.
+    """
+    widgets = sys.modules.get("PySide6.QtWidgets")
+    if widgets is None or widgets.QApplication.instance() is None:
+        return set()
+    return {w for w in widgets.QApplication.topLevelWidgets() if w.parentWidget() is None}
+
+
+@pytest.fixture(autouse=True)
+def destroy_test_windows(isolated_user_state):
+    """Destroy each window a test created, before the next test starts.
+
+    A window left alive, or queued with ``deleteLater()`` and never flushed,
+    stays in the process for every later test. A later nested event loop
+    (``QTest.qWait``) then deletes the queued ones, and an application-wide
+    ``setStyleSheet`` has to repolish all the others; together this has
+    segfaulted the suite.
+
+    Windows that already existed at setup belong to a wider fixture and are
+    left alone. This hides and deletes rather than calls ``close()``:
+    ``MainWindow.closeEvent`` asks about unsaved text in a modal box, which
+    would block a headless run.
+    """
+    before = _parentless_windows()
+    yield
+    created = _parentless_windows() - before
+    for window in created:
+        window.hide()
+        window.deleteLater()
+    if "PySide6.QtWidgets" not in sys.modules:
+        return
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    app = QCoreApplication.instance()
+    if app is None:
+        return
+    # Also flushes deletions the test queued itself. Processing events can
+    # queue more of them, hence the second flush.
+    for _ in range(2):
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
 
 
 @pytest.fixture(autouse=True)
