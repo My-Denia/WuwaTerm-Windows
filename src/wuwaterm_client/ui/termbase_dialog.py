@@ -540,6 +540,34 @@ class TermbaseDialog(QDialog):
             edit.clear()
         self.form_error.clear()
 
+    def prefill(
+        self,
+        *,
+        source: str = "",
+        target: str = "",
+        direction: str | None = None,
+        kind: str | None = "preferred_term",
+        note: str = "",
+    ) -> None:
+        """Pre-fill the add-entry form so the person can review and save it."""
+        self._cancel_edit()
+        self.source_edit.setText(source.strip()[:tb.SOURCE_SCALARS[1]])
+        self.target_edit.setText(target.strip()[:tb.TARGET_SCALARS[1]])
+        self.note_edit.setText(note.strip()[:tb.NOTE_SCALARS[1]])
+        if direction in tb.TERMBASE_DIRECTION_VALUES:
+            idx = self.direction_combo.findData(direction)
+            if idx >= 0:
+                self.direction_combo.setCurrentIndex(idx)
+        if kind in tb.TERMBASE_KIND_VALUES:
+            idx = self.kind_combo.findData(kind)
+            if idx >= 0:
+                self.kind_combo.setCurrentIndex(idx)
+        if self._store.usable:
+            if self.source_edit.text() and not self.target_edit.text():
+                self.target_edit.setFocus()
+            else:
+                self.source_edit.setFocus()
+
     def _submit(self) -> None:
         if not self._store.usable:
             return

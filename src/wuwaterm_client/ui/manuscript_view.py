@@ -49,6 +49,7 @@ from ..manuscript import (
     load_workfile, parse_workfile, sanitize_duplicate_choices, save_workfile, serialize_workfile,
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
+from ..search_replace import SearchReplaceController
 from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
 from ..termbase import TermbaseStore
 from . import review_states
@@ -68,7 +69,8 @@ TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
 MAX_IMPORT_BYTES = 1_048_576
 _TEXT_SUFFIXES = (".txt", ".md")
 # The term-view status filters, in the order the combo lists them.
-_TERM_FILTER_KEYS = ("all", "inconsistent", "pending", "not_evaluated", "confirmed")
+_TERM_FILTER_KEYS = ("unhandled", "all", "inconsistent", "pending", "not_evaluated", "confirmed")
+_DEFAULT_TERM_FILTER = "unhandled"
 # What a finding of a long manuscript still needs, by its record's state.
 _RECHECK_STATES = ("stale", "pending", "failed", "not_reviewed", "needs_manual_split", "untranslated",
                    "unpaired_target")
@@ -154,6 +156,7 @@ class LosslessEditor(QPlainTextEdit):
     # decides what they mean; the editor only keeps Qt from typing a URL.
     filesDropped = Signal(object, str)
     focused = Signal()
+    promoteRequested = Signal()
 
     side = "source"
 
@@ -363,6 +366,16 @@ class LosslessEditor(QPlainTextEdit):
         finally:
             self._finalize_pending()
 
+    def selected_raw_text(self) -> str:
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return ""
+        start = _scalar_boundary(self._shown, cursor.selectionStart())
+        end = _scalar_boundary(self._shown, cursor.selectionEnd())
+        if start is None or end is None:
+            return cursor.selectedText()
+        return self._raw[self._bounds[start]:self._bounds[end]]
+
     def createMimeDataFromSelection(self) -> QMimeData:  # noqa: N802
         cursor = self.textCursor()
         start = _scalar_boundary(self._shown, cursor.selectionStart())
@@ -372,6 +385,13 @@ class LosslessEditor(QPlainTextEdit):
         data = QMimeData()
         data.setText(self._raw[self._bounds[start]:self._bounds[end]])
         return data
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        promote = menu.addAction(strings.TERMBASE_PROMOTE_BUTTON)
+        promote.triggered.connect(self.promoteRequested.emit)
+        menu.exec(event.globalPos())
 
     @staticmethod
     def typed_with_altgr(event) -> bool:
@@ -939,9 +959,9 @@ class ManuscriptView(QWidget):
         self._quiet_row = -1
         self._quiet_ref: tuple[int, int, int] | None = None
         # Term inspector view mode ("grouped" default in long mode, "order" in short)
-        # and status filter ("all" | "inconsistent" | "pending" | "not_evaluated" | "confirmed").
+        # and status filter ("unhandled" default hiding confirmed noise).
         self._term_view_override: str | None = None
-        self._term_filter: str = "all"
+        self._term_filter: str = _DEFAULT_TERM_FILTER
         self._term_groups_data: list[dict] = []
         self._finding_group_status: list[set[str]] = []
         self._syncing_term_selection = False
@@ -957,12 +977,15 @@ class ManuscriptView(QWidget):
         self._l1_rows: list[tuple[int, dict]] = []
         self._l1_sendable = False
         self._l1_views: list = []
-        # Layer 2: issues left out because Layer 1 covers them, and folded
-        # low-confidence ones.
+        # Layer 2: issues left out because Layer 1 covers them, folded
+        # low-confidence ones, and hidden handled issues.
         self._covered_count = 0
         self._low_rows: list[sessions.LiveIssue] = []
+        self._handled_rows: list[sessions.LiveIssue] = []
         # Every issue Layer 2 lists, folded low-confidence ones included.
         self._layer2_listed: list[sessions.LiveIssue] = []
+        self._search_controller = SearchReplaceController()
+        self._suppress_find_refresh = False
 
         self.source_edit = LosslessEditor(self)
         self.target_edit = LosslessEditor(self)
@@ -972,6 +995,7 @@ class ManuscriptView(QWidget):
         for editor in (self.source_edit, self.target_edit):
             editor.filesDropped.connect(self._files_dropped)
             editor.focused.connect(lambda e=editor: setattr(self, "_last_side", e.side))
+            editor.promoteRequested.connect(lambda e=editor: self._promote_from_editor(e.side))
             editor.setMinimumHeight(36)
             editor.setMinimumWidth(80)
             editor.rawChanged.connect(lambda side="source" if editor is self.source_edit else "target",
@@ -1070,6 +1094,16 @@ class ManuscriptView(QWidget):
             widget.setVisible(False)
         self.translate_button = QPushButton(self)
         self.translate_button.clicked.connect(self._translate)
+        self.promote_editor_button = QPushButton(self)
+        self.promote_editor_button.setObjectName("commandButton")
+        self.promote_editor_button.setIcon(icon("book-open"))
+        self.promote_editor_button.setIconSize(QSize(16, 16))
+        self.promote_editor_button.setFixedWidth(34)
+        self.promote_editor_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.promote_editor_button.setToolTip(strings.TERMBASE_PROMOTE_BUTTON)
+        self.promote_editor_button.setAccessibleName(strings.TERMBASE_PROMOTE_BUTTON)
+        self.promote_editor_button.clicked.connect(lambda: self._promote_from_editor())
+        self._build_find_bar()
         self._build_semantic_widgets()
         self._build_layer_widgets()
 
@@ -1157,6 +1191,7 @@ class ManuscriptView(QWidget):
             header_layout.addStretch(1)
             if editor is self.target_edit:
                 # Translation only ever fills this side, so its action lives here.
+                header_layout.addWidget(self.promote_editor_button)
                 header_layout.addWidget(self.translate_button)
             else:
                 # An invisible twin keeps both headers the same height in every style.
@@ -1272,6 +1307,7 @@ class ManuscriptView(QWidget):
         self.term_view_combo.currentIndexChanged.connect(self._on_term_view_changed)
         self.term_filter_combo = ChevronComboBox(self.term_toolbar)
         for label_text, key in (
+            (strings.MANUSCRIPT_TERM_FILTER_UNHANDLED, "unhandled"),
             (strings.MANUSCRIPT_TERM_FILTER_ALL, "all"),
             (strings.MANUSCRIPT_TERM_FILTER_INCONSISTENT, "inconsistent"),
             (strings.MANUSCRIPT_TERM_FILTER_PENDING, "pending"),
@@ -1285,8 +1321,8 @@ class ManuscriptView(QWidget):
         self.term_filter_combo.setMinimumContentsLength(3)
         self.term_filter_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.term_filter_combo.currentIndexChanged.connect(self._on_term_filter_changed)
-        term_bar.addWidget(self.term_view_combo, 3)
-        term_bar.addWidget(self.term_filter_combo, 2)
+        term_bar.addWidget(self.term_view_combo, 1)
+        term_bar.addWidget(self.term_filter_combo, 1)
         self.term_toolbar.hide()
         term_details.addWidget(self.term_toolbar)
         self.term_groups = _WrappedListWidget(term_page)
@@ -1446,6 +1482,12 @@ class ManuscriptView(QWidget):
         term_actions.addWidget(self.lookup_button)
         term_actions.addStretch(1)
         term_details.addLayout(term_actions)
+        self.promote_term_button = _ElidingButton(strings.TERMBASE_PROMOTE_BUTTON, inspector_body)
+        self.promote_term_button.setToolTip(strings.TERMBASE_PROMOTE_TOOLTIP)
+        self.promote_term_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.promote_term_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.promote_term_button.clicked.connect(self._promote_from_term_finding)
+        term_details.addWidget(self.promote_term_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
         self.manual_edit_label.setWordWrap(True)
         term_details.addWidget(self.manual_edit_label)
@@ -1501,10 +1543,17 @@ class ManuscriptView(QWidget):
         inspector_scroll.setWidget(inspector_body)
         inspector_layout.addWidget(inspector_scroll, 1)
 
+        self.editor_pane = QWidget(self)
+        editor_pane_layout = QVBoxLayout(self.editor_pane)
+        editor_pane_layout.setContentsMargins(0, 0, 0, 0)
+        editor_pane_layout.setSpacing(6)
+        editor_pane_layout.addWidget(self.find_bar)
+        editor_pane_layout.addWidget(self.editor_splitter, 1)
+
         self.work_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.work_splitter.setChildrenCollapsible(False)
         self.work_splitter.setHandleWidth(8)
-        self.work_splitter.addWidget(self.editor_splitter)
+        self.work_splitter.addWidget(self.editor_pane)
         self.work_splitter.addWidget(self.inspector)
         self.work_splitter.setStretchFactor(0, 1)
         self.work_splitter.setStretchFactor(1, 0)
@@ -1772,6 +1821,12 @@ class ManuscriptView(QWidget):
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
+        self.semantic_promote_button = _ElidingButton(strings.TERMBASE_PROMOTE_BUTTON, page)
+        self.semantic_promote_button.setToolTip(strings.TERMBASE_PROMOTE_TOOLTIP)
+        self.semantic_promote_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.semantic_promote_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.semantic_promote_button.clicked.connect(self._promote_from_semantic_issue)
+        layout.addWidget(self.semantic_promote_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.adjust_area = QWidget(page)
         self.adjust_area.setObjectName("inspectorBody")
         adjust = QVBoxLayout(self.adjust_area)
@@ -1805,6 +1860,16 @@ class ManuscriptView(QWidget):
         self.low_toggle.toggled.connect(self._low_toggled)
         self.low_toggle.hide()
         layout.addWidget(self.low_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        # Already accepted/adjusted/ignored issues stay hidden until toggled on.
+        self.handled_toggle = _ElidingButton(parent=page)
+        self.handled_toggle.setObjectName("commandButton")
+        self.handled_toggle.setCheckable(True)
+        self.handled_toggle.setChecked(False)
+        self.handled_toggle.setIconSize(QSize(16, 16))
+        self.handled_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.handled_toggle.toggled.connect(self._handled_toggled)
+        self.handled_toggle.hide()
+        layout.addWidget(self.handled_toggle, 0, Qt.AlignmentFlag.AlignLeft)
         self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
         self.shortcuts_label.setObjectName("captionText")
         self.shortcuts_label.setWordWrap(True)
@@ -2120,6 +2185,8 @@ class ManuscriptView(QWidget):
             ("Ctrl+Alt+1", lambda: self._shortcut_track(TRACK_TERMS)),
             ("Ctrl+Alt+2", lambda: self._shortcut_track(TRACK_SEMANTIC)),
             ("Ctrl+Alt+3", lambda: self._shortcut_track(TRACK_SEGMENTS)),
+            ("Ctrl+F", lambda: self._open_find_bar(replace=False)),
+            ("Ctrl+H", lambda: self._open_find_bar(replace=True)),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -2463,6 +2530,14 @@ class ManuscriptView(QWidget):
             source=record["source_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE,
             target=record["target_excerpt"] or strings.MANUSCRIPT_ISSUE_NO_SIDE)
 
+    @property
+    def hide_handled(self) -> bool:
+        return not self.handled_toggle.isChecked()
+
+    @hide_handled.setter
+    def hide_handled(self, value: bool) -> None:
+        self.handled_toggle.setChecked(not bool(value))
+
     def _refresh_semantic(self) -> None:
         """Keep the issue rows in step. The list widget is rebuilt only when the
         rows themselves change; otherwise only changed row texts are updated,
@@ -2471,23 +2546,39 @@ class ManuscriptView(QWidget):
             return
         current = self._current_issue()
         listed, covered = self._layer2_rows()
-        low = [issue for issue in listed if issue.issue.get("confidence") == "low"]
         open_low = self.low_toggle.isChecked()
+        hide_handled = self.hide_handled
+        handled = [
+            issue for issue in listed
+            if self._issue_state(issue) not in sessions.UNHANDLED
+        ]
+        active_pool = (
+            [issue for issue in listed if self._issue_state(issue) in sessions.UNHANDLED]
+            if hide_handled else listed
+        )
+        low = [issue for issue in active_pool if issue.issue.get("confidence") == "low"]
         # High and medium first; low-confidence issues are folded at the end
         # of the list until the owner opens them.
-        rows = sorted([issue for issue in listed if open_low or issue.issue.get("confidence") != "low"],
+        rows = sorted([issue for issue in active_pool if open_low or issue.issue.get("confidence") != "low"],
                       key=lambda issue: (
             1 if issue.issue.get("confidence") == "low" else 0,
             0 if self._issue_state(issue) in sessions.UNHANDLED else 1,
             issue.segment_index,
             (issue.source_span or issue.target_span or {"start": 0})["start"]))
-        self._covered_count, self._low_rows, self._layer2_listed = covered, low, listed
+        self._covered_count, self._low_rows, self._handled_rows, self._layer2_listed = covered, low, handled, listed
         self.l2_covered.setText(strings.MANUSCRIPT_L2_COVERED.format(count=covered))
         self.l2_covered.setVisible(bool(covered))
         self.low_toggle.setText((strings.MANUSCRIPT_L2_LOW_HIDE if open_low else strings.MANUSCRIPT_L2_LOW_SHOW)
                                 .format(count=len(low)))
         self.low_toggle.setIcon(icon("chevron-down" if open_low else "chevron-right"))
         self.low_toggle.setVisible(bool(low))
+        show_handled = not hide_handled
+        self.handled_toggle.setText(
+            (strings.MANUSCRIPT_L2_HANDLED_HIDE if show_handled else strings.MANUSCRIPT_L2_HANDLED_SHOW)
+            .format(count=len(handled))
+        )
+        self.handled_toggle.setIcon(icon("chevron-down" if show_handled else "chevron-right"))
+        self.handled_toggle.setVisible(bool(handled))
         same = len(rows) == len(self._issue_rows) and all(a is b for a, b in zip(rows, self._issue_rows))
         visible = self.track_stack.currentIndex() == TRACK_SEMANTIC
         self._refreshing_lists = True
@@ -2562,6 +2653,10 @@ class ManuscriptView(QWidget):
         return None
 
     def _low_toggled(self, _open: bool) -> None:
+        self._refresh_semantic()
+        self._update_tracks()
+
+    def _handled_toggled(self, _open: bool) -> None:
         self._refresh_semantic()
         self._update_tracks()
 
@@ -2663,13 +2758,18 @@ class ManuscriptView(QWidget):
         widgets = (self.issue_confidence, self.issue_excerpts, self.issue_rationale, self.issue_suggestion,
                    self.issue_term_effect, self.issue_notice)
         if issue is None:
-            self.issue_title.setText(strings.MANUSCRIPT_SEMANTIC_PROMPT if self._issue_rows else "")
+            if self._issue_rows:
+                self.issue_title.setText(strings.MANUSCRIPT_SEMANTIC_PROMPT)
+            elif self._handled_rows:
+                self.issue_title.setText(strings.MANUSCRIPT_ALL_HANDLED)
+            else:
+                self.issue_title.setText("")
             self.issue_state.hide()
             for widget in widgets:
                 widget.clear()
                 widget.hide()
             for widget in (self.issue_alternative_button, self.accept_button, self.adjust_button,
-                           self.ignore_button, self.adjust_area):
+                           self.ignore_button, self.semantic_promote_button, self.adjust_area):
                 widget.hide()
             return
         record = issue.issue
@@ -2722,7 +2822,7 @@ class ManuscriptView(QWidget):
         for widget in widgets:
             widget.setVisible(bool(widget.text()))
         self.issue_alternative_button.setVisible(bool(alternatives) and suggestion is not None)
-        for button in (self.accept_button, self.adjust_button, self.ignore_button):
+        for button in (self.accept_button, self.adjust_button, self.ignore_button, self.semantic_promote_button):
             button.show()
         # suggestion_withheld leaves only adjust and ignore (plan §2.3).
         self.accept_button.setVisible(suggestion is not None)
@@ -2744,6 +2844,7 @@ class ManuscriptView(QWidget):
         # A decision already made here stays as history; it is not decided again.
         self.ignore_button.setEnabled(free and self._controller.can_ignore(issue))
         self.adjust_apply_button.setEnabled(free and self._can_adjust(issue))
+        self.semantic_promote_button.setEnabled(not composing and issue is not None)
         self.semantic_list.setEnabled(not composing)
 
     def _alternative_toggled(self, _checked: bool) -> None:
@@ -2795,6 +2896,28 @@ class ManuscriptView(QWidget):
                 if self._issue_state(rows[row]) in sessions.UNHANDLED:
                     self.semantic_list.setCurrentRow(row)
                     return
+        else:
+            handled_pos = (
+                1 if handled.issue.get("confidence") == "low" else 0,
+                handled.segment_index,
+                (handled.source_span or handled.target_span or {"start": 0})["start"],
+            )
+            unhandled_rows = [
+                (
+                    row,
+                    (
+                        1 if issue.issue.get("confidence") == "low" else 0,
+                        issue.segment_index,
+                        (issue.source_span or issue.target_span or {"start": 0})["start"],
+                    ),
+                )
+                for row, issue in enumerate(rows)
+                if self._issue_state(issue) in sessions.UNHANDLED
+            ]
+            if unhandled_rows:
+                next_row = next((row for row, pos in unhandled_rows if pos >= handled_pos), unhandled_rows[0][0])
+                self.semantic_list.setCurrentRow(next_row)
+                return
         self.status_label.setText(self.status_label.text() + " " + strings.MANUSCRIPT_ALL_HANDLED)
 
     # -- semantic review: decisions ------------------------------------------
@@ -3501,7 +3624,9 @@ class ManuscriptView(QWidget):
         self._render_inspector_hint()
         self._render_choice(index if finding is not None else -1)
         if finding is None:
-            if total > 0 and self._term_filter != "all":
+            if total > 0 and self._term_filter == "unhandled":
+                prompt = strings.MANUSCRIPT_TERM_FILTER_UNHANDLED_EMPTY.format(count=total)
+            elif total > 0 and self._term_filter != "all":
                 prompt = strings.MANUSCRIPT_TERM_FILTER_EMPTY
             elif total > 0:
                 prompt = strings.MANUSCRIPT_FINDING_PROMPT
@@ -3519,6 +3644,7 @@ class ManuscriptView(QWidget):
             self.finding_pair.hide()
             self.finding_reason.hide()
             self.lookup_button.hide()
+            self.promote_term_button.hide()
             self.manual_edit_label.hide()
             self.replace_toggle.hide()
             self.replace_toggle.setChecked(False)
@@ -3575,6 +3701,7 @@ class ManuscriptView(QWidget):
             self.candidates_label.clear()
             self.candidates_label.hide()
         self.lookup_button.setVisible(bool(source.get("text")))
+        self.promote_term_button.setVisible(bool(source.get("text")))
         reliable = self._target_span_reliable(target)
         skip_manual_notice = verdict == "not_evaluated" and reason in ("not_a_term", "ordinary_word")
         self.manual_edit_label.setVisible(not reliable and not skip_manual_notice)
@@ -3912,7 +4039,11 @@ class ManuscriptView(QWidget):
         self.jump_mismatch_button.setEnabled(not composing)
         self._render_mismatch_prompt()
         self.lookup_button.setEnabled(not composing)
+        self.promote_term_button.setEnabled(not composing)
+        self.promote_editor_button.setEnabled(not composing)
         self.replace_toggle.setEnabled(not composing)
+        if hasattr(self, "find_bar") and self.find_bar.isVisible() and not self._suppress_find_refresh:
+            self._update_find_controls()
         index = self.findings.currentRow()
         has_target = (self._report is not None and 0 <= index < len(self._report["findings"])
                       and self._target_span_reliable(self._report["findings"][index].get("target_span")))
@@ -4032,6 +4163,8 @@ class ManuscriptView(QWidget):
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._derived_timer.start()
         self._update_controls()
+        if hasattr(self, "find_bar") and self.find_bar.isVisible() and not self._suppress_find_refresh:
+            self._refresh_find_matches(preserve_current=True)
         # The status bar's counts follow on the next pause, not every keystroke.
         self._caret_timer.start()
         self._my_terms_timer.start()
@@ -4391,7 +4524,7 @@ class ManuscriptView(QWidget):
                     status = "confirmed"
                 else:
                     status = "pending"
-                matched_by_index[idx] = {"all", status}
+                matched_by_index[idx] = {"all", status} if status == "confirmed" else {"all", "unhandled", status}
         self._finding_group_status = matched_by_index
 
         preferred = row if 0 <= row < len(report["findings"]) and (quiet or self._term_mode == "segments") else -1
@@ -4634,11 +4767,17 @@ class ManuscriptView(QWidget):
                    else self._controller.redo(view_state=self._editor_state()))
         if outcome is None:
             return
-        self._finish(outcome.edit, editors=True)
-        self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
-        self._update_controls()
-        if outcome.entry.view is not None:
-            self._restore_editor_state(outcome.entry.view)
+        self._suppress_find_refresh = True
+        try:
+            self._finish(outcome.edit, editors=True)
+            self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
+            self._update_controls()
+            if outcome.entry.view is not None:
+                self._restore_editor_state(outcome.entry.view)
+        finally:
+            self._suppress_find_refresh = False
+        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+            self._refresh_find_matches(preserve_current=True)
 
     def _set_payload(self, value: dict) -> None:
         self._updating = True
@@ -4660,12 +4799,110 @@ class ManuscriptView(QWidget):
         self._my_terms_timer.stop()
         self.my_terms.set_context(self._payload["source"], self._payload["direction"])
 
-    def show_termbase_dialog(self) -> None:
+    def show_termbase_dialog(
+        self,
+        _checked: bool = False,
+        *,
+        source: str = "",
+        target: str = "",
+        direction: str | None = None,
+        kind: str | None = None,
+        note: str = "",
+    ) -> None:
         """Manage the termbase; the list of hits follows every change."""
         dialog = TermbaseDialog(self._termbase_store, self)
+        if source or target or direction is not None or kind is not None or note:
+            dialog.prefill(
+                source=source,
+                target=target,
+                direction=direction or self._payload["direction"],
+                kind=kind or "preferred_term",
+                note=note,
+            )
         dialog.changed.connect(self._refresh_my_terms)
         dialog.exec()
         self._refresh_my_terms()
+
+    def _promote_from_term_finding(self) -> None:
+        if not self._input_ready():
+            return
+        index = self.findings.currentRow()
+        if self._report is None or not 0 <= index < len(self._report["findings"]):
+            return
+        finding = self._report["findings"][index]
+        direction = self._payload["direction"]
+        source_text = (finding.get("source_span") or {}).get("text") or ""
+        target_text = self.replacement_edit.text().strip()
+        if not target_text:
+            target_span = finding.get("target_span")
+            if isinstance(target_span, dict) and isinstance(target_span.get("text"), str):
+                target_text = target_span["text"]
+            elif len(finding.get("candidates") or ()) == 1:
+                target_text = finding["candidates"][0].get(direction, "")
+        self.show_termbase_dialog(
+            source=source_text,
+            target=target_text,
+            direction=direction,
+            kind="preferred_term",
+        )
+
+    def _promote_from_semantic_issue(self) -> None:
+        if not self._input_ready():
+            return
+        issue = self._current_issue()
+        if issue is None:
+            return
+        direction = self._payload["direction"]
+        source_text = (
+            issue.source_span["text"]
+            if issue.source_span and issue.source_span.get("text")
+            else (issue.issue.get("source_excerpt") or "")
+        )
+        decision = sessions.decision_for(issue, self._controller.decision_index())
+        option = self._selected_option(issue)
+        if self.adjust_area.isVisible() and self.adjust_edit.toPlainText().strip():
+            target_text = self.adjust_edit.toPlainText().strip()
+        elif decision is not None and decision.get("applied_text"):
+            target_text = decision["applied_text"]
+        elif option is not None:
+            target_text = option[0]
+        elif issue.target_span and issue.target_span.get("text"):
+            target_text = issue.target_span["text"]
+        else:
+            target_text = issue.issue.get("target_excerpt") or ""
+        self.show_termbase_dialog(
+            source=source_text,
+            target=target_text,
+            direction=direction,
+            kind="preferred_term",
+        )
+
+    def _promote_from_editor(self, side: str | None = None) -> None:
+        if not self._input_ready():
+            return
+        source_selected = self.source_edit.selected_raw_text().strip()
+        target_selected = self.target_edit.selected_raw_text().strip()
+        if not source_selected and not target_selected:
+            match = self._search_controller.current_match()
+            if match is not None:
+                if match.side == "source":
+                    source_selected = match.text.strip()
+                else:
+                    target_selected = match.text.strip()
+            elif self.track_stack.currentIndex() == TRACK_SEMANTIC and self._current_issue() is not None:
+                self._promote_from_semantic_issue()
+                return
+            elif self.track_stack.currentIndex() == TRACK_TERMS and 0 <= self.findings.currentRow() < (
+                len(self._report["findings"]) if self._report is not None else 0
+            ):
+                self._promote_from_term_finding()
+                return
+        self.show_termbase_dialog(
+            source=source_selected,
+            target=target_selected,
+            direction=self._payload["direction"],
+            kind="preferred_term",
+        )
 
     def _refresh_conflicts(self) -> None:
         history = sr.parts_of(self._payload).history if self._history_removal else []
@@ -4957,8 +5194,15 @@ class ManuscriptView(QWidget):
         self._conflict_mode = self._history_removal = False
         self._mismatch_prompt_active = False
         self._term_view_override = None
-        self._term_filter = "all"
+        self._term_filter = _DEFAULT_TERM_FILTER
         self._quiet_ref = None
+        self.handled_toggle.blockSignals(True)
+        self.handled_toggle.setChecked(False)
+        self.handled_toggle.blockSignals(False)
+        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+            self._close_find_bar(restore_focus=False)
+        else:
+            self._search_controller.clear()
         self._refresh_conflicts()
         self._set_payload(value)
         # Opening or clearing a document has not moved the caret: cancel the
@@ -5109,6 +5353,340 @@ class ManuscriptView(QWidget):
         self.status_label.setText(strings.MANUSCRIPT_EXPORT_DONE)
         return True
 
+    def _build_find_bar(self) -> None:
+        """Collapsible in-editor Find & Replace bar (Ctrl+F / Ctrl+H)."""
+        bar = QFrame(self)
+        bar.setObjectName("workbenchToolbar")
+        bar.hide()
+        self.find_bar = bar
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(10, 6, 10, 6)
+        outer.setSpacing(6)
+
+        find_row = QHBoxLayout()
+        find_row.setContentsMargins(0, 0, 0, 0)
+        find_row.setSpacing(6)
+
+        self.find_query_edit = QLineEdit(bar)
+        self.find_query_edit.setObjectName("searchField")
+        self.find_query_edit.setPlaceholderText(strings.FIND_BAR_QUERY_PLACEHOLDER)
+        self.find_query_edit.setAccessibleName(strings.FIND_BAR_QUERY_LABEL)
+        self.find_query_edit.textChanged.connect(lambda _t: self._refresh_find_matches(preserve_current=False))
+
+        self.find_side_combo = ChevronComboBox(bar)
+        self.find_side_combo.addItem(strings.FIND_BAR_SIDE_TARGET, "target")
+        self.find_side_combo.addItem(strings.FIND_BAR_SIDE_SOURCE, "source")
+        self.find_side_combo.setAccessibleName(strings.FIND_BAR_SIDE_LABEL)
+        self.find_side_combo.currentIndexChanged.connect(lambda _i: self._refresh_find_matches(preserve_current=False))
+
+        self.find_case_check = QCheckBox(strings.FIND_BAR_CASE_SENSITIVE, bar)
+        self.find_case_check.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_case_check.toggled.connect(lambda _c: self._refresh_find_matches(preserve_current=False))
+
+        self.find_scope_check = QCheckBox(strings.FIND_BAR_SCOPE_SEGMENT, bar)
+        self.find_scope_check.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_scope_check.toggled.connect(lambda _c: self._refresh_find_matches(preserve_current=False))
+
+        self.find_count_label = QLabel(strings.FIND_BAR_COUNT_NONE, bar)
+        self.find_count_label.setObjectName("secondaryText")
+
+        self.find_prev_button = QPushButton(bar)
+        self.find_prev_button.setObjectName("commandButton")
+        self.find_prev_button.setIcon(icon("chevron-up"))
+        self.find_prev_button.setIconSize(QSize(16, 16))
+        self.find_prev_button.setFixedWidth(34)
+        self.find_prev_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_prev_button.setToolTip(strings.FIND_BAR_PREV)
+        self.find_prev_button.setAccessibleName(strings.FIND_BAR_PREV)
+        self.find_prev_button.clicked.connect(self._find_prev)
+
+        self.find_next_button = QPushButton(bar)
+        self.find_next_button.setObjectName("commandButton")
+        self.find_next_button.setIcon(icon("chevron-down"))
+        self.find_next_button.setIconSize(QSize(16, 16))
+        self.find_next_button.setFixedWidth(34)
+        self.find_next_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_next_button.setToolTip(strings.FIND_BAR_NEXT)
+        self.find_next_button.setAccessibleName(strings.FIND_BAR_NEXT)
+        self.find_next_button.clicked.connect(self._find_next)
+
+        self.find_replace_toggle = QPushButton(strings.FIND_BAR_TOGGLE_REPLACE, bar)
+        self.find_replace_toggle.setObjectName("commandButton")
+        self.find_replace_toggle.setCheckable(True)
+        self.find_replace_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_replace_toggle.toggled.connect(self._set_find_replace_visible)
+
+        self.find_close_button = QPushButton(bar)
+        self.find_close_button.setObjectName("commandButton")
+        self.find_close_button.setIcon(icon("x"))
+        self.find_close_button.setIconSize(QSize(16, 16))
+        self.find_close_button.setFixedWidth(34)
+        self.find_close_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_close_button.setToolTip(strings.FIND_BAR_CLOSE)
+        self.find_close_button.setAccessibleName(strings.FIND_BAR_CLOSE)
+        self.find_close_button.clicked.connect(lambda: self._close_find_bar())
+
+        find_row.addWidget(self.find_query_edit, 1)
+        find_row.addWidget(self.find_side_combo)
+        find_row.addWidget(self.find_case_check)
+        find_row.addWidget(self.find_scope_check)
+        find_row.addWidget(self.find_count_label)
+        find_row.addWidget(self.find_prev_button)
+        find_row.addWidget(self.find_next_button)
+        find_row.addWidget(self.find_replace_toggle)
+        find_row.addWidget(self.find_close_button)
+        outer.addLayout(find_row)
+
+        self.find_replace_row = QWidget(bar)
+        self.find_replace_row.setObjectName("inspectorBody")
+        replace_layout = QHBoxLayout(self.find_replace_row)
+        replace_layout.setContentsMargins(0, 0, 0, 0)
+        replace_layout.setSpacing(6)
+
+        self.find_replace_edit = QLineEdit(self.find_replace_row)
+        self.find_replace_edit.setPlaceholderText(strings.FIND_BAR_REPLACE_PLACEHOLDER)
+        self.find_replace_edit.setAccessibleName(strings.FIND_BAR_REPLACE_LABEL)
+        self.find_replace_edit.returnPressed.connect(self._find_replace_current)
+
+        self.find_replace_one_button = QPushButton(strings.FIND_BAR_REPLACE_ONE, self.find_replace_row)
+        self.find_replace_one_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_replace_one_button.clicked.connect(self._find_replace_current)
+
+        self.find_replace_segment_button = QPushButton(strings.FIND_BAR_REPLACE_SEGMENT, self.find_replace_row)
+        self.find_replace_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.find_replace_segment_button.setToolTip(strings.FIND_BAR_REPLACE_SEGMENT_TOOLTIP)
+        self.find_replace_segment_button.clicked.connect(self._find_replace_in_segment)
+
+        replace_layout.addWidget(self.find_replace_edit, 1)
+        replace_layout.addWidget(self.find_replace_one_button)
+        replace_layout.addWidget(self.find_replace_segment_button)
+        self.find_replace_row.hide()
+        outer.addWidget(self.find_replace_row)
+
+    def _set_find_replace_visible(self, visible: bool) -> None:
+        self.find_replace_row.setVisible(visible)
+        self._update_find_controls()
+
+    def _find_segment_context(self, side: str, *, offset: int | None = None) -> tuple[list[tuple[int, int]], int | None]:
+        pairs = self._current_pairs()
+        if not pairs:
+            return [], None
+        ranges = [(getattr(pair, side).core_start, getattr(pair, side).core_end) for pair in pairs]
+        resolved_offset = self._caret_offset(side) if offset is None else offset
+        seg_idx = self._pair_index_at(pairs, side, resolved_offset)
+        return ranges, seg_idx
+
+    def _open_find_bar(self, *, replace: bool = False) -> None:
+        if not self._input_ready():
+            return
+        if self.source_edit.hasFocus():
+            side = "source"
+        elif self.target_edit.hasFocus():
+            side = "target"
+        elif not self.find_bar.isVisible():
+            side = self._last_side
+        else:
+            side = self.find_side_combo.currentData() or self._last_side
+
+        selected = self._editor(side).selected_raw_text()
+        if selected and "\n" not in selected and "\r" not in selected:
+            self.find_query_edit.blockSignals(True)
+            self.find_query_edit.setText(selected)
+            self.find_query_edit.blockSignals(False)
+
+        side_idx = self.find_side_combo.findData(side)
+        if side_idx >= 0 and self.find_side_combo.currentIndex() != side_idx:
+            self.find_side_combo.blockSignals(True)
+            self.find_side_combo.setCurrentIndex(side_idx)
+            self.find_side_combo.blockSignals(False)
+
+        self.find_bar.show()
+        if replace:
+            self.find_replace_toggle.setChecked(True)
+        elif not self.find_replace_row.isVisible():
+            self.find_replace_toggle.setChecked(False)
+        self._refresh_find_matches(preserve_current=True)
+        self.find_query_edit.setFocus()
+        self.find_query_edit.selectAll()
+
+    def _close_find_bar(self, *, restore_focus: bool = True) -> None:
+        self.find_bar.hide()
+        self._search_controller.clear()
+        self.source_edit.setExtraSelections([])
+        self.target_edit.setExtraSelections([])
+        self.find_count_label.setText(strings.FIND_BAR_COUNT_NONE)
+        if restore_focus:
+            self._editor(self._last_side).setFocus()
+
+    def _refresh_find_matches(self, *, preserve_current: bool = True, cursor_offset: int | None = None) -> None:
+        side = self.find_side_combo.currentData() or "target"
+        ctrl = self._search_controller
+        ctrl.query = self.find_query_edit.text()
+        ctrl.replacement = self.find_replace_edit.text()
+        ctrl.side = side
+        ctrl.case_sensitive = self.find_case_check.isChecked()
+        ctrl.scope = "segment" if self.find_scope_check.isChecked() else "all"
+        anchor = self._caret_offset(side) if cursor_offset is None else cursor_offset
+        ranges, seg_idx = self._find_segment_context(side, offset=anchor)
+        ctrl.refresh(
+            self._payload[side],
+            segment_ranges=ranges,
+            scope_segment=seg_idx,
+            cursor_offset=anchor,
+            preserve_current=preserve_current,
+        )
+        self._highlight_find_match()
+        self._update_find_controls(seg_idx=seg_idx if ctrl.scope == "segment" else None)
+
+    def _highlight_find_match(self) -> None:
+        match = self._search_controller.current_match()
+        if match is None:
+            self.source_edit.setExtraSelections([])
+            self.target_edit.setExtraSelections([])
+            self.find_count_label.setText(strings.FIND_BAR_COUNT_NONE)
+            return
+        editor = self._editor(match.side)
+        other = self.target_edit if match.side == "source" else self.source_edit
+        other.setExtraSelections([])
+        with self.scroll_sync.suspended():
+            editor.select_raw_span(match.span(), move_cursor=True)
+            editor.ensureCursorVisible()
+        current = (self._search_controller.current_index or 0) + 1
+        self.find_count_label.setText(strings.FIND_BAR_COUNT.format(current=current, total=len(self._search_controller.matches)))
+
+    def _update_find_controls(self, *, seg_idx: int | None = None) -> None:
+        composing = self.source_edit._ime_active or self.target_edit._ime_active
+        has_matches = bool(self._search_controller.matches)
+        side = self.find_side_combo.currentData() or "target"
+        ranges, resolved_seg_idx = self._find_segment_context(side)
+        if seg_idx is not None:
+            resolved_seg_idx = seg_idx
+        has_segment_match = False
+        if (
+            not composing
+            and self._search_controller.query
+            and resolved_seg_idx is not None
+            and 0 <= resolved_seg_idx < len(ranges)
+        ):
+            seg_start, seg_end = ranges[resolved_seg_idx]
+            has_segment_match = any(
+                seg_start <= m.start and m.end <= seg_end for m in self._search_controller.matches
+            )
+        self.find_prev_button.setEnabled(not composing and has_matches)
+        self.find_next_button.setEnabled(not composing and has_matches)
+        self.find_replace_one_button.setEnabled(not composing and self._search_controller.current_match() is not None)
+        self.find_replace_segment_button.setEnabled(not composing and has_segment_match)
+
+    def _find_next(self) -> None:
+        if not self.find_bar.isVisible():
+            return
+        if not self._search_controller.matches and self.find_query_edit.text():
+            self._refresh_find_matches(preserve_current=False)
+            return
+        side = self.find_side_combo.currentData() or "target"
+        self._search_controller.step(forward=True, cursor_offset=self._caret_offset(side))
+        self._highlight_find_match()
+        self._update_find_controls()
+
+    def _find_prev(self) -> None:
+        if not self.find_bar.isVisible():
+            return
+        if not self._search_controller.matches and self.find_query_edit.text():
+            self._refresh_find_matches(preserve_current=False)
+            return
+        side = self.find_side_combo.currentData() or "target"
+        self._search_controller.step(forward=False, cursor_offset=self._caret_offset(side))
+        self._highlight_find_match()
+        self._update_find_controls()
+
+    def _find_replace_current(self) -> None:
+        if not self._input_ready():
+            return
+        match = self._search_controller.current_match()
+        if match is None:
+            self.status_label.setText(strings.FIND_BAR_NO_MATCH)
+            return
+        side = match.side
+        editor = self._editor(side)
+        raw = self._payload[side]
+        try:
+            result = self._search_controller.replace_current(raw, self.find_replace_edit.text())
+        except ValueError:
+            self._refresh_find_matches(preserve_current=False)
+            return
+        if result is None:
+            return
+        if result.text == raw:
+            editor.set_raw_cursor_offset(result.new_cursor_offset)
+            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+            return
+        if not editor.can_display(result.text):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        value = self._draft_snapshot()
+        value[side] = result.text
+        next_source = result.text if side == "source" else value["source"]
+        next_target = result.text if side == "target" else value["target"]
+        _, start, old_end, new_len = result.edit
+        remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
+        value["alignments"] = remap.alignments
+        self._suppress_find_refresh = True
+        try:
+            self._apply_edit(value, edits=[result.edit], remap=remap)
+        finally:
+            self._suppress_find_refresh = False
+        editor.set_raw_cursor_offset(result.new_cursor_offset)
+        self.status_label.setText(strings.FIND_BAR_REPLACED_ONE)
+        self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+
+    def _find_replace_in_segment(self) -> None:
+        if not self._input_ready():
+            return
+        side = self.find_side_combo.currentData() or "target"
+        editor = self._editor(side)
+        ranges, seg_idx = self._find_segment_context(side)
+        match = self._search_controller.current_match()
+        if match is not None and match.segment_index is not None:
+            seg_idx = match.segment_index
+        if seg_idx is None or not 0 <= seg_idx < len(ranges):
+            self.status_label.setText(strings.FIND_BAR_NO_SEGMENT)
+            return
+        raw = self._payload[side]
+        self._search_controller.query = self.find_query_edit.text()
+        self._search_controller.side = side
+        self._search_controller.case_sensitive = self.find_case_check.isChecked()
+        result = self._search_controller.replace_scoped_segment(
+            raw,
+            ranges[seg_idx],
+            segment_index=seg_idx,
+            replacement=self.find_replace_edit.text(),
+        )
+        if result is None:
+            self.status_label.setText(strings.FIND_BAR_NO_MATCH)
+            return
+        if result.text == raw:
+            editor.set_raw_cursor_offset(result.new_cursor_offset)
+            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+            return
+        if not editor.can_display(result.text):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        value = self._draft_snapshot()
+        value[side] = result.text
+        next_source = result.text if side == "source" else value["source"]
+        next_target = result.text if side == "target" else value["target"]
+        _, start, old_end, new_len = result.edit
+        remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
+        value["alignments"] = remap.alignments
+        self._suppress_find_refresh = True
+        try:
+            self._apply_edit(value, edits=[result.edit], remap=remap)
+        finally:
+            self._suppress_find_refresh = False
+        editor.set_raw_cursor_offset(result.new_cursor_offset)
+        self.status_label.setText(strings.FIND_BAR_REPLACED_SEGMENT.format(count=result.replaced_count))
+        self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+
     # -- file continuity: import, clipboard, work position -------------------
     def _guard_text_inputs(self) -> None:
         """Inspector text fields take a dropped file as a file, not as typed text,
@@ -5117,10 +5695,31 @@ class ManuscriptView(QWidget):
         QLineEdit and the adjust box accept drops by default and would type
         the file's path into a field that can later be written into the draft.
         """
-        for widget in (*self.findChildren(QLineEdit), self.adjust_edit):
+        for widget in (*self.findChildren(QLineEdit), self.adjust_edit,
+                       self.find_bar, self.find_side_combo, self.find_case_check,
+                       self.find_scope_check, self.find_prev_button, self.find_next_button,
+                       self.find_replace_toggle, self.find_close_button,
+                       self.find_replace_one_button, self.find_replace_segment_button,
+                       self.source_edit, self.target_edit):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.KeyPress:
+            if (
+                event.key() == Qt.Key.Key_Escape
+                and self.find_bar.isVisible()
+                and not (self.source_edit._ime_active or self.target_edit._ime_active)
+            ):
+                self._close_find_bar()
+                return True
+            if watched is self.find_query_edit and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self._find_prev()
+                else:
+                    self._find_next()
+                return True
+        if watched in (self.source_edit, self.target_edit):
+            return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.ShortcutOverride and LosslessEditor.typed_with_altgr(event):
             event.accept()
             return True

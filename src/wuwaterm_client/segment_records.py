@@ -1222,6 +1222,8 @@ def group_matches_filter(group: Mapping[str, Any], key: str) -> bool:
     """
     if key == "all":
         return True
+    if key == "unhandled":
+        return group["status"] != "confirmed"
     if key == "inconsistent":
         return bool(group.get("inconsistent", group["status"] == "inconsistent"))
     if key == "pending":

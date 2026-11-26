@@ -518,3 +518,122 @@ def test_hits_and_dialog_are_legible_and_unclipped_in_both_themes(qapp, store, s
         panel.close()
     finally:
         qapp.setStyleSheet("")
+
+
+def test_promote_to_personal_termbase_prefills_from_term_finding_semantic_and_editor(qapp, store, monkeypatch) -> None:
+    from PySide6.QtGui import QTextCursor
+    from wuwaterm_client import semantic_session as sessions
+    from wuwaterm_client.ui.manuscript_view import TRACK_SEMANTIC, TRACK_TERMS
+
+    view = make_view(store)
+    source = "椿在城楼。椿停下。"
+    target = "Camelia stood on the tower. Camelia stopped."
+    install(view, source, target, "en")
+
+    captured: list[dict[str, str]] = []
+
+    def fake_exec(self):
+        captured.append({
+            "source": self.source_edit.text(),
+            "target": self.target_edit.text(),
+            "direction": self.direction_combo.currentData(),
+            "kind": self.kind_combo.currentData(),
+        })
+        self._submit()
+        return 1
+
+    monkeypatch.setattr(TermbaseDialog, "exec", fake_exec)
+
+    # 1) Term finding promote (uses replacement_edit when edited, else finding target)
+    report = {
+        "request_id": "r-promote",
+        "source_revision": "a" * 64,
+        "target_revision": "b" * 64,
+        "rule_version": "review-v2",
+        "matcher_revision": "c" * 64,
+        "dictionary": {"schema_version": "1", "source_commit": "d" * 40, "term_count": 1, "revision": "e" * 64},
+        "coverage": {"evaluated": 1, "not_evaluated": 0, "rules": ["review.term_pair"]},
+        "findings": [{
+            "id": "0:1:椿",
+            "rule_id": "review.term_pair",
+            "verdict": "confirmed_conflict",
+            "source_span": {"start": 0, "end": 1, "text": "椿"},
+            "target_span": {"start": 0, "end": 7, "text": "Camelia"},
+            "candidates": [{"candidate_id": "f" * 64, "zh": "椿", "en": "Camellya", "category": "resonator", "sources": []}],
+            "candidates_truncated": False,
+        }],
+        "truncated": False,
+    }
+    view._show_term_report(report)
+    view._show_track(TRACK_TERMS)
+    view.findings.setCurrentRow(0)
+    view.replacement_edit.setText("Camellya")
+    assert view.promote_term_button.isVisibleTo(view) and view.promote_term_button.isEnabled()
+    view.promote_term_button.click()
+    assert captured[-1] == {"source": "椿", "target": "Camellya", "direction": "en", "kind": "preferred_term"}
+    assert store.entries[-1]["source"] == "椿" and store.entries[-1]["target"] == "Camellya"
+    assert store.entries[-1]["kind"] == "preferred_term"
+    # Promoting to personal termbase never auto-replaces homographs in the manuscript.
+    assert view._payload["target"] == target
+
+    # 2) Semantic review detail card promote
+    view._controller.capabilities = frozenset({"semantic-review-v1"})
+    result = sessions.SegmentResult(
+        sent_source=source,
+        sent_target=target,
+        source_core=(0, len(source)),
+        target_core=(0, len(target)),
+        hard_cut=False,
+        index=0,
+        report={"status": "complete", "review_version": "semantic-review-v1"},
+        issues=[
+            sessions.LiveIssue(
+                issue={
+                    "id": "sem-1",
+                    "fingerprint": "1" * 32,
+                    "category": "term_sense",
+                    "confidence": "high",
+                    "source_span": {"start": 5, "end": 6, "text": "椿"},
+                    "target_span": {"start": 28, "end": 35, "text": "Camelia"},
+                    "source_excerpt": "椿",
+                    "target_excerpt": "Camelia",
+                    "rationale": "r",
+                    "suggestion": {
+                        "target_span": {"start": 28, "end": 35, "text": "Camelia"},
+                        "replacement": "Camellya",
+                        "term_effect": "none",
+                    },
+                    "suggestion_withheld": None,
+                    "alternatives": [],
+                    "segment_index": 0,
+                },
+                segment_index=0,
+                source_revision=sessions.revision(source),
+                target_revision=sessions.revision(target),
+                term_basis={"dictionary_revision": "e" * 64, "matcher_revision": "c" * 64},
+                source_span={"start": 5, "end": 6, "text": "椿"},
+                target_span={"start": 28, "end": 35, "text": "Camelia"},
+                suggestion_span={"start": 28, "end": 35, "text": "Camelia"},
+            )
+        ],
+    )
+    view._session.add(result)
+    view._refresh_semantic()
+    view._show_track(TRACK_SEMANTIC)
+    view.semantic_list.setCurrentRow(0)
+    assert view.semantic_promote_button.isVisibleTo(view) and view.semantic_promote_button.isEnabled()
+    view.semantic_promote_button.click()
+    assert captured[-1] == {"source": "椿", "target": "Camellya", "direction": "en", "kind": "preferred_term"}
+
+    # 3) Editor selection promote button
+    sc = view.source_edit.textCursor()
+    sc.setPosition(2)
+    sc.setPosition(4, QTextCursor.MoveMode.KeepAnchor)
+    view.source_edit.setTextCursor(sc)
+    tc = view.target_edit.textCursor()
+    tc.setPosition(17)
+    tc.setPosition(26, QTextCursor.MoveMode.KeepAnchor)
+    view.target_edit.setTextCursor(tc)
+    view.promote_editor_button.click()
+    assert captured[-1] == {"source": "城楼", "target": "the tower", "direction": "en", "kind": "preferred_term"}
+    view.close()
