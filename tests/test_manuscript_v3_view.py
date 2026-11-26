@@ -15,6 +15,7 @@ import httpx
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QListView, QMessageBox
 
 from test_manuscript_semantic import issue as semantic_issue, semantic_report
@@ -909,3 +910,133 @@ def test_a_segment_row_wraps_instead_of_ending_in_an_ellipsis(qapp) -> None:
         assert wrapped > listing.fontMetrics().height() * 2, (wrapped, item.text())
     finally:
         view.close()
+
+
+def test_noop_save_after_opening_preserves_null_progress_current(qapp, tmp_path, monkeypatch) -> None:
+    """Opening a manuscript with progress.current=None, inspecting tracks, or resting
+    the caret without selecting a segment and saving produces byte-identical output."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+
+    async def scenario():
+        core = Core()
+        author = make_view(core)
+        await review(author)
+        source_path = tmp_path / "w1-null-cursor.json"
+        author._path = source_path
+        assert author.save_document()
+        original_bytes = source_path.read_bytes()
+        assert load_workfile(source_path)["progress"]["current"] is None
+
+        view = make_view(core, "", "")
+        try:
+            view.resize(1200, 760)
+            view.show()
+            QApplication.processEvents()
+            assert view.open_path(source_path)
+            QTest.qWait(400)
+            assert view.segment_list.currentRow() == -1
+            assert view._segment_cursor is None
+
+            # Switching to the segments track and letting caret-following
+            # highlight another segment must not record a persisted cursor.
+            view._show_track(TRACK_SEGMENTS)
+            assert view._segment_cursor is None
+            pairs = view._current_pairs()
+            view.target_edit.setFocus()
+            view.target_edit.set_raw_cursor_offset(pairs[2].target.core_start + 5)
+            QTest.qWait(400)
+            assert view.segment_list.currentRow() == 2
+            assert view._segment_cursor is None
+
+            view._show_track(TRACK_TERMS)
+            view._show_track(TRACK_SEGMENTS)
+            assert view._segment_cursor is None
+
+            resaved_path = tmp_path / "w1-resaved.json"
+            monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *_a, **_k: (str(resaved_path), "")))
+            assert view.save_document(save_as=True)
+            assert resaved_path.read_bytes() == original_bytes
+            assert load_workfile(resaved_path)["progress"]["current"] is None
+        finally:
+            view.close()
+    asyncio.run(scenario())
+
+
+def test_noop_save_after_opening_preserves_existing_progress_current(qapp, tmp_path, monkeypatch) -> None:
+    """Opening a manuscript with a saved progress.current keeps both the restored
+    cursor and exact bytes when saved without an explicit segment selection."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+
+    async def scenario():
+        core = Core()
+        author = make_view(core)
+        await review(author)
+        select_segment(author, 2)
+        source_path = tmp_path / "w1-cursor-2.json"
+        author._path = source_path
+        assert author.save_document()
+        original_bytes = source_path.read_bytes()
+        assert load_workfile(source_path)["progress"]["current"] == 2
+
+        view = make_view(core, "", "")
+        try:
+            view.resize(1200, 760)
+            view.show()
+            QApplication.processEvents()
+            assert view.open_path(source_path)
+            QTest.qWait(400)
+            assert view.segment_list.currentRow() == 2
+            assert view._segment_cursor == 2
+
+            # Caret-following to segment 1 visually tracks the caret without
+            # overwriting the saved progress.current=2 on track switch or save.
+            pairs = view._current_pairs()
+            view.source_edit.setFocus()
+            view.source_edit.set_raw_cursor_offset(pairs[1].source.core_start + 5)
+            QTest.qWait(400)
+            assert view.segment_list.currentRow() == 1
+            assert view._segment_cursor == 2
+
+            view._show_track(TRACK_SEGMENTS)
+            assert view._segment_cursor == 2
+
+            resaved_path = tmp_path / "w1-cursor-2-resaved.json"
+            monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *_a, **_k: (str(resaved_path), "")))
+            assert view.save_document(save_as=True)
+            assert resaved_path.read_bytes() == original_bytes
+            assert load_workfile(resaved_path)["progress"]["current"] == 2
+        finally:
+            view.close()
+    asyncio.run(scenario())
+
+
+def test_explicit_segment_switch_and_edit_update_progress_current_on_save(qapp, tmp_path, monkeypatch) -> None:
+    """Explicitly selecting a segment and editing still updates progress.current on save."""
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: pytest.fail("unexpected unsaved-changes prompt"))
+
+    async def scenario():
+        core = Core()
+        author = make_view(core)
+        await review(author)
+        path = tmp_path / "explicit-switch.json"
+        author._path = path
+        assert author.save_document()
+        assert load_workfile(path)["progress"]["current"] is None
+
+        view = make_view(core, "", "")
+        try:
+            view.resize(1200, 760)
+            view.show()
+            QApplication.processEvents()
+            assert view.open_path(path)
+            QTest.qWait(400)
+
+            select_segment(view, 1)
+            type_at(view.target_edit, TARGET.index("Paragraph 02") + 15, "改")
+            view._refresh_derived()
+            assert view._segment_cursor == 1
+            assert view.save_document()
+            assert load_workfile(path)["progress"]["current"] == 1
+        finally:
+            view.close()
+    asyncio.run(scenario())
