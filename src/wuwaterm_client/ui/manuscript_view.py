@@ -927,6 +927,10 @@ class ManuscriptView(QWidget):
         # The selected segment: written to progress.current only on save, so
         # navigating never makes the manuscript look edited.
         self._segment_cursor: int | None = None
+        # A row chosen in segment_list while it still held an earlier pairing;
+        # kept apart from caret-following highlights so _refresh_segments only
+        # commits genuine selections.
+        self._pending_segment_row: int | None = None
         # For each listed term finding of a long manuscript: (record, start, end)
         # relative to that record's source core, and whether it awaits a re-check.
         self._finding_refs: list[tuple[int, int, int]] = []
@@ -2873,9 +2877,14 @@ class ManuscriptView(QWidget):
             return
         pairs = self._current_pairs()
         records = self._records()
-        row = self.segment_list.currentRow()
-        if row < 0 and self._segment_cursor is not None:
-            row = self._segment_cursor  # restored from progress.current on open
+        pending_row = self._pending_segment_row
+        self._pending_segment_row = None
+        if pending_row is not None:
+            row = pending_row
+        else:
+            row = self.segment_list.currentRow()
+            if row < 0 and self._segment_cursor is not None:
+                row = self._segment_cursor  # restored from progress.current on open
         self._refreshing_lists = True
         try:
             self._segment_rows, self._segment_rows_from = list(pairs), pairs
@@ -2891,7 +2900,7 @@ class ManuscriptView(QWidget):
         finally:
             self._refreshing_lists = False
         pair = self._current_segment()
-        if pair is not None and pair.index != self._segment_cursor:
+        if pending_row is not None and pair is not None and pair.index != self._segment_cursor:
             # A row clicked while the list still held the old text: now that
             # it lists this text, the row is the selected segment.
             self._segment_cursor = pair.index
@@ -3085,7 +3094,10 @@ class ManuscriptView(QWidget):
             return
         pair = self._current_segment()
         if pair is not None:
+            self._pending_segment_row = None
             self._segment_cursor = pair.index
+        else:
+            self._pending_segment_row = _row if _row >= 0 else None
         self._render_segment(pair)
         self._update_tracks()
         if pair is not None:
@@ -4234,6 +4246,7 @@ class ManuscriptView(QWidget):
         """A new document or service: no term basis yet, so nothing saved is current."""
         self._controller.reset_term_session()
         self._segment_cursor = cursor if isinstance(cursor, int) else None
+        self._pending_segment_row = None
         self.segment_list.setCurrentRow(-1)
         self._render_structure()
 
@@ -4948,6 +4961,11 @@ class ManuscriptView(QWidget):
         self._quiet_ref = None
         self._refresh_conflicts()
         self._set_payload(value)
+        # Opening or clearing a document has not moved the caret: cancel the
+        # follow timer started by _set_payload so a restored progress.current
+        # (or None) is not overwritten by caret offset 0, and update counts now.
+        self._caret_timer.stop()
+        self._caret_side = "source"
         self._reset_term_session(cursor)
         self._session_snapshots = []
         # Clearing the runs above listed the outgoing manuscript's segments,
@@ -4956,6 +4974,7 @@ class ManuscriptView(QWidget):
         # index. Rebuilt after the cursor reset, so progress.current is the
         # row selected, never the old one.
         self._refresh_segments()
+        self.workbenchStatusChanged.emit()
 
     # -- report export ----------------------------------------------------------
     def _report_input(self) -> dict:
