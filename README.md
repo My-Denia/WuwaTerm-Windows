@@ -26,11 +26,11 @@
 `contracts/manuscript-v3/SPEC.md` 定义);旧客户端(Windows 0.4.2、Web 0.2.0 及更早版本)会明确拒绝 v3 文件。
 整篇或某一段的发现、选择或历史报告的已提交决定超过 32 条,或有「未评估」发现带原因时改用
 `wuwaterm-manuscript-v4`(格式同样由公共 Web 的 `contracts/manuscript-v4/SPEC.md` 定义,单文件上限同为
-44 MiB),Windows 0.5.1、Web 0.3.1 及更早版本打不开。结果是在服务列出 `ambiguous-mention-v1` 时
-审出的、带有「可能是角色名的单字」发现,或明确的段落对应只覆盖了部分正文时,改用
-`wuwaterm-manuscript-v5`(格式由公共 Web 的 `contracts/manuscript-v5/SPEC.md` 定义),
-Windows 0.6.6、Web 0.4.5 及更早版本打不开。第一层结构核查(`POST /v1/structure-checks`)的结果
-不写进任何版本的稿件。
+44 MiB),Windows 0.5.1、Web 0.3.1 及更早版本打不开。稿件要记下审校能力 `ambiguous-mention-v1`
+时(已完成的段落记录是在服务列出这项能力时审出的,或报告里有「可能是角色名的单字」发现),或段落
+记录按 `segmentation-v1-gaps` 配对时,改用 `wuwaterm-manuscript-v5`(格式由公共 Web 的
+`contracts/manuscript-v5/SPEC.md` 定义),Windows 0.6.6、Web 0.4.5 及更早版本打不开。第一层结构
+核查(`POST /v1/structure-checks`)的结果不写进任何版本的稿件。
 
 两边对不对得上,由「服务状态」区那一次「刷新」顺带查出来:那次请求本来就要发,客户端
 读回其中的 `api_version`,发现不是自己支持的版本时,就在同一块界面上给出提示,并写明
@@ -314,12 +314,12 @@ Get-FileHash .\WuwaTerm-0.7.0-windows-x64.zip -Algorithm SHA256
 每份历史报告的发现与已提交决定都限在 32 条;其中任一项超过,或有「未评估」发现带原因时,改写为
 `wuwaterm-manuscript-v4`(格式由公共 Web 的 `contracts/manuscript-v4/SPEC.md` 定义,两端互读),这些
 上限提到 128 条(单条发现附带的候选、单个选择附带的候选清单仍各限 8 条),单文件上限同为 44 MiB,
-超出时的丢弃规则同上。结果带有审校能力 `ambiguous-mention-v1`(或有「可能是角色名的单字」发现),
-或段落按 `segmentation-v1-gaps` 配对时,写为 `wuwaterm-manuscript-v5`(格式由公共 Web 的
-`contracts/manuscript-v5/SPEC.md` 定义),上限与 v4 相同,另在最后记下 `review_features`;能力不同
-的已完成结果写为待复核。旧客户端会明确拒绝它读不懂的格式,不会部分读取:Windows 0.4.2、Web 0.2.0
-及更早版本拒绝 v3;Windows 0.5.1、Web 0.3.1 及更早版本拒绝 v4;Windows 0.6.6、Web 0.4.5 及更早
-版本拒绝 v5。重新审校时,
+超出时的丢弃规则同上。稿件要记下审校能力 `ambiguous-mention-v1` 时(已完成的段落记录是在这项
+能力下审出的,或写入的发现带 `ambiguous_mention` 原因),或段落按 `segmentation-v1-gaps` 配对时,
+写为 `wuwaterm-manuscript-v5`(格式由公共 Web 的 `contracts/manuscript-v5/SPEC.md` 定义),上限与
+v4 相同,记下的能力写在文件最后的 `review_features` 里;能力不同的已完成结果写为待复核。旧客户端
+会明确拒绝它读不懂的格式,不会部分读取:Windows 0.4.2、Web 0.2.0 及更早版本拒绝 v3;Windows
+0.5.1、Web 0.3.1 及更早版本拒绝 v4;Windows 0.6.6、Web 0.4.5 及更早版本拒绝 v5。重新审校时,
 上次的"忽略"只有在两侧位置都能在旧正文中唯一恢复、且新报告里恰好有一条同类疑点落在该处时
 才自动沿用;旧正文缺失或校验不符等其余情况显示为需重新确认,处理记录保留。曾经采纳过的位置
 再次被报告时会注明。短稿(两侧都不超过 2,000 字)导入时界面
