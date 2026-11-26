@@ -49,6 +49,10 @@ _REFUSALS = {
     "tm_non_finite": strings.TM_ERROR_NON_FINITE,
     "tm_invalid_content": strings.TM_ERROR_INVALID_CONTENT,
     "tm_unconfirmed_origin": strings.TM_ERROR_UNCONFIRMED_ORIGIN,
+    "tm_schema_mismatch": strings.TM_ERROR_SCHEMA_MISMATCH,
+    "tm_unreadable": strings.TM_ERROR_UNREADABLE,
+    "tm_unavailable": strings.TM_ERROR_UNAVAILABLE,
+    "tm_store_error": strings.TM_ERROR_STORE_ERROR,
 }
 _ORIGIN_LABELS = {"human_confirmed": strings.TM_ORIGIN_HUMAN, "imported_confirmed": strings.TM_ORIGIN_IMPORTED}
 _DIRECTION_LABELS = {"en": strings.TM_DIRECTION_EN, "zh": strings.TM_DIRECTION_ZH}
@@ -551,7 +555,7 @@ class TranslationMemoryDialog(QDialog):
         try:
             tm.export_tm_file(self._memory, path)
         except tm.TmError as error:
-            self.banner.show_message(f"{strings.TM_EXPORT_FAILED} {refusal_text(error)}", SEVERITY_DANGER)
+            self.banner.show_message(strings.TM_EXPORT_FAILED.format(reason=refusal_text(error)), SEVERITY_DANGER)
             return False
         except OSError as error:
             self.banner.show_message(strings.TM_EXPORT_FAILED.format(reason=_os_reason(error)), SEVERITY_DANGER)

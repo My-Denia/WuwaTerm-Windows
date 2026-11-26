@@ -649,6 +649,15 @@ def _context_hash(value: str | None, path: str) -> str | None:
     return None if not text.strip() else source_hash(text)
 
 
+class _Unspecified:
+    """An argument the caller did not pass, as distinct from an explicit None."""
+
+    __slots__ = ()
+
+
+_UNSPECIFIED: Final = _Unspecified()
+
+
 class TranslationMemory:
     """Confirmed translations in one local SQLite file.
 
@@ -909,24 +918,40 @@ class TranslationMemory:
         target_text: str,
         direction: str,
         *,
-        prev_source: str | None = None,
-        next_source: str | None = None,
+        prev_source: str | None | _Unspecified = _UNSPECIFIED,
+        next_source: str | None | _Unspecified = _UNSPECIFIED,
         origin: str = TM_ORIGIN_HUMAN,
         terms_db_revision: str | None = None,
         game_version: str | None = None,
         note: str = "",
     ) -> TmEntry:
-        """Rewrites an entry's text and provenance, keeping its use count and
-        creation time. Editing one candidate into another that exists is refused."""
-        values = _draft(source_text, target_text, direction, prev_source, next_source, origin,
-                        terms_db_revision, game_version, note)
+        """Rewrites an entry's text and provenance, keeping its use count, its
+        creation time and, unless the caller passes them, its context hashes.
+
+        ``prev_source`` and ``next_source`` are the surrounding source texts; an
+        explicit ``None`` clears that side of the context, while omitting the
+        argument keeps what the entry already had. Editing one candidate into
+        another that exists is refused.
+        """
+        keep_prev = isinstance(prev_source, _Unspecified)
+        keep_next = isinstance(next_source, _Unspecified)
+        values = _draft(source_text, target_text, direction,
+                        None if keep_prev else prev_source,
+                        None if keep_next else next_source,
+                        origin, terms_db_revision, game_version, note)
         self._require_usable()
         entry_id = int(entry_id)
         connection = self._write_connection()
         try:
             with _sqlite_guard(), connection:
-                if connection.execute("SELECT id FROM tm_entries WHERE id = ?", (entry_id,)).fetchone() is None:
+                row = connection.execute("SELECT * FROM tm_entries WHERE id = ?", (entry_id,)).fetchone()
+                if row is None:
                     raise KeyError(entry_id)
+                existing = _entry_from_row(row)
+                if keep_prev:
+                    values["prev_source_hash"] = existing.prev_source_hash
+                if keep_next:
+                    values["next_source_hash"] = existing.next_source_hash
                 clash = connection.execute(
                     "SELECT id FROM tm_entries WHERE direction = ? AND source_hash = ?"
                     " AND COALESCE(prev_source_hash, '') = ? AND COALESCE(next_source_hash, '') = ?"
@@ -1007,25 +1032,48 @@ class TranslationMemory:
         exact_hash = source_hash(text)
         norm = normalize_source(text)
         masked = numeric_mask(text)
-        # Three indexed reads rather than one OR: SQLite's planner otherwise
+        # Separate indexed reads rather than one OR: SQLite's planner otherwise
         # takes only ``direction`` from an index and scans every row of it.
+        # Each read is ordered so a cap keeps the most-used, most-recent rows;
+        # the context read comes first because rank 1 must survive a source with
+        # more candidates than the cap.
+        rows_by_id: dict[int, sqlite3.Row] = {}
+
+        def collect(sql: str, parameters: Sequence[object]) -> None:
+            for row in self._rows(sql, parameters):
+                rows_by_id.setdefault(int(row["id"]), row)
+
         row_limit = min(MAX_LOOKUP_CANDIDATES, limit * 8 + 8)
-        candidates = self._rows(
-            "SELECT * FROM tm_entries WHERE direction = ? AND source_hash = ? LIMIT ?",
+        order = " ORDER BY use_count DESC, updated_at DESC, id DESC LIMIT ?"
+        if prev_hash is not None or next_hash is not None:
+            conditions = []
+            context_parameters: list[object] = [direction, exact_hash]
+            if prev_hash is not None:
+                conditions.append("prev_source_hash = ?")
+                context_parameters.append(prev_hash)
+            if next_hash is not None:
+                conditions.append("next_source_hash = ?")
+                context_parameters.append(next_hash)
+            collect(
+                "SELECT * FROM tm_entries WHERE direction = ? AND source_hash = ?"
+                " AND " + " AND ".join(conditions) + order,
+                (*context_parameters, row_limit),
+            )
+        collect(
+            "SELECT * FROM tm_entries WHERE direction = ? AND source_hash = ?" + order,
             (direction, exact_hash, row_limit),
         )
-        candidates += self._rows(
-            "SELECT * FROM tm_entries WHERE direction = ? AND source_norm = ? AND source_hash <> ? LIMIT ?",
+        collect(
+            "SELECT * FROM tm_entries WHERE direction = ? AND source_norm = ? AND source_hash <> ?" + order,
             (direction, norm, exact_hash, row_limit),
         )
-        candidates += self._rows(
+        collect(
             "SELECT * FROM tm_entries WHERE direction = ? AND source_masked = ?"
-            " AND source_hash <> ? AND source_norm <> ?"
-            " ORDER BY use_count DESC, updated_at DESC, id DESC LIMIT ?",
+            " AND source_hash <> ? AND source_norm <> ?" + order,
             (direction, masked, exact_hash, norm, row_limit),
         )
         best: list[TmMatch] = []
-        for row in candidates:
+        for row in rows_by_id.values():
             entry = _entry_from_row(row)
             if entry.source_hash == exact_hash:
                 kind = _exact_kind(entry, prev_hash, next_hash)
@@ -1038,7 +1086,7 @@ class TranslationMemory:
             best.append(self._match(entry, kind, terms, game))
         ordered = best
         ordered.sort(key=lambda match: match.entry.id)
-        ordered.sort(key=lambda match: match.entry.updated_at, reverse=True)
+        ordered.sort(key=lambda match: _instant_key(match.entry.updated_at), reverse=True)
         ordered.sort(key=lambda match: match.entry.use_count, reverse=True)
         ordered.sort(key=lambda match: _RANK[match.match_kind])
         return ordered[:limit]
@@ -1228,9 +1276,6 @@ class TranslationMemory:
 def export_tm_file(memory: TranslationMemory, path: Path) -> None:
     """Writes the canonical file to a path the person chose, atomically."""
     write_tm_file_atomically(Path(path), memory.export_tm_json())
-
-
-_UNSPECIFIED: Final = object()
 
 
 def _instant_key(value: str) -> datetime.datetime:

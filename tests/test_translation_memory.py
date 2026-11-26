@@ -112,13 +112,15 @@ def test_only_confirmed_origins_are_stored_at_the_module_and_the_database(store)
     # row cannot smuggle a machine origin past the module.
     connection = sqlite3.connect(store.path)
     try:
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(sqlite3.IntegrityError) as refused:
             connection.execute(
-                "INSERT INTO tm_entries (direction, source_text, source_norm, source_hash, target_text,"
-                " origin, note, use_count, created_at, updated_at)"
-                " VALUES ('en', 'x', 'x', ?, 'y', 'machine_translated', '', 1, ?, ?)",
-                (tm.source_hash("x"), STAMP, STAMP),
+                "INSERT INTO tm_entries (direction, source_text, source_norm, source_masked, source_hash,"
+                " target_text, origin, note, use_count, created_at, updated_at)"
+                " VALUES ('en', 'x', 'x', ?, ?, 'y', 'machine_translated', '', 1, ?, ?)",
+                (tm.numeric_mask("x"), tm.source_hash("x"), STAMP, STAMP),
             )
+        message = str(refused.value).lower()
+        assert "check" in message or "origin" in message, message
     finally:
         connection.close()
 
@@ -182,6 +184,19 @@ def test_update_keeps_identity_and_refuses_a_collision(store):
     assert store.entry(second.id).target_text == "二"
     with pytest.raises(KeyError):
         store.update(9999, "x", "y", "en")
+
+
+def test_editing_an_entry_keeps_the_context_it_was_not_asked_to_change(store):
+    contextual = store.add("开", "open", "en", prev_source="门", next_source="宝箱")
+    store.add("开", "open", "en")  # the context-free twin a dropped context would collide with
+    updated = store.update(contextual.id, "开", "open", "en", note="复核")
+    assert updated.note == "复核"
+    assert updated.prev_source_hash == tm.source_hash("门")
+    assert updated.next_source_hash == tm.source_hash("宝箱")
+    # An explicit None is a request to clear that side, not an omission.
+    cleared = store.update(updated.id, "开", "open", "en", prev_source=None)
+    assert cleared.prev_source_hash is None
+    assert cleared.next_source_hash == tm.source_hash("宝箱")
 
 
 def test_removing_and_clearing(store):
@@ -257,6 +272,34 @@ def test_numeric_variants_are_references_never_certified(store):
     assert store.lookup_segment("攻击力提高 ２５％，持续 １０ 秒", "en") == []
 
 
+def test_a_context_candidate_is_not_lost_beyond_the_candidate_row_cap(tmp_path):
+    store = tm.TranslationMemory(tmp_path / "tm.sqlite3", clock=lambda: STAMP)
+    entries = [
+        _entry(
+            index,
+            source_text="同一句",
+            target_text=f"target {index}",
+            prev_source_hash=tm.source_hash(f"ctx-{index}"),
+            use_count=200 if index < 19 else 100,
+        )
+        for index in range(20)
+    ]
+    store.import_tm_json_bytes(_bytes(_file(entries)))
+    # The other nineteen candidates are more used, so a cap ordered by use count
+    # would drop the context one from the plain source read.
+    (match,) = store.lookup_segment("同一句", "en", prev_source="ctx-19", limit=1)
+    assert match.match_kind == "context_exact"
+    assert match.entry.use_count == 100
+    assert match.entry.prev_source_hash == tm.source_hash("ctx-19")
+
+    segments = [f"ctx-{index}" for index in range(20)] + ["同一句"]
+    classified = store.classify_segments_for_tm(segments, "en")
+    assert classified[-1].source == "同一句"
+    assert classified[-1].status == "context_exact_fresh"
+    assert classified[-1].match is not None
+    assert classified[-1].match.entry.use_count == 100
+
+
 def test_stale_flags_name_the_reason_and_only_when_a_current_value_is_known(store):
     store.add("挑战成功", "Challenge complete", "en", terms_db_revision="r14", game_version="3.0")
     (fresh,) = store.lookup_segment("挑战成功", "en", current_terms_db_revision="r14",
@@ -273,6 +316,18 @@ def test_stale_flags_name_the_reason_and_only_when_a_current_value_is_known(stor
     store.add("没有记录", "no record", "en")
     (no_record,) = store.lookup_segment("没有记录", "en", current_terms_db_revision="r14")
     assert no_record.stale_reasons == ("terms_revision_changed",)
+
+
+def test_ordering_compares_parsed_instants_not_the_string_form(tmp_path):
+    store = tm.TranslationMemory(tmp_path / "tm.sqlite3", clock=lambda: STAMP)
+    entries = [
+        _entry(0, source_text="同一句", target_text="later", updated_at="2026-11-27T00:00:00.5Z"),
+        _entry(1, source_text="同一句", target_text="earlier", updated_at="2026-11-27T00:00:00Z"),
+    ]
+    store.import_tm_json_bytes(_bytes(_file(entries)))
+    # "…00.5Z" is later than "…00Z", although it sorts first as a string.
+    matches = store.lookup_segment("同一句", "en", limit=2)
+    assert [m.entry.target_text for m in matches] == ["later", "earlier"]
 
 
 def test_a_stale_entry_is_ordered_by_kind_then_use_count_then_recency(store):
@@ -580,24 +635,54 @@ _NETWORK_AND_SECRET_MODULES = frozenset({
 _FORBIDDEN_LOCAL_MODULES = frozenset({"manuscript", "credentials", "api"})
 
 
-def _imported_modules(path: Path) -> set[str]:
+def _imported_modules(path: Path) -> tuple[set[str], set[str]]:
+    """Top-level names imported absolutely, and relatively, in one file.
+
+    The top-level name is what a refusal must compare: ``from urllib.request
+    import ...`` imports ``urllib`` and ``from PySide6.QtWidgets import ...``
+    imports ``PySide6``. ``node.level`` separates a local import from an
+    absolute one with the same spelling.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    names: set[str] = set()
+    absolute: set[str] = set()
+    relative: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
+            absolute.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            names.add(node.module or "")
-    return names
+            if node.level:
+                module = node.module or (node.names[0].name if node.names else None)
+                if module:
+                    relative.add(module.split(".")[0])
+            elif node.module:
+                absolute.add(node.module.split(".")[0])
+    return absolute, relative
+
+
+def test_the_import_boundary_helper_sees_top_level_and_relative_imports(tmp_path):
+    sample = tmp_path / "sample.py"
+    sample.write_text(
+        "import os\n"
+        "import urllib.request\n"
+        "from PySide6.QtWidgets import QWidget\n"
+        "from . import manuscript\n"
+        "from .credentials import load\n",
+        encoding="utf-8",
+    )
+    absolute, relative = _imported_modules(sample)
+    assert "urllib" in absolute and "PySide6" in absolute
+    assert relative == {"manuscript", "credentials"}
+    # The same intersections the boundary test applies: these would be refused.
+    assert absolute & _NETWORK_AND_SECRET_MODULES
+    assert relative & _FORBIDDEN_LOCAL_MODULES
 
 
 def test_the_engine_imports_no_network_credential_manuscript_or_qt_code():
-    imported = _imported_modules(SRC / "translation_memory.py")
-    assert not imported & _NETWORK_AND_SECRET_MODULES, imported & _NETWORK_AND_SECRET_MODULES
-    local = {name.lstrip(".") for name in imported if name.startswith(".")}
+    absolute, relative = _imported_modules(SRC / "translation_memory.py")
+    assert not absolute & _NETWORK_AND_SECRET_MODULES, absolute & _NETWORK_AND_SECRET_MODULES
+    assert not absolute & _FORBIDDEN_LOCAL_MODULES, absolute & _FORBIDDEN_LOCAL_MODULES
     # The one local import is the path of the per-user folder, loaded only inside the helper.
-    assert local <= {"config"}
-    assert not local & _FORBIDDEN_LOCAL_MODULES
+    assert relative == {"config"}
 
 
 def test_storing_matching_and_moving_a_memory_open_no_connection(tmp_path, monkeypatch):
