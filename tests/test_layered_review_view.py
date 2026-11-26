@@ -544,3 +544,53 @@ def test_an_eliding_button_shows_its_whole_text_when_there_is_room(qapp) -> None
     QApplication.processEvents()
     assert not button.grab().isNull() and button.text() == "下一处待处理"
     button.close()
+
+
+def test_layer_two_handled_low_confidence_only_keeps_handled_toggle_reachable(qapp) -> None:
+    """When only a folded low-confidence issue exists and is ignored, handled_toggle stays
+    visible so toggling handled + low-confidence can reveal and undo/review it again."""
+    def only_low(source, target):
+        return [issue(source, target, category="meaning_shift", confidence="low", source_quote="价格",
+                      target_quote="price", seed="1")]
+
+    async def scenario():
+        server = Server(capabilities=("semantic-review-v1", STRUCTURE), issues=only_low)
+        view = make_view(server, NUMBER_SOURCE, NUMBER_TARGET)
+        view.resize(1100, 700)
+        view.show()
+        try:
+            view._start_review()
+            await settle(view)
+            view._show_track(TRACK_SEMANTIC)
+            assert view.semantic_list.count() == 0
+            assert view.low_toggle.isVisibleTo(view)
+            assert not view.handled_toggle.isVisibleTo(view)
+
+            # Open folded low-confidence issue, select it, and mark it ignored.
+            view.low_toggle.click()
+            assert view.semantic_list.count() == 1
+            view.semantic_list.setCurrentRow(0)
+            view.ignore_button.click()
+            assert view._issue_state(only_rows := view._layer2_listed[0]) == "ignored"
+            assert not view.low_toggle.isVisibleTo(view)
+            assert view.handled_toggle.isVisibleTo(view)
+            assert view.handled_toggle.text() == strings.MANUSCRIPT_L2_HANDLED_SHOW.format(count=1)
+
+            # Close low fold (already folded UI toggle) and ensure handled_toggle stays reachable.
+            if view.low_toggle.isChecked():
+                view.low_toggle.setChecked(False)
+            assert view.semantic_list.count() == 0
+            assert not view.low_toggle.isVisibleTo(view)
+            assert view.handled_toggle.isVisibleTo(view)
+
+            # Clicking handled_toggle reveals low_toggle, and opening it shows the ignored issue again.
+            view.handled_toggle.click()
+            assert view.low_toggle.isVisibleTo(view)
+            assert view.semantic_list.count() == 0
+            view.low_toggle.click()
+            assert view.semantic_list.count() == 1
+            assert view._issue_state(view._issue_rows[0]) == "ignored"
+        finally:
+            view.close()
+
+    asyncio.run(scenario())

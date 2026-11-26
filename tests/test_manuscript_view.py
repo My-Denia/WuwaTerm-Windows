@@ -2206,3 +2206,73 @@ def test_find_and_replace_bar_shortcuts_navigation_scoped_replace_and_undo(qapp)
         assert view.target_edit.extraSelections() == []
     finally:
         view.close()
+
+
+def test_find_and_replace_scoped_second_segment_keeps_segment_and_noop_replace_does_not_claim_undo(qapp) -> None:
+    from wuwaterm_client import strings
+
+    view = ManuscriptView(ApiClient(None))
+    try:
+        view.resize(1100, 800)
+        view.show()
+        source = f"段一：椿。{'甲' * 1500}\n\n段二：椿与椿与椿。{'甲' * 1500}"
+        target = f"Para 1: Camelia. {'x' * 1500}\n\nPara 2: Camelia, Camelia, Camelia. {'x' * 1500}"
+        seg1_prefix = f"Para 1: Camelia. {'x' * 1500}\n\n"
+        value = empty_workfile()
+        value.update(
+            source=source,
+            target=target,
+            direction="en",
+        )
+        view._set_payload(value)
+        view._update_controls()
+        qapp.processEvents()
+        assert len(view._current_pairs()) == 2
+
+        view.target_edit.setFocus()
+        QTest.keyClick(view.target_edit, Qt.Key.Key_H, Qt.KeyboardModifier.ControlModifier)
+        qapp.processEvents()
+        view.find_query_edit.setText("Camelia")
+        view.find_scope_check.setChecked(True)
+        para2_offset = target.index("Para 2")
+        view.target_edit.set_raw_cursor_offset(para2_offset)
+        view._refresh_find_matches(preserve_current=False)
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=3)
+
+        # Identical replacement produces no edit, pushes no undo history, and does not claim undo.
+        view.find_replace_edit.setText("Camelia")
+        view.find_replace_one_button.click()
+        qapp.processEvents()
+        assert not view._controller.can_undo()
+        assert view.status_label.text() != strings.FIND_BAR_REPLACED_ONE
+        assert view._payload["target"] == target
+
+        # Consecutive single replacements in segment #2 stay scoped to segment #2 without touching segment #1.
+        view.target_edit.set_raw_cursor_offset(para2_offset)
+        view._refresh_find_matches(preserve_current=False)
+        view.find_replace_edit.setText("Camellya")
+        view.find_replace_one_button.click()
+        qapp.processEvents()
+        assert view._payload["target"] == seg1_prefix + f"Para 2: Camellya, Camelia, Camelia. {'x' * 1500}"
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=2)
+        assert [m.segment_index for m in view._search_controller.matches] == [1, 1]
+
+        view.find_replace_one_button.click()
+        qapp.processEvents()
+        assert view._payload["target"] == seg1_prefix + f"Para 2: Camellya, Camellya, Camelia. {'x' * 1500}"
+        assert view.find_count_label.text() == strings.FIND_BAR_COUNT.format(current=1, total=1)
+        assert [m.segment_index for m in view._search_controller.matches] == [1]
+
+        # Scoped segment replace finishes only segment #2's last match, leaving segment #1 untouched.
+        view.find_replace_segment_button.click()
+        qapp.processEvents()
+        assert view._payload["target"] == seg1_prefix + f"Para 2: Camellya, Camellya, Camellya. {'x' * 1500}"
+        assert view._search_controller.matches == ()
+        assert not view.find_replace_segment_button.isEnabled()
+
+        # Undo restores match in segment #2 without jumping scope back to segment #1.
+        view._undo_replace()
+        assert view._payload["target"] == seg1_prefix + f"Para 2: Camellya, Camellya, Camelia. {'x' * 1500}"
+        assert [m.segment_index for m in view._search_controller.matches] == [1]
+    finally:
+        view.close()

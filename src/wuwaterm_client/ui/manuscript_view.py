@@ -985,6 +985,7 @@ class ManuscriptView(QWidget):
         # Every issue Layer 2 lists, folded low-confidence ones included.
         self._layer2_listed: list[sessions.LiveIssue] = []
         self._search_controller = SearchReplaceController()
+        self._suppress_find_refresh = False
 
         self.source_edit = LosslessEditor(self)
         self.target_edit = LosslessEditor(self)
@@ -1320,8 +1321,8 @@ class ManuscriptView(QWidget):
         self.term_filter_combo.setMinimumContentsLength(3)
         self.term_filter_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.term_filter_combo.currentIndexChanged.connect(self._on_term_filter_changed)
-        term_bar.addWidget(self.term_view_combo, 3)
-        term_bar.addWidget(self.term_filter_combo, 2)
+        term_bar.addWidget(self.term_view_combo, 1)
+        term_bar.addWidget(self.term_filter_combo, 1)
         self.term_toolbar.hide()
         term_details.addWidget(self.term_toolbar)
         self.term_groups = _WrappedListWidget(term_page)
@@ -2549,8 +2550,7 @@ class ManuscriptView(QWidget):
         hide_handled = self.hide_handled
         handled = [
             issue for issue in listed
-            if (open_low or issue.issue.get("confidence") != "low")
-            and self._issue_state(issue) not in sessions.UNHANDLED
+            if self._issue_state(issue) not in sessions.UNHANDLED
         ]
         active_pool = (
             [issue for issue in listed if self._issue_state(issue) in sessions.UNHANDLED]
@@ -2898,11 +2898,19 @@ class ManuscriptView(QWidget):
                     return
         else:
             handled_pos = (
+                1 if handled.issue.get("confidence") == "low" else 0,
                 handled.segment_index,
                 (handled.source_span or handled.target_span or {"start": 0})["start"],
             )
             unhandled_rows = [
-                (row, (issue.segment_index, (issue.source_span or issue.target_span or {"start": 0})["start"]))
+                (
+                    row,
+                    (
+                        1 if issue.issue.get("confidence") == "low" else 0,
+                        issue.segment_index,
+                        (issue.source_span or issue.target_span or {"start": 0})["start"],
+                    ),
+                )
                 for row, issue in enumerate(rows)
                 if self._issue_state(issue) in sessions.UNHANDLED
             ]
@@ -4034,7 +4042,7 @@ class ManuscriptView(QWidget):
         self.promote_term_button.setEnabled(not composing)
         self.promote_editor_button.setEnabled(not composing)
         self.replace_toggle.setEnabled(not composing)
-        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+        if hasattr(self, "find_bar") and self.find_bar.isVisible() and not self._suppress_find_refresh:
             self._update_find_controls()
         index = self.findings.currentRow()
         has_target = (self._report is not None and 0 <= index < len(self._report["findings"])
@@ -4155,7 +4163,7 @@ class ManuscriptView(QWidget):
         if self.track_stack.currentIndex() == TRACK_SEGMENTS:
             self._derived_timer.start()
         self._update_controls()
-        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+        if hasattr(self, "find_bar") and self.find_bar.isVisible() and not self._suppress_find_refresh:
             self._refresh_find_matches(preserve_current=True)
         # The status bar's counts follow on the next pause, not every keystroke.
         self._caret_timer.start()
@@ -4759,11 +4767,17 @@ class ManuscriptView(QWidget):
                    else self._controller.redo(view_state=self._editor_state()))
         if outcome is None:
             return
-        self._finish(outcome.edit, editors=True)
-        self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
-        self._update_controls()
-        if outcome.entry.view is not None:
-            self._restore_editor_state(outcome.entry.view)
+        self._suppress_find_refresh = True
+        try:
+            self._finish(outcome.edit, editors=True)
+            self.status_label.setText(strings.MANUSCRIPT_UNDONE if undo else strings.MANUSCRIPT_REDONE)
+            self._update_controls()
+            if outcome.entry.view is not None:
+                self._restore_editor_state(outcome.entry.view)
+        finally:
+            self._suppress_find_refresh = False
+        if hasattr(self, "find_bar") and self.find_bar.isVisible():
+            self._refresh_find_matches(preserve_current=True)
 
     def _set_payload(self, value: dict) -> None:
         self._updating = True
@@ -5453,13 +5467,13 @@ class ManuscriptView(QWidget):
         self.find_replace_row.setVisible(visible)
         self._update_find_controls()
 
-    def _find_segment_context(self, side: str) -> tuple[list[tuple[int, int]], int | None]:
+    def _find_segment_context(self, side: str, *, offset: int | None = None) -> tuple[list[tuple[int, int]], int | None]:
         pairs = self._current_pairs()
         if not pairs:
             return [], None
         ranges = [(getattr(pair, side).core_start, getattr(pair, side).core_end) for pair in pairs]
-        offset = self._caret_offset(side)
-        seg_idx = self._pair_index_at(pairs, side, offset)
+        resolved_offset = self._caret_offset(side) if offset is None else offset
+        seg_idx = self._pair_index_at(pairs, side, resolved_offset)
         return ranges, seg_idx
 
     def _open_find_bar(self, *, replace: bool = False) -> None:
@@ -5512,8 +5526,8 @@ class ManuscriptView(QWidget):
         ctrl.side = side
         ctrl.case_sensitive = self.find_case_check.isChecked()
         ctrl.scope = "segment" if self.find_scope_check.isChecked() else "all"
-        ranges, seg_idx = self._find_segment_context(side)
         anchor = self._caret_offset(side) if cursor_offset is None else cursor_offset
+        ranges, seg_idx = self._find_segment_context(side, offset=anchor)
         ctrl.refresh(
             self._payload[side],
             segment_ranges=ranges,
@@ -5522,7 +5536,7 @@ class ManuscriptView(QWidget):
             preserve_current=preserve_current,
         )
         self._highlight_find_match()
-        self._update_find_controls()
+        self._update_find_controls(seg_idx=seg_idx if ctrl.scope == "segment" else None)
 
     def _highlight_find_match(self) -> None:
         match = self._search_controller.current_match()
@@ -5540,14 +5554,21 @@ class ManuscriptView(QWidget):
         current = (self._search_controller.current_index or 0) + 1
         self.find_count_label.setText(strings.FIND_BAR_COUNT.format(current=current, total=len(self._search_controller.matches)))
 
-    def _update_find_controls(self) -> None:
+    def _update_find_controls(self, *, seg_idx: int | None = None) -> None:
         composing = self.source_edit._ime_active or self.target_edit._ime_active
         has_matches = bool(self._search_controller.matches)
         side = self.find_side_combo.currentData() or "target"
-        ranges, seg_idx = self._find_segment_context(side)
+        ranges, resolved_seg_idx = self._find_segment_context(side)
+        if seg_idx is not None:
+            resolved_seg_idx = seg_idx
         has_segment_match = False
-        if not composing and self._search_controller.query and seg_idx is not None and 0 <= seg_idx < len(ranges):
-            seg_start, seg_end = ranges[seg_idx]
+        if (
+            not composing
+            and self._search_controller.query
+            and resolved_seg_idx is not None
+            and 0 <= resolved_seg_idx < len(ranges)
+        ):
+            seg_start, seg_end = ranges[resolved_seg_idx]
             has_segment_match = any(
                 seg_start <= m.start and m.end <= seg_end for m in self._search_controller.matches
             )
@@ -5595,6 +5616,10 @@ class ManuscriptView(QWidget):
             return
         if result is None:
             return
+        if result.text == raw:
+            editor.set_raw_cursor_offset(result.new_cursor_offset)
+            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+            return
         if not editor.can_display(result.text):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
@@ -5605,7 +5630,12 @@ class ManuscriptView(QWidget):
         _, start, old_end, new_len = result.edit
         remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
         value["alignments"] = remap.alignments
-        self._apply_edit(value, edits=[result.edit], remap=remap)
+        self._suppress_find_refresh = True
+        try:
+            self._apply_edit(value, edits=[result.edit], remap=remap)
+        finally:
+            self._suppress_find_refresh = False
+        editor.set_raw_cursor_offset(result.new_cursor_offset)
         self.status_label.setText(strings.FIND_BAR_REPLACED_ONE)
         self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
 
@@ -5634,6 +5664,10 @@ class ManuscriptView(QWidget):
         if result is None:
             self.status_label.setText(strings.FIND_BAR_NO_MATCH)
             return
+        if result.text == raw:
+            editor.set_raw_cursor_offset(result.new_cursor_offset)
+            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+            return
         if not editor.can_display(result.text):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
@@ -5644,7 +5678,12 @@ class ManuscriptView(QWidget):
         _, start, old_end, new_len = result.edit
         remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
         value["alignments"] = remap.alignments
-        self._apply_edit(value, edits=[result.edit], remap=remap)
+        self._suppress_find_refresh = True
+        try:
+            self._apply_edit(value, edits=[result.edit], remap=remap)
+        finally:
+            self._suppress_find_refresh = False
+        editor.set_raw_cursor_offset(result.new_cursor_offset)
         self.status_label.setText(strings.FIND_BAR_REPLACED_SEGMENT.format(count=result.replaced_count))
         self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
 
@@ -5666,7 +5705,11 @@ class ManuscriptView(QWidget):
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Escape and self.find_bar.isVisible():
+            if (
+                event.key() == Qt.Key.Key_Escape
+                and self.find_bar.isVisible()
+                and not (self.source_edit._ime_active or self.target_edit._ime_active)
+            ):
                 self._close_find_bar()
                 return True
             if watched is self.find_query_edit and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
