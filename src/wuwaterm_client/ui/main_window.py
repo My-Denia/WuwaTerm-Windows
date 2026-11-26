@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, recent, strings
 from ..recovery import default_recovery_path
+from ..translation_memory import TmError, TranslationMemory, default_tm_path
 from ..api import ApiClient
 from ..config import (
     ClientConfig,
@@ -86,6 +87,20 @@ PAGE_TERMS = 0
 PAGE_TRANSLATE = 1
 PAGE_STATUS = 2
 PAGE_MANUSCRIPT = 3
+
+
+def open_translation_memory() -> TranslationMemory | None:
+    """The local confirmed-translation memory, or None when it cannot be opened.
+
+    A missing, moved or unreadable file is not a reason to refuse to start: the
+    workbench opens without a memory, its panel says so, and nothing is read or
+    written. An unusable file (the constructor keeps ``error``) still opens so
+    the panel and the manager can say why the file is untouched.
+    """
+    try:
+        return TranslationMemory(default_tm_path())
+    except (TmError, OSError):
+        return None
 
 
 def endpoint_status_text(base_url: str | None) -> str:
@@ -182,7 +197,8 @@ class MainWindow(QMainWindow):
             self.api_client, self, on_enter_token=self.enter_token
         )
         self.manuscript_view = ManuscriptView(
-            self.api_client, self, recovery_path=default_recovery_path()
+            self.api_client, self, recovery_path=default_recovery_path(),
+            translation_memory=open_translation_memory(),
         )
 
         self.stack = QStackedWidget(self)
@@ -368,6 +384,7 @@ class MainWindow(QMainWindow):
         add(edit_menu, strings.EDIT_COPY_TARGET, "Ctrl+Shift+C", view.copy_target)
         edit_menu.addSeparator()
         add(edit_menu, strings.TERMBASE_MENU, None, view.show_termbase_dialog)
+        add(edit_menu, strings.TM_MENU, "Ctrl+M", view.show_tm_dialog)
         file_menu.addSeparator()
         settings_action = QAction(strings.SETTINGS_MENU_LABEL, self)
         settings_action.triggered.connect(self._on_settings_clicked)
