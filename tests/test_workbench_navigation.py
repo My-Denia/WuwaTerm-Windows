@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import time
 
 import pytest
 from PySide6.QtCore import QEvent, Qt
@@ -62,15 +61,6 @@ def _view(source: str = SOURCE, target: str = TARGET, *, alignments=None) -> Man
 
 def _caret(editor) -> int:
     return editor.raw_offset_at_position(editor.textCursor().position())
-
-
-def _pause(ms: int) -> None:
-    """Let timers fire for ``ms`` without a nested event loop: QTest.qWait would
-    also run every deferred deletion other test modules left queued."""
-    deadline = time.monotonic() + ms / 1000
-    while time.monotonic() < deadline:
-        QApplication.processEvents()
-        time.sleep(0.01)
 
 
 # -- scroll sync ----------------------------------------------------------------
@@ -271,7 +261,7 @@ def test_a_resting_caret_selects_its_segment_row_without_moving_the_caret_or_the
         view.target_edit.set_raw_cursor_offset(pairs[5].target.core_start + 5)
         caret = view.target_edit.textCursor().position()
         assert view._caret_timer.isActive() and view._caret_timer.interval() == 300
-        _pause(400)
+        QTest.qWait(400)
         assert view.segment_list.currentRow() == 5
         assert view.target_edit.textCursor().position() == caret
         assert QApplication.focusWidget() is view.target_edit
@@ -323,7 +313,7 @@ def test_a_chosen_finding_stays_current_when_its_start_touches_the_previous_one(
         view._show_term_report(_adjacent_report(view._payload["source"], view._payload["target"]))
         view.findings.setCurrentRow(1)
         assert view.replacement_edit.text() == "Beta"
-        _pause(400)
+        QTest.qWait(400)
         assert view.findings.currentRow() == 1, "the caret at B's start is inside B, not at A's end"
         assert view.replacement_edit.text() == "Beta"
     finally:
