@@ -116,7 +116,7 @@ jobs:
                       "sha256": hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest(), "signed": False}
           pathlib.Path("manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
           PY
-          printf 'WuwaTerm Windows %s. Source: %s.\n\nUNSIGNED: Windows may display a SmartScreen warning. Verify SHA256SUMS before use.\nRequires HTTP API v1; manuscript review also needs review-v2. Manuscripts use wuwaterm-manuscript-v1 or v2; long manuscripts with segment records use wuwaterm-manuscript-v3, or wuwaterm-manuscript-v4 when document or segment counts exceed 32 or a not_evaluated finding carries a reason.\n' "$VERSION" "$SOURCE" > ../notes.md
+          printf 'WuwaTerm Windows %s. Source: %s.\n\nUNSIGNED: Windows may display a SmartScreen warning. Verify SHA256SUMS before use.\nRequires HTTP API v1; manuscript review also needs review-v2. Manuscripts use wuwaterm-manuscript-v1 or v2; long manuscripts with segment records use wuwaterm-manuscript-v3, or wuwaterm-manuscript-v4 when document or segment counts exceed 32 or a not_evaluated finding carries a reason, or wuwaterm-manuscript-v5 when results use ambiguous-mention-v1 or segment records are paired as segmentation-v1-gaps.\n' "$VERSION" "$SOURCE" > ../notes.md
           gh release create "$tag" --draft --latest=false --target "$SOURCE" --title "WuwaTerm Windows $VERSION" --notes-file ../notes.md "$zip" SHA256SUMS manifest.json
           test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
           test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$SOURCE"
