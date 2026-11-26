@@ -197,6 +197,40 @@ def test_a_document_check_asks_for_the_feature_and_sends_this_sessions_choice() 
     asyncio.run(scenario())
 
 
+def test_a_short_manuscript_with_32_choices_still_takes_an_ambiguous_choice() -> None:
+    """v4/v5 files and Core's ``resolutions`` hold 128: a short manuscript from
+    Web with 32 choices already is not full."""
+    from wuwaterm_client import markdown_report as mdr
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=(AMB,))
+        client.term = ambiguous_report
+        payload = short_payload()
+        payload["source"] = SHORT_SOURCE + "字" * 40
+        controller, client, _host = make(client, payload)
+        controller.start_review()
+        await settle(controller)
+        report = controller.payload["history"][-1]["report"]
+        source = controller.payload["source"]
+        first = source.index("字")
+        controller.payload["choices"] = [{
+            "source": source, "direction": "en",
+            "source_span": {"start": first + i, "end": first + i + 1, "text": "字"},
+            "scope": "positional", "choice": "not_a_term", "candidate": None, "basis": mdr.basis_of(report),
+        } for i in range(32)]
+        finding = report["findings"][0]
+        outcome = controller.choose_document(finding, CANDIDATE)
+        assert outcome.committed and len(controller.payload["choices"]) == 33
+        assert controller.choose_document(finding, None).committed  # replaces it, still 33
+        assert len(controller.payload["choices"]) == 33
+        written = json.loads(serialize_workfile(controller.payload))
+        assert written["format"] == WORKFILE_FORMAT_V5 and len(written["choices"]) == 33
+        controller.start_review()
+        await settle(controller)
+        assert client.review_calls[-1]["resolutions"] == [{"mention_id": finding["id"], "choice": "not_a_term"}]
+    asyncio.run(scenario())
+
+
 def test_a_refused_resolution_is_checked_once_more_without_it() -> None:
     async def scenario() -> None:
         client = FakeClient(capabilities=(AMB,))

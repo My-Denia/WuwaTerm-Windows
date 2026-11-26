@@ -24,7 +24,8 @@ from PySide6.QtGui import QIcon, QKeySequence, QPalette, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QStyledItemDelegate, QTextEdit, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionButton, QStylePainter,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .. import markdown_report as mdr
@@ -661,19 +662,73 @@ class _WordWrapDelegate(QStyledItemDelegate):
 
 
 class _WrappedListWidget(QListWidget):
-    """Recompute wrapped item heights whenever the list is shown or resized."""
+    """Recompute wrapped item heights whenever the list is shown or resized.
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    With ``fit_rows`` set, the list is at most as tall as that many whole rows
+    (fewer when it has fewer), so no row is cut in half at any scale."""
+
+    def __init__(self, parent: QWidget | None = None, *, fit_rows: int | None = None) -> None:
         super().__init__(parent)
         self.setItemDelegate(_WordWrapDelegate(self))
+        self.fit_rows = fit_rows
+
+    def fit_height(self) -> None:
+        if not self.fit_rows or not self.count():
+            return
+        rows = sum(self.sizeHintForRow(i) for i in range(min(self.count(), self.fit_rows)))
+        height = max(self.minimumHeight(), rows + 2 * self.frameWidth())
+        if self.maximumHeight() != height:
+            self.setMaximumHeight(height)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self.scheduleDelayedItemsLayout()
+        self.fit_height()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.scheduleDelayedItemsLayout()
+        if event.size().width() != event.oldSize().width():
+            self.fit_height()
+
+
+class _ElidingButton(QPushButton):
+    """A button that may be narrower than its text, so it never widens the
+    inspector: short of room it draws the text elided. Its own sizeHint is the
+    whole text, so it is shown whole whenever there is room; its accessible
+    name and tooltip keep the whole text."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
+        self.setSizePolicy(policy)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        metrics = self.fontMetrics()
+        icon = self.iconSize().width() + 6 if not self.icon().isNull() else 0
+        # Room for the first character and an ellipsis, and the padding.
+        least = icon + metrics.horizontalAdvance(self.text()[:1] + "…") + 26
+        return QSize(min(hint.width(), least), hint.height())
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if self.width() >= self.sizeHint().width():
+            # Room for the whole text: drawn exactly as any button.
+            super().paintEvent(event)
+            return
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        contents = self.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, self)
+        room = contents.width() - (option.iconSize.width() + 6 if not option.icon.isNull() else 0)
+        lines = option.text.split("\n")
+        elided = "\n".join(option.fontMetrics.elidedText(line, Qt.TextElideMode.ElideRight, max(0, room))
+                           for line in lines)
+        if elided == option.text:
+            super().paintEvent(event)
+            return
+        option.text = elided
+        QStylePainter(self).drawControl(QStyle.ControlElement.CE_PushButton, option)
 
 
 class _ElidedDocumentLabel(QLabel):
@@ -1244,7 +1299,7 @@ class ManuscriptView(QWidget):
         term_details.addWidget(self.findings)
         # Ambiguous one-character names: after the judged findings, folded,
         # never counted with them.
-        self.ambiguous_toggle = QPushButton(term_page)
+        self.ambiguous_toggle = _ElidingButton(parent=term_page)
         self.ambiguous_toggle.setObjectName("commandButton")
         self.ambiguous_toggle.setCheckable(True)
         self.ambiguous_toggle.setIconSize(QSize(16, 16))
@@ -1261,9 +1316,8 @@ class ManuscriptView(QWidget):
         self.ambiguous_note.setObjectName("secondaryText")
         self.ambiguous_note.setWordWrap(True)
         ambiguous.addWidget(self.ambiguous_note)
-        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area)
+        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area, fit_rows=3)
         self.ambiguous_list.setMinimumHeight(52)
-        self.ambiguous_list.setMaximumHeight(140)
         self.ambiguous_list.setWordWrap(True)
         self.ambiguous_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.ambiguous_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1283,9 +1337,9 @@ class ManuscriptView(QWidget):
         self.ambiguous_combo.setMinimumContentsLength(8)
         self.ambiguous_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         actions.addWidget(self.ambiguous_combo)
-        self.ambiguous_adopt_button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON, self.ambiguous_actions)
+        self.ambiguous_adopt_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON, self.ambiguous_actions)
         self.ambiguous_adopt_button.clicked.connect(self._adopt_ambiguous)
-        self.ambiguous_ignore_button = QPushButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
+        self.ambiguous_ignore_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
         self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
         for button in (self.ambiguous_adopt_button, self.ambiguous_ignore_button):
             # Keep an IME composition in the editor when an action is clicked.
@@ -1353,9 +1407,9 @@ class ManuscriptView(QWidget):
         self.choice_combo.setMinimumContentsLength(8)
         self.choice_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         choice_label.setBuddy(self.choice_combo)
-        self.choice_button = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_RECORD, self.choice_area)
+        self.choice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECORD, self.choice_area)
         self.choice_button.clicked.connect(self._choose_term)
-        self.unchoice_button = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, self.choice_area)
+        self.unchoice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, self.choice_area)
         self.unchoice_button.clicked.connect(self._unchoose_term)
         choice_buttons = QHBoxLayout()
         choice_buttons.setSpacing(6)
@@ -1375,11 +1429,11 @@ class ManuscriptView(QWidget):
         choice_layout.addWidget(self.choice_state)
         self.choice_area.hide()
         term_details.addWidget(self.choice_area)
-        self.lookup_button = QPushButton(strings.NAV_ITEM_TERMS, inspector_body)
+        self.lookup_button = _ElidingButton(strings.NAV_ITEM_TERMS, inspector_body)
         self.lookup_button.setIcon(icon("external-link"))
         self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.lookup_button.clicked.connect(self._request_lookup)
-        self.replace_toggle = QPushButton(strings.MANUSCRIPT_REPLACE, inspector_body)
+        self.replace_toggle = _ElidingButton(strings.MANUSCRIPT_REPLACE, inspector_body)
         self.replace_toggle.setCheckable(True)
         self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         term_actions = QHBoxLayout()
@@ -1612,9 +1666,11 @@ class ManuscriptView(QWidget):
         list so long manuscripts can be navigated and their gaps explained."""
         self.track_group = QButtonGroup(self)
         self.track_group.setExclusive(True)
-        self.terms_track_button = QPushButton(self)
-        self.semantic_track_button = QPushButton(self)
-        self.segments_track_button = QPushButton(self)
+        # They elide rather than widen the inspector when the counts and a wide
+        # system font do not fit side by side.
+        self.terms_track_button = _ElidingButton(parent=self)
+        self.semantic_track_button = _ElidingButton(parent=self)
+        self.segments_track_button = _ElidingButton(parent=self)
         for index, button in enumerate((self.terms_track_button, self.semantic_track_button,
                                         self.segments_track_button)):
             button.setObjectName("activityItem")
@@ -1696,14 +1752,14 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.issue_alternative_button, 0, Qt.AlignmentFlag.AlignLeft)
         actions = QHBoxLayout()
         actions.setSpacing(6)
-        self.accept_button = QPushButton(strings.MANUSCRIPT_ACCEPT, page)
+        self.accept_button = _ElidingButton(strings.MANUSCRIPT_ACCEPT, page)
         self.accept_button.setObjectName("primaryButton")
         self.accept_button.setToolTip(f"{strings.MANUSCRIPT_ACCEPT}（Ctrl+Enter）")
         self.accept_button.clicked.connect(self._accept_current)
-        self.adjust_button = QPushButton(strings.MANUSCRIPT_ADJUST, page)
+        self.adjust_button = _ElidingButton(strings.MANUSCRIPT_ADJUST, page)
         self.adjust_button.setToolTip(f"{strings.MANUSCRIPT_ADJUST}（Ctrl+Shift+E）")
         self.adjust_button.clicked.connect(self._adjust_current)
-        self.ignore_button = QPushButton(strings.MANUSCRIPT_IGNORE, page)
+        self.ignore_button = _ElidingButton(strings.MANUSCRIPT_IGNORE, page)
         self.ignore_button.setToolTip(f"{strings.MANUSCRIPT_IGNORE}（Ctrl+Shift+I）")
         self.ignore_button.clicked.connect(self._ignore_current)
         for button in (self.accept_button, self.adjust_button, self.ignore_button):
@@ -1737,7 +1793,7 @@ class ManuscriptView(QWidget):
         self.semantic_list.currentRowChanged.connect(self._select_issue)
         layout.addWidget(self.semantic_list)
         # Low-confidence issues are folded at the end of the list until opened.
-        self.low_toggle = QPushButton(page)
+        self.low_toggle = _ElidingButton(parent=page)
         self.low_toggle.setObjectName("commandButton")
         self.low_toggle.setCheckable(True)
         self.low_toggle.setIconSize(QSize(16, 16))
@@ -1781,9 +1837,9 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.segment_hint)
         segment_actions = QHBoxLayout()
         segment_actions.setSpacing(6)
-        self.finish_button = QPushButton(strings.MANUSCRIPT_SEGMENT_FINISH, page)
+        self.finish_button = _ElidingButton(strings.MANUSCRIPT_SEGMENT_FINISH, page)
         self.finish_button.clicked.connect(self._toggle_finished)
-        self.next_pending_button = QPushButton(strings.MANUSCRIPT_NEXT_PENDING, page)
+        self.next_pending_button = _ElidingButton(strings.MANUSCRIPT_NEXT_PENDING, page)
         self.next_pending_button.clicked.connect(self._next_pending)
         for button in (self.finish_button, self.next_pending_button):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -1802,9 +1858,9 @@ class ManuscriptView(QWidget):
         layout.addWidget(self.segment_choices)
         choice_actions = QHBoxLayout()
         choice_actions.setSpacing(6)
-        self.segment_choice_action = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_RECONFIRM, page)
+        self.segment_choice_action = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECONFIRM, page)
         self.segment_choice_action.clicked.connect(self._segment_choice_primary)
-        self.segment_choice_remove = QPushButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, page)
+        self.segment_choice_remove = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, page)
         self.segment_choice_remove.clicked.connect(self._segment_choice_removed)
         for button in (self.segment_choice_action, self.segment_choice_remove):
             button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
@@ -1813,7 +1869,7 @@ class ManuscriptView(QWidget):
         choice_actions.addStretch(1)
         layout.addLayout(choice_actions)
         self._segment_choice_rows: list[tuple] = []
-        self.translate_segment_button = QPushButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
+        self.translate_segment_button = _ElidingButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
         self.translate_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.translate_segment_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.translate_segment_button.clicked.connect(self._translate_segment)
@@ -1845,7 +1901,7 @@ class ManuscriptView(QWidget):
         self.l1_note.setWordWrap(True)
         self.l1_note.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
         layout.addWidget(self.l1_note)
-        self.l1_run_button = QPushButton(strings.MANUSCRIPT_L1_RUN.format(count=0), card)
+        self.l1_run_button = _ElidingButton(strings.MANUSCRIPT_L1_RUN.format(count=0), card)
         self.l1_run_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.l1_run_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.l1_run_button.clicked.connect(self._run_structure_check)
@@ -1855,9 +1911,8 @@ class ManuscriptView(QWidget):
         self.l1_status.setTextFormat(Qt.TextFormat.PlainText)
         self.l1_status.setWordWrap(True)
         layout.addWidget(self.l1_status)
-        self.l1_list = _WrappedListWidget(card)
+        self.l1_list = _WrappedListWidget(card, fit_rows=3)
         self.l1_list.setMinimumHeight(52)
-        self.l1_list.setMaximumHeight(124)
         self.l1_list.setWordWrap(True)
         self.l1_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.l1_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1872,10 +1927,14 @@ class ManuscriptView(QWidget):
         self.l2_overview.setWordWrap(True)
         self.l2_overview.hide()
         layout.addWidget(self.l2_overview)
-        # Component state only: never saved, never sent.
-        self.l3_check = QCheckBox(strings.MANUSCRIPT_L3_TITLE, card)
+        # The title wraps; the switch beside it has a short label, so neither
+        # widens the inspector. Component state only: never saved, never sent.
+        self.l3_title = QLabel(strings.MANUSCRIPT_L3_TITLE, card)
+        self.l3_title.setObjectName("statusText")
+        self.l3_title.setWordWrap(True)
+        layout.addWidget(self.l3_title)
+        self.l3_check = QCheckBox(strings.MANUSCRIPT_L3_TOGGLE, card)
         self.l3_check.setChecked(False)
-        self.l3_check.setToolTip(strings.MANUSCRIPT_L3_TOGGLE)
         self.l3_check.setAccessibleName(strings.MANUSCRIPT_L3_TITLE)
         self.l3_check.toggled.connect(self._style_toggled)
         layout.addWidget(self.l3_check)
@@ -1991,9 +2050,11 @@ class ManuscriptView(QWidget):
             self.l1_list.setCurrentRow(-1)
             self.l1_list.blockSignals(False)
         self.l1_list.setVisible(bool(rows) and not unavailable)
+        self.l1_list.fit_height()
         self._render_layer_overview()
-        if self._covered_count or (state.results and self._issue_rows):
-            # What Layer 1 covers decides which semantic issues are listed.
+        if self._covered_count or (state.results and self._session.issues()):
+            # What Layer 1 covers decides which semantic issues are listed,
+            # folded low-confidence ones included (they are not in _issue_rows).
             self._refresh_semantic()
 
     def _select_l1_row(self, row: int) -> None:
@@ -3670,10 +3731,8 @@ class ManuscriptView(QWidget):
         self.ambiguous_list.setCurrentRow(row if 0 <= row < count else (0 if count else -1))
         self.ambiguous_list.blockSignals(False)
         self.ambiguous_area.setVisible(bool(count) and expanded)
-        if count:
-            # As tall as its rows (a usual report has one or two), at most 140 px.
-            rows = sum(self.ambiguous_list.sizeHintForRow(i) for i in range(count))
-            self.ambiguous_list.setMaximumHeight(max(52, min(140, rows + 2 * self.ambiguous_list.frameWidth() + 4)))
+        # As tall as its rows (a usual report has one or two), at most three.
+        self.ambiguous_list.fit_height()
         self._render_ambiguous_actions()
 
     def _current_ambiguous(self) -> tuple[dict, tuple[int, int, int] | None] | None:
@@ -4037,6 +4096,8 @@ class ManuscriptView(QWidget):
         self._cancel_pending()
         self._stop_semantic()
         self._stop_translation()
+        # A Layer 1 check in flight would otherwise answer into a closed view.
+        self._controller.cancel_structure_check()
 
     @staticmethod
     def _has_recovery_content(payload: dict) -> bool:

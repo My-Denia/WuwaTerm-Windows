@@ -75,7 +75,7 @@ from .errors import (
     ERROR_RATE_LIMITED, ERROR_UNAUTHORIZED, ClientError,
 )
 from .manuscript import (
-    MAX_CHOICES, MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, ReviewReport, WorkfileError,
+    MAX_HISTORY_SEGMENTS, MAX_SEMANTIC_DECISIONS, MAX_SEMANTIC_HISTORY, MAX_V4_CHOICES, ReviewReport, WorkfileError,
     empty_workfile, recover_span, sanitize_duplicate_choices, semantic_payload_fits, serialize_workfile,
 )
 from .segmentation import (
@@ -815,7 +815,9 @@ class DocumentRunController:
         """Adopt ``candidate`` (an official pair) or mark the place not a term,
         at a finding of the latest report checked in this session (Web
         ``choose``). It replaces any choice at the same place, is one undoable
-        edit, and goes out as a resolution with the next document check."""
+        edit, and goes out as a resolution with the next document check. A
+        short manuscript holds up to 128 choices, as v4/v5 files and Core's
+        ``resolutions`` do."""
         latest = self.latest_trusted()
         if latest is None or latest["report"]["truncated"]:
             return CommandOutcome(reason=REASON_NOT_APPLICABLE)
@@ -835,7 +837,7 @@ class DocumentRunController:
         value = self.draft_snapshot()
         existing = self.document_choice_at({"source_span": span})
         choices = [c for c in value["choices"] if c != existing]
-        if existing is None and len(choices) >= MAX_CHOICES:
+        if existing is None and len(choices) >= MAX_V4_CHOICES:
             return CommandOutcome(reason=REASON_FULL)
         value["choices"] = [*choices, made]
         self.session_choices = [c for c in self.session_choices if c != existing] + [copy.deepcopy(made)]

@@ -108,6 +108,8 @@ class MyTermsPanel(QFrame):
 
         self.title_label = QLabel(strings.TERMBASE_TITLE, self)
         self.title_label.setObjectName("sectionTitle")
+        # Wraps in the narrowest inspector instead of widening it.
+        self.title_label.setWordWrap(True)
         self.count_label = QLabel(self)
         self.count_label.setObjectName("secondaryText")
         self.count_label.setWordWrap(True)

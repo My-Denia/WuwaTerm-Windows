@@ -248,11 +248,81 @@ def test_layer_two_folds_low_confidence_and_leaves_out_what_layer_one_shows(qapp
     asyncio.run(scenario())
 
 
+def test_layer_one_leaves_out_a_low_confidence_issue_while_every_issue_is_folded(qapp) -> None:
+    """Every semantic issue low confidence, so none is listed until the fold is
+    opened: Layer 1 still decides which of them the fold holds and counts."""
+    def all_low(source, target):
+        return [issue(source, target, category="quantity_change", confidence="low", source_quote="100",
+                      target_quote="10", seed="1")]
+
+    async def scenario():
+        server = Server(capabilities=("semantic-review-v1", STRUCTURE), issues=all_low)
+        view = make_view(server, NUMBER_SOURCE, NUMBER_TARGET)
+        view._start_review()
+        await settle(view)
+        view._show_track(TRACK_SEMANTIC)
+        assert view._issue_rows == [] and len(view._session.issues()) == 1
+        assert view.low_toggle.text() == strings.MANUSCRIPT_L2_LOW_SHOW.format(count=1)
+        assert view.semantic_track_button.text() == strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=1)
+        view.l1_run_button.click()
+        await settle(view)
+        # The missing number is Layer 1's: the folded issue on it is left out and counted as such.
+        assert view.l2_covered.text() == strings.MANUSCRIPT_L2_COVERED.format(count=1)
+        assert view.low_toggle.isHidden()
+        assert view.semantic_track_button.text() == strings.MANUSCRIPT_TRACK_SEMANTIC.format(count=0)
+        assert strings.MANUSCRIPT_L2_OVERVIEW.format(high=0, medium=0, low=0) in view.l2_overview.text()
+        view.low_toggle.setChecked(True)
+        assert view._issue_rows == []
+    asyncio.run(scenario())
+
+
+def test_closing_the_window_cancels_a_structure_check_in_flight(qapp) -> None:
+    async def scenario():
+        server = Server(capabilities=(STRUCTURE,))
+        gate = asyncio.Event()
+        seen: list[str] = []
+
+        async def held(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.path)
+            if request.url.path == "/v1/structure-checks":
+                await gate.wait()
+            return server(request)
+
+        client = ApiClient("https://example.invalid", token_provider=lambda: "test-token",
+                           _test_transport=httpx.MockTransport(held))
+        view = ManuscriptView(client)
+        value = empty_workfile()
+        value.update(source=NUMBER_SOURCE, target=NUMBER_TARGET)
+        view._set_payload(value)
+        view._saved_payload = view._payload.copy()
+        view._refresh_derived()
+        controller = view._controller
+        view.l1_run_button.click()
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if "/v1/structure-checks" in seen:
+                break
+        assert controller.structure_running()
+        renders: list[str] = []
+        view._render_structure = lambda: renders.append("render")
+        view.cancel_background_work()
+        assert not controller.structure_running()
+        gate.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Nothing answers into the closed view, and nothing was kept.
+        assert renders == []
+        assert controller.structure_task is None and controller.structure.results == {}
+        assert controller.structure.phase == "idle"
+    asyncio.run(scenario())
+
+
 def test_layer_three_is_off_by_default_and_sends_or_stores_nothing(qapp) -> None:
     server = Server(capabilities=(STRUCTURE,))
     view = make_view(server, NUMBER_SOURCE, NUMBER_TARGET)
     before = serialize_workfile(view._payload)
-    assert view.l3_check.text() == strings.MANUSCRIPT_L3_TITLE
+    assert view.l3_title.text() == strings.MANUSCRIPT_L3_TITLE
+    assert view.l3_check.text() == strings.MANUSCRIPT_L3_TOGGLE
     assert not view.l3_check.isChecked() and view.l3_note.text() == strings.MANUSCRIPT_L3_OFF
     view.l3_check.click()
     assert view.l3_check.isChecked() and view.l3_note.text() == strings.MANUSCRIPT_L3_ON
@@ -388,7 +458,7 @@ def test_the_new_text_meets_contrast_in_both_themes(qapp, scheme) -> None:
     tokens = theme.TOKENS_BY_SCHEME[scheme]
     view = make_view(Server(), NUMBER_SOURCE, NUMBER_TARGET)
     names = {widget.objectName() for widget in (
-        view.layers_title, view.l1_title, view.l1_note, view.l1_status, view.l2_overview, view.l3_note,
+        view.layers_title, view.l1_title, view.l1_note, view.l1_status, view.l2_overview, view.l3_title, view.l3_note,
         view.l2_title, view.l2_note, view.l2_covered, view.low_toggle, view.ambiguous_toggle, view.ambiguous_note,
         view.ambiguous_state)}
     colour = {"sectionTitle": "text-secondary", "statusText": "text-primary", "secondaryText": "text-secondary",
@@ -401,10 +471,15 @@ def test_the_new_text_meets_contrast_in_both_themes(qapp, scheme) -> None:
             assert contrast(tokens[colour[name]], tokens[background]) >= 4.5, (scheme, name, background)
 
 
+@pytest.mark.parametrize("font_scale", [1.0, 1.25])
 @pytest.mark.parametrize("scheme", [theme.SCHEME_LIGHT, theme.SCHEME_DARK])
-def test_every_layer_open_never_widens_the_inspector(qapp, scheme) -> None:
+def test_every_layer_open_never_widens_the_inspector(qapp, scheme, font_scale) -> None:
     """All three layers filled, both folds open: nothing pushes the inspector
-    into a horizontal scroll (the width the My terms panel test uses)."""
+    into a horizontal scroll, with room to spare. Windows' CJK fonts are wider
+    than Linux's (they once overflowed this by 32 px), so the test also runs
+    with every font a quarter larger and asks for 40 px of headroom."""
+    import re
+
     from PySide6.QtWidgets import QScrollArea
 
     async def scenario():
@@ -421,18 +496,47 @@ def test_every_layer_open_never_widens_the_inspector(qapp, scheme) -> None:
         view.ambiguous_toggle.setChecked(True)
         view.ambiguous_list.setCurrentRow(0)
         view.low_toggle.setChecked(True)
-        for track in (0, TRACK_SEMANTIC):
+        scroll = view.inspector.findChild(QScrollArea)
+        for track in (0, TRACK_SEMANTIC, 2):
             view._show_track(track)
             for _ in range(3):
                 QApplication.processEvents()
             assert view.l1_list.count() and view.ambiguous_list.count() and view._issue_rows
-            assert view.inspector.findChild(QScrollArea).horizontalScrollBar().maximum() == 0, (scheme, track)
+            assert scroll.horizontalScrollBar().maximum() == 0, (scheme, font_scale, track)
+            room = scroll.viewport().width() - scroll.widget().minimumSizeHint().width()
+            assert room >= 40, (scheme, font_scale, track, room)
+        # Whole rows only: the Layer 1 list is exactly as tall as its first three rows.
+        rows = sum(view.l1_list.sizeHintForRow(i) for i in range(min(3, view.l1_list.count())))
+        assert view.l1_list.maximumHeight() == max(view.l1_list.minimumHeight(), rows + 2 * view.l1_list.frameWidth())
+        # A button short of room keeps its whole text for readers.
+        assert view.terms_track_button.accessibleName() == view.terms_track_button.text()
         view._saved_payload = view._payload
         view.close()
 
-    previous = qapp.styleSheet()
-    qapp.setStyleSheet(theme.load_stylesheet(scheme))
+    previous_sheet, previous_font = qapp.styleSheet(), qapp.font()
+    sheet = re.sub(r"(\d+(?:\.\d+)?)pt", lambda m: f"{float(m.group(1)) * font_scale:.1f}pt",
+                   theme.load_stylesheet(scheme))
+    font = qapp.font()
+    font.setPointSizeF(font.pointSizeF() * font_scale)
+    qapp.setFont(font)
+    qapp.setStyleSheet(sheet)
     try:
         asyncio.run(scenario())
     finally:
-        qapp.setStyleSheet(previous)
+        qapp.setStyleSheet(previous_sheet)
+        qapp.setFont(previous_font)
+
+
+def test_an_eliding_button_shows_its_whole_text_when_there_is_room(qapp) -> None:
+    from wuwaterm_client.ui.manuscript_view import _ElidingButton
+    button = _ElidingButton("下一处待处理")
+    assert button.minimumSizeHint().width() < button.sizeHint().width()
+    button.resize(button.sizeHint())
+    button.show()
+    QApplication.processEvents()
+    image = button.grab()  # paints the whole text without eliding
+    assert not image.isNull() and button.text() == "下一处待处理"
+    button.resize(button.minimumSizeHint().width(), button.sizeHint().height())
+    QApplication.processEvents()
+    assert not button.grab().isNull() and button.text() == "下一处待处理"
+    button.close()
