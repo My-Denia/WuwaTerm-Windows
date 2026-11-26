@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "fe4555fcfeaf3605247948452ce1b279a5b3f660",
+    "commit": "2737530187f1e1c3a6b8758de357c8d32d21dfc7",
     "files": {
       "src/wuwaterm_api/__init__.py": "cf02ace4b8e3038b3e297bf6c7057541f6e67c60ad595fdcf2487240ed0c10c0",
-      "docs/api/openapi.json": "1e8c25c8cf8ffd33287aa84bcc18ec8f3f75b43193be8a533cb263898d9df770",
+      "docs/api/openapi.json": "3eff73357f276285e7f98b4d57d5f6732f1674ddc6683a4948b97b75d981f9cb",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",
@@ -30,11 +30,11 @@
   },
   "web": {
     "repository": "My-Denia/WuwaTerm-Web",
-    "commit": "ae5b3963e0ca452b3e3db39a3b634bb5254f922e",
+    "commit": "6cd0a7c5c65243c3d2cd741dc567690fa941f460",
     "files": {
       "contracts/workbench-state/cases.json": "226368210e557d061f02fbb0fb1a48e215d050668a5cdb2fa42329c4af71e8c2",
       "contracts/workbench-state/duplicate-attribution.json": "9b8d6211a4bb9fc10c17b4ba0ee419397810a4410263e95f7d1e97fe9be1d2f4",
-      "package.json": "6c960836ed2411999c9e85d860442c89804f9cb136742b68ee6e2dd787f4ae90",
+      "package.json": "850a8eb8e6557659a2f4ac7f160861999da277ce63ac885adaed3fdc4c84b815",
       "lib/manuscript.js": "41efa8a3a2c161c9145e6155cd644fd41b6c2f6bc130152421f89af8e85c6f1b",
       "lib/review-report.js": "a078e29b5f958d5d54007fb96af2295d2cccdf45bfd5dcc23a6cf29a9b7bf67e",
       "lib/semantic-review.js": "bee29bea220adb5410922af339ecf69e710274038e4165c99816714fa72922dc",
@@ -204,7 +204,7 @@
       "contracts/termbase-v1/fixtures/valid-escaped-astral-pair.json": "1eade246a32df6a126c85adb074eea25b5cb8af3b561f2446fc20df587110eb7",
       "contracts/termbase-v1/fixtures/valid-max-length-fields.json": "d917dcc2b299801b2458e1fc09b6a2193da2ed5aecebb73da7e0475861f405a0",
       "contracts/termbase-v1/fixtures/valid-one-entry.json": "b91c2bf3b130b6ae52b2066324cde6b4484b911623ae06aac02330a8d01917ac",
-      "contracts/manuscript-v5/SPEC.md": "ae187c67be7719cf1bfa11fd3637ea1a93d861f7d7246399b9e7c8cd92a975c6",
+      "contracts/manuscript-v5/SPEC.md": "fbf577023cbde7ca781138dca1d77509bf42f795871393e6553cb931cd5cc2b1",
       "contracts/manuscript-v5/cases.json": "26d6ea2e4fd39023b5c46593e057e4cf007cd3b113846dca2055556bfd80e7bd",
       "contracts/manuscript-v5/invalid-v5-ambiguous-on-verified.json": "d70d1817ea12acc2a662cc5656dc9461b094104f4057bca6a2f490ff77828bff",
       "contracts/manuscript-v5/invalid-v5-ambiguous-without-feature-document.json": "38e5ee1f253c53819bcbc5d0e6da05f9f5188036f0f919fffd4ceb0714854034",
