@@ -2322,9 +2322,14 @@ def test_a_review_dictionary_against_another_dictionary_is_dropped(qapp, memory)
         view.set_service_dictionary(identity)
         view._record_live_review_dictionary(review_dictionary)
 
+        # A review is served LATER than the identity, so its disagreement means
+        # the cached revision may be the superseded one: neither statement is
+        # kept, and reuse stays off until a refresh settles it.
         assert view._live_review_dictionary is None, "a stale review basis was adopted"
+        assert view._service_dictionary is None, "a possibly superseded identity stayed authoritative"
         assert requested, "nothing asked for a refresh"
-        assert view._terms_db_revision() == REVISION
+        assert view._terms_db_revision() is None
+        assert view._controller._tm_provenance() == (None, None), "a superseded revision was still reported"
 
         # The other order: a review was recorded first and the identity arrives after.
         view.set_service_dictionary(None)

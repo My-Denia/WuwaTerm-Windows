@@ -5059,11 +5059,15 @@ class ManuscriptView(QWidget):
         if identity is not None:
             review_revision = tm.normalize_provenance_value(recorded.get("revision"))
             if review_revision is not None and review_revision != identity.revision:
-                # The review ran against a dictionary that is not the one being
-                # served: its basis is stale, so it is not adopted and the
-                # identity stays the authority. A refresh is requested so the
-                # next review starts from the served dictionary.
+                # A review is served by the same process as the identity but
+                # happens LATER, so this answer describes a dictionary the
+                # cached identity no longer matches - and the identity may be
+                # the superseded one. Neither statement is kept: reuse stays off
+                # (unknown revision) until a refresh says which dictionary is
+                # served now. Keeping the identity here would let 翻译 reuse
+                # entries confirmed under a dictionary the service replaced.
                 self._live_review_dictionary = None
+                self._service_dictionary = None
                 self.serviceMetaRefreshRequested.emit()
                 self._refresh_tm_panel()
                 self.workbenchStatusChanged.emit()
