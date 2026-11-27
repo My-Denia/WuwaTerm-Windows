@@ -666,10 +666,9 @@ def test_the_reuse_check_writes_nothing_while_it_counts(qapp, memory) -> None:
 
 
 def test_homograph_encore_with_different_context_is_reference_only_never_batch_filled(qapp, memory) -> None:
-    source_commit = "d" * 40
     # Confirmed in character story context.
     memory.add("Encore!", "安可！", "en", prev_source="剧情对话：", next_source="她露出了微笑。",
-               origin="human_confirmed", terms_db_revision=REVISION, game_version=source_commit)
+               origin="human_confirmed", terms_db_revision=REVISION, game_version="3.7.0")
     # Current manuscript is a performance review with different neighbours.
     source = "演出评论开场。Encore! 观众鼓掌。"
     target = "Show intro."
@@ -680,7 +679,7 @@ def test_homograph_encore_with_different_context_is_reference_only_never_batch_f
     ])
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": source_commit}}
+        view._term_basis = {"dictionary": {"revision": REVISION, "game_version": "3.7.0"}}
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         summary = view.tm_panel.summary
@@ -701,6 +700,16 @@ def test_homograph_encore_with_different_context_is_reference_only_never_batch_f
         assert "安可！" in card
         view.tm_panel.apply_at(0)
         assert "安可！" in view._payload["target"]
+
+        # Moving Encore! to the end of the manuscript (prev matches, next disappeared) also stays reference-only.
+        end_source = "剧情对话：Encore!"
+        end_target = "Story line:"
+        end_alignments = alignments_for(end_source, end_target, [("剧情对话：", "Story line:"), ("Encore!", "")])
+        install(view, end_source, end_target, alignments=end_alignments)
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view._tm_fill_plan == []
     finally:
         view.close()
 
@@ -732,18 +741,77 @@ def test_provenance_unknown_shows_badge_and_never_enters_trusted_fill(qapp, memo
         view.close()
 
 
-def test_fill_from_memory_triggers_layer_one_structure_check(qapp, memory) -> None:
+def test_reconfirming_with_source_commit_only_preserves_existing_game_version_and_report_overrides_basis(
+    qapp, memory
+) -> None:
+    source, target, alignments = two_segments()
+    memory.add(
+        "First line.", "甲句。", "en", next_source="Second line.",
+        origin="human_confirmed", terms_db_revision=REVISION, game_version="3.7.0",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        # Server report has source_commit but no explicit game_version -> _game_version() must be None.
+        view._report = {
+            "request_id": "r1",
+            "findings": [],
+            "dictionary": {"revision": OTHER_REVISION, "source_commit": "d" * 40},
+        }
+        view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": "c" * 40}}
+        install(view, source, target, alignments=alignments)
+        assert view._game_version() is None
+        # Report takes precedence over stale _term_basis in both view and controller.
+        assert view._terms_db_revision() == OTHER_REVISION
+        assert view._controller._tm_provenance() == (OTHER_REVISION, None)
+
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        view.tm_panel.confirm_button.click()
+        (entry,) = memory.entries()
+        assert entry.terms_db_revision == OTHER_REVISION
+        assert entry.game_version == "3.7.0"
+    finally:
+        view.close()
+
+
+def test_overlong_neighbour_never_grants_context_exact_in_panel_or_reuse_check(qapp, memory) -> None:
+    limit = tm.SOURCE_SCALARS[1]
+    short = "First line."
+    long_tail = "字" * (limit + 1)
+    source = f"{short}\n\n{long_tail}"
+    target = ""
+    alignments = alignments_for(source, target, [(short, ""), (long_tail, "")])
+    memory.add(short, "首句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        assert view.tm_panel.matches[0].match_kind == tm.TM_MATCH_EXACT
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view._tm_fill_plan == []
+    finally:
+        view.close()
+
+
+def test_fill_from_memory_triggers_layer_one_structure_check_and_restarts_inflight_check(qapp, memory) -> None:
     async def scenario() -> None:
         source_commit = "d" * 40
         source = "First line. Second line."
         target = "甲句。"
         alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
         memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
-                   terms_db_revision=REVISION, game_version=source_commit)
+                   terms_db_revision=REVISION)
 
         requests: list[tuple[str, dict | None]] = []
+        hold_first_l1 = asyncio.Event()
+        l1_calls = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal l1_calls
             body = json.loads(request.content) if request.content else None
             requests.append((request.url.path, body))
             if request.url.path == "/v1/capabilities":
@@ -753,8 +821,12 @@ def test_fill_from_memory_triggers_layer_one_structure_check(qapp, memory) -> No
                     "request_id": "caps",
                 })
             if request.url.path == "/v1/structure-checks":
+                l1_calls += 1
+                if l1_calls == 1:
+                    # Simulate a stale in-flight L1 check before fill; the client cancels it via generation.
+                    pass
                 return httpx.Response(200, json={
-                    "request_id": "l1",
+                    "request_id": f"l1-{l1_calls}",
                     "check_version": "structure-check-v1",
                     "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
                     "segments": [
@@ -775,9 +847,13 @@ def test_fill_from_memory_triggers_layer_one_structure_check(qapp, memory) -> No
         try:
             view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": source_commit}}
             install(view, source, target, alignments=alignments)
+            # Start an in-flight Layer 1 check before filling; _fill_from_memory must restart it.
+            assert view._controller.start_structure_check() is True
+            prior_generation = view._controller.structure_generation
             view._check_memory_reuse()
             assert view.tm_panel.summary.fillable == 1
             view._fill_from_memory()
+            assert view._controller.structure_generation > prior_generation
             assert view._payload["target"] == "甲句。乙句。"
             assert view.status_label.text() == strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=1)
             for _ in range(100):
@@ -785,8 +861,12 @@ def test_fill_from_memory_triggers_layer_one_structure_check(qapp, memory) -> No
                 if task is None or task.done():
                     break
                 await asyncio.sleep(0.01)
-            assert [path for path, _ in requests] == ["/v1/capabilities", "/v1/structure-checks"]
+            assert [path for path, _ in requests if path == "/v1/structure-checks"]
+            # Latest structure check covered the newly filled target and updated the status bar.
+            last_l1_body = [body for path, body in requests if path == "/v1/structure-checks"][-1]
+            assert "乙句。" in last_l1_body["segments"][0]["target"]
             assert view._controller.structure.phase == "done"
+            assert view.status_label.text() == strings.MANUSCRIPT_L1_CLEAN.format(checked=1)
             # Undo remains intact and reverts the batch fill cleanly.
             assert view._controller.can_undo() is True
             view._undo_replace()

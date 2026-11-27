@@ -42,8 +42,9 @@ from ..document_controller import (
 )
 from ..document_edits import (
     NOTICE_ALL, NOTICE_PARTIAL, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM,
-    REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome, copy_payload as _copy_payload,
-    normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_for_target_fill, remap_splice,
+    REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome,
+    build_target_fill_transaction, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
+    remap_for_free_edit, remap_for_target_fill, remap_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
@@ -864,6 +865,15 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         *,
         remap: AlignmentRemap | None = None,
     ) -> bool:
+        return self.apply_target_edits(changed, [edit], remap=remap)
+
+    def apply_target_edits(
+        self,
+        changed: str,
+        edits: list[tuple],
+        *,
+        remap: AlignmentRemap | None = None,
+    ) -> bool:
         view = self._view
         if not view.target_edit.can_display(changed):
             return False
@@ -873,7 +883,7 @@ class _WorkbenchHostAdapter(WorkbenchHost):
             value["alignments"] = remap.alignments
         elif value["alignments"] is not None:
             value["alignments"] = []
-        view._apply_edit(value, edits=[edit], remap=remap)
+        view._apply_edit(value, edits=edits, remap=remap)
         view._save_recovery_snapshot()
         return True
 
@@ -4907,11 +4917,12 @@ class ManuscriptView(QWidget):
         return None
 
     def _game_version(self) -> str | None:
-        """The dictionary data/game version from the open document's review, if any.
+        """The explicit ``dictionary.game_version`` from the open document's review, if any.
 
-        Uses ``game_version`` when present, otherwise ``dictionary.source_commit``
-        (which ``/v1/reviews`` actually supplies). Kept consistent between storing
-        confirmed entries and querying freshness so no false match is ever formed.
+        Never substitutes ``source_commit`` for ``game_version``, so confirming a
+        segment without an explicit server ``game_version`` preserves any
+        previously recorded ``game_version`` rather than overwriting it with a
+        commit SHA.
         """
         for source in (self._report, self._term_basis):
             if not isinstance(source, dict):
@@ -4919,10 +4930,9 @@ class ManuscriptView(QWidget):
             dictionary = source.get("dictionary")
             if not isinstance(dictionary, dict):
                 continue
-            for key in ("game_version", "source_commit"):
-                value = dictionary.get(key)
-                if isinstance(value, str) and value.strip() and len(value) <= tm.REVISION_SCALARS[1]:
-                    return value
+            value = dictionary.get("game_version")
+            if isinstance(value, str) and value.strip() and len(value) <= tm.REVISION_SCALARS[1]:
+                return value
         return None
 
     def _active_segment_pair(self):
@@ -4959,17 +4969,26 @@ class ManuscriptView(QWidget):
         def core(text: str, region) -> str:
             return text[region.core_start:region.core_end]
 
-        def neighbour(position: int) -> str | None:
+        def neighbour(position: int) -> tuple[str | None, bool]:
             if not 0 <= position < len(pairs):
-                return None
-            return self._memory_text(core(source, pairs[position].source))
+                return None, False
+            text = core(source, pairs[position].source)
+            if not text.strip():
+                return None, False
+            if len(text) > tm.SOURCE_SCALARS[1]:
+                return None, True
+            return text, False
 
+        prev_text, prev_unhashable = neighbour(index - 1)
+        next_text, next_unhashable = neighbour(index + 1)
         return ActiveSegment(
             source=core(source, pair.source),
             target=core(target, pair.target),
             direction=self._payload["direction"],
-            prev_source=neighbour(index - 1),
-            next_source=neighbour(index + 1),
+            prev_source=prev_text,
+            next_source=next_text,
+            prev_unhashable=prev_unhashable,
+            next_unhashable=next_unhashable,
             terms_db_revision=self._terms_db_revision(),
             game_version=self._game_version(),
         )
@@ -5100,8 +5119,15 @@ class ManuscriptView(QWidget):
         def readable(text: str) -> bool:
             return self._memory_text(text) is not None
 
-        def neighbour(index: int) -> str | None:
-            return self._memory_text(sources[index]) if 0 <= index < len(sources) else None
+        def neighbour(index: int) -> tuple[str | None, bool]:
+            if not 0 <= index < len(sources):
+                return None, False
+            text = sources[index]
+            if not text.strip():
+                return None, False
+            if len(text) > tm.SOURCE_SCALARS[1]:
+                return None, True
+            return text, False
 
         classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
         run: list[int] = []
@@ -5109,8 +5135,17 @@ class ManuscriptView(QWidget):
         def flush() -> None:
             if not run:
                 return
-            items = [{"source": sources[index], "prev_source": neighbour(index - 1),
-                      "next_source": neighbour(index + 1)} for index in run]
+            items = []
+            for index in run:
+                prev_src, prev_unhashable = neighbour(index - 1)
+                next_src, next_unhashable = neighbour(index + 1)
+                items.append({
+                    "source": sources[index],
+                    "prev_source": prev_src,
+                    "next_source": next_src,
+                    "prev_unhashable": prev_unhashable,
+                    "next_unhashable": next_unhashable,
+                })
             found = self._translation_memory.classify_segments_for_tm(
                 items,
                 self._payload["direction"],
@@ -5132,9 +5167,9 @@ class ManuscriptView(QWidget):
     def _check_memory_reuse(self) -> None:
         """Count what the memory offers for the current pairing. Reads the memory only.
 
-        A segment counts as fresh when the same text (with the same neighbours,
-        or anywhere) was confirmed under this document's dictionary revision;
-        anything else is a reference, which is never filled silently.
+        仅词库来源已核验且双侧上下文一致的匹配才计为可信复用；
+        其余（上下文不同/未知、版本未知或已过期、数值变体或规范化匹配）仅作参考，
+        从不进入批量填充。
         """
         problem = self._memory_problem()
         if problem is not None:
@@ -5196,42 +5231,23 @@ class ManuscriptView(QWidget):
         plan = sorted(self._tm_fill_plan, key=lambda item: (item[0], item[1], item[3], item[4]))
         raw = self._payload["target"]
         source = self._payload["source"]
-        changed = raw
-        for start, end, text, _source_start, _source_end in reversed(plan):
-            changed = changed[:start] + text + changed[end:]
+        changed, edits, combined_remap = build_target_fill_transaction(
+            source,
+            raw,
+            self._payload["alignments"],
+            plan,
+            separate_paragraphs=False,
+        )
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
-        # Each fill is its own transaction against the text it lands in, in
-        # order, as a translation run writes one segment at a time; what the
-        # transactions invalidated is reported together, as one edit step.
-        alignments = self._payload["alignments"]
-        current = raw
-        shift = 0
-        invalidated: list[dict] = []
-        emptied: list[dict] = []
-        for start, end, text, source_start, source_end in plan:
-            position = start + shift
-            filled = current[:position] + text + current[end + shift:]
-            remap = remap_for_target_fill(alignments, source, filled, source_start, source_end, position,
-                                          position, position + len(text), len(text))
-            alignments = remap.alignments
-            invalidated.extend(remap.invalidated)
-            emptied.extend(remap.emptied_targets)
-            current = filled
-            shift += len(text) - (end - start)
         value = self._draft_snapshot()
         value["target"] = changed
-        value["alignments"] = alignments
-        # Every edit is read in the text the ones before it left, so the list
-        # runs from the last segment back to the first: a segment's own offset
-        # is still the one the document gave it, and an insertion never moves
-        # an edit that has already been applied.
-        edits = [("target", start, end, len(text)) for start, end, text, _s, _e in reversed(plan)]
-        self._apply_edit(value, edits=edits, remap=AlignmentRemap(alignments, tuple(invalidated), tuple(emptied)))
+        value["alignments"] = combined_remap.alignments
+        self._apply_edit(value, edits=edits, remap=combined_remap)
         self._tm_fill_plan = []
         self.tm_panel.clear_reuse()
-        l1_started = self._controller.start_structure_check() if self._api_client.is_configured else False
+        l1_started = self._controller.start_structure_check(restart=True) if self._api_client.is_configured else False
         if l1_started:
             self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=len(plan)))
         elif not self._api_client.is_configured:

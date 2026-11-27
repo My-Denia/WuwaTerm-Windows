@@ -241,9 +241,20 @@ def test_context_exact_ranks_above_exact(store):
     assert [m.match_kind for m in store.lookup_segment("挑战成功", "en", prev_source="其他")] == [
         "exact", "exact"
     ]
-    # One provided neighbour matching is enough for rank 1.
+    # Both sides must match when recorded with both neighbours: supplying only one side
+    # (or moving the entry to an end boundary) degrades to exact, never context_exact.
     assert matches[0].match_kind == "context_exact"
-    assert store.lookup_segment("挑战成功", "en", next_source="奖励")[0].match_kind == "context_exact"
+    assert [m.match_kind for m in store.lookup_segment("挑战成功", "en", next_source="奖励")] == [
+        "exact", "exact"
+    ]
+    # An entry genuinely recorded at a start boundary (prev=None) still matches context_exact there.
+    store.add("边界句", "Boundary", "en", prev_source=None, next_source="奖励")
+    assert store.lookup_segment("边界句", "en", next_source="奖励")[0].match_kind == "context_exact"
+    assert store.lookup_segment("边界句", "en", prev_source="新增前段", next_source="奖励")[0].match_kind == "exact"
+    # An existing neighbour that could not be hashed (>2000 chars) also degrades to exact.
+    assert store.lookup_segment(
+        "边界句", "en", prev_source=None, next_source="奖励", prev_unhashable=True,
+    )[0].match_kind == "exact"
 
 
 def test_normalized_exact_matches_only_whitespace_and_line_endings(store):
@@ -322,11 +333,13 @@ def test_stale_flags_name_the_reason_and_distinguish_three_state_freshness(store
 
     (terms,) = store.lookup_segment("挑战成功", "en", current_terms_db_revision="r15")
     assert terms.freshness == tm.TM_FRESHNESS_STALE
-    assert terms.stale_reasons == ("terms_revision_changed",) and terms.needs_recheck is True
+    assert terms.stale_reasons == ("terms_revision_changed", tm.TM_STALE_PROVENANCE_UNKNOWN)
+    assert terms.needs_recheck is True
 
     (game,) = store.lookup_segment("挑战成功", "en", current_game_version="3.1")
     assert game.freshness == tm.TM_FRESHNESS_STALE
-    assert game.stale_reasons == ("game_version_changed",) and game.needs_recheck is True
+    assert game.stale_reasons == ("game_version_changed", tm.TM_STALE_PROVENANCE_UNKNOWN)
+    assert game.needs_recheck is True
 
     # Missing current provenance is provenance_unknown, never verified_fresh.
     (unknown,) = store.lookup_segment("挑战成功", "en")
@@ -355,6 +368,10 @@ def test_stale_flags_name_the_reason_and_distinguish_three_state_freshness(store
     assert missing_entry_game.stale_reasons == (tm.TM_STALE_PROVENANCE_UNKNOWN,)
     assert missing_entry_game.needs_recheck is True
 
+    # Re-confirming without game_version keeps existing game_version intact.
+    reconfirmed = store.add("挑战成功", "Challenge complete", "en", terms_db_revision="r15", game_version=None)
+    assert reconfirmed.game_version == "3.0"
+
 
 def test_classification_three_state_freshness_and_homograph_context_isolation(store):
     # Homograph Encore! confirmed in story context must not become context_exact_fresh in review context.
@@ -372,6 +389,29 @@ def test_classification_three_state_freshness_and_homograph_context_isolation(st
     assert review_pass[1].match is not None
     assert review_pass[1].match.match_kind == tm.TM_MATCH_EXACT
     assert review_pass[1].match.freshness == tm.TM_FRESHNESS_VERIFIED
+
+    # Moving Encore! to manuscript end (prev matches, next disappeared -> None) must degrade to exact_fresh.
+    end_boundary_pass = store.classify_segments_for_tm(
+        ["角色剧情台词", "Encore!"],
+        "en",
+        current_terms_db_revision="r14",
+        current_game_version="3.0",
+    )
+    assert end_boundary_pass[1].status == tm.TM_STATUS_EXACT_FRESH
+    assert end_boundary_pass[1].match is not None
+    assert end_boundary_pass[1].match.match_kind == tm.TM_MATCH_EXACT
+
+    # Unhashable neighbour (>2000 chars) also degrades to exact_fresh, never context_exact_fresh.
+    store.add("边界句", "Boundary", "en", next_source="后段", terms_db_revision="r14", game_version="3.0")
+    unhashable_pass = store.classify_segments_for_tm(
+        [{"source": "边界句", "prev_source": None, "next_source": "后段", "prev_unhashable": True}],
+        "en",
+        current_terms_db_revision="r14",
+        current_game_version="3.0",
+    )
+    assert unhashable_pass[0].status == tm.TM_STATUS_EXACT_FRESH
+    assert unhashable_pass[0].match is not None
+    assert unhashable_pass[0].match.match_kind == tm.TM_MATCH_EXACT
 
     # Missing current_terms_db_revision -> provenance_unknown -> reference status, never context_exact_fresh.
     unknown_pass = store.classify_segments_for_tm(

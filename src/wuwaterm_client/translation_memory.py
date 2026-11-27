@@ -1014,6 +1014,8 @@ class TranslationMemory:
         *,
         prev_source: str | None = None,
         next_source: str | None = None,
+        prev_unhashable: bool = False,
+        next_unhashable: bool = False,
         current_terms_db_revision: str | None = None,
         current_game_version: str | None = None,
         limit: int = 5,
@@ -1025,13 +1027,18 @@ class TranslationMemory:
         reference, never certified), rank 4 the same text once whitespace and
         line endings are collapsed. Every match carries the reasons it may not
         still hold; ``limit`` caps the list after ranking.
+
+        When ``prev_unhashable`` or ``next_unhashable`` is True (an existing
+        neighbour exceeded ``SOURCE_SCALARS[1]`` and could not be hashed), that
+        side cannot be verified as a manuscript boundary so ``context_exact`` is
+        never returned.
         """
         text = _bounded_string(source, "source", SOURCE_SCALARS)
         if not normalize_source(text):
             raise _invalid("source", "expected non-blank source text")
         direction = _direction(direction, "direction")
-        prev_hash = _context_hash(prev_source, "prev_source")
-        next_hash = _context_hash(next_source, "next_source")
+        prev_hash = None if prev_unhashable else _context_hash(prev_source, "prev_source")
+        next_hash = None if next_unhashable else _context_hash(next_source, "next_source")
         terms = _optional_string(current_terms_db_revision, "current_terms_db_revision", REVISION_SCALARS)
         game = _optional_string(current_game_version, "current_game_version", REVISION_SCALARS)
         limit = _bounded_limit(limit)
@@ -1051,19 +1058,11 @@ class TranslationMemory:
 
         row_limit = min(MAX_LOOKUP_CANDIDATES, limit * 8 + 8)
         order = " ORDER BY use_count DESC, updated_at DESC, id DESC LIMIT ?"
-        if prev_hash is not None or next_hash is not None:
-            conditions = []
-            context_parameters: list[object] = [direction, exact_hash]
-            if prev_hash is not None:
-                conditions.append("prev_source_hash = ?")
-                context_parameters.append(prev_hash)
-            if next_hash is not None:
-                conditions.append("next_source_hash = ?")
-                context_parameters.append(next_hash)
+        if (prev_hash is not None or next_hash is not None) and not (prev_unhashable or next_unhashable):
             collect(
                 "SELECT * FROM tm_entries WHERE direction = ? AND source_hash = ?"
-                " AND " + " AND ".join(conditions) + order,
-                (*context_parameters, row_limit),
+                " AND prev_source_hash IS ? AND next_source_hash IS ?" + order,
+                (direction, exact_hash, prev_hash, next_hash, row_limit),
             )
         collect(
             "SELECT * FROM tm_entries WHERE direction = ? AND source_hash = ?" + order,
@@ -1082,7 +1081,13 @@ class TranslationMemory:
         for row in rows_by_id.values():
             entry = _entry_from_row(row)
             if entry.source_hash == exact_hash:
-                kind = _exact_kind(entry, prev_hash, next_hash)
+                kind = _exact_kind(
+                    entry,
+                    prev_hash,
+                    next_hash,
+                    prev_unhashable=prev_unhashable,
+                    next_unhashable=next_unhashable,
+                )
             elif entry.source_norm == norm:
                 kind = TM_MATCH_NORMALIZED_EXACT
             elif entry.source_masked == masked:
@@ -1110,29 +1115,38 @@ class TranslationMemory:
         A plain sequence of strings uses its neighbours as the context, which is
         what a manuscript pass wants. A mapping may instead name
         ``prev_source`` and ``next_source`` explicitly (``None`` clears the
-        context). Statuses:
+        context), plus ``prev_unhashable`` / ``next_unhashable`` when an
+        existing neighbour could not be hashed. Statuses:
 
         * ``context_exact_fresh`` - the same text with the same neighbours,
           recorded under the current terms revision and game version;
         * ``exact_fresh`` - the same text, but a different or unknown context;
         * ``stale_or_numeric_reference`` - a reference only: the numbers changed,
-          or the entry was recorded under another revision, or the text matches
-          only after normalising whitespace;
+          or the entry was recorded under another revision, or provenance is
+          unknown, or the text matches only after normalising whitespace;
         * ``unmatched`` - nothing to reuse.
         """
         direction = _direction(direction, "direction")
         terms = _optional_string(current_terms_db_revision, "current_terms_db_revision", REVISION_SCALARS)
         game = _optional_string(current_game_version, "current_game_version", REVISION_SCALARS)
         sources: list[str] = []
-        explicit: list[tuple[object, object]] = []
+        explicit: list[tuple[object, object, bool, bool]] = []
         for index, item in enumerate(segments):
             if isinstance(item, str):
                 raw_source: object = item
                 previous, following = _UNSPECIFIED, _UNSPECIFIED
+                prev_unhashable, next_unhashable = False, False
             elif isinstance(item, Mapping):
                 raw_source = item["source"] if "source" in item else item.get("source_text")
                 previous = item["prev_source"] if "prev_source" in item else _UNSPECIFIED
                 following = item["next_source"] if "next_source" in item else _UNSPECIFIED
+                raw_prev_u = item.get("prev_unhashable", False)
+                raw_next_u = item.get("next_unhashable", False)
+                if not isinstance(raw_prev_u, bool):
+                    raise _invalid(f"segments[{index}].prev_unhashable", "expected a boolean")
+                if not isinstance(raw_next_u, bool):
+                    raise _invalid(f"segments[{index}].next_unhashable", "expected a boolean")
+                prev_unhashable, next_unhashable = raw_prev_u, raw_next_u
                 for path, value in ((f"segments[{index}].prev_source", previous),
                                     (f"segments[{index}].next_source", following)):
                     if value is _UNSPECIFIED or value is None:
@@ -1144,10 +1158,10 @@ class TranslationMemory:
             if not normalize_source(source):
                 raise _invalid(f"segments[{index}].source", "expected non-blank text")
             sources.append(source)
-            explicit.append((previous, following))
+            explicit.append((previous, following, prev_unhashable, next_unhashable))
         results: list[TmSegmentClassification] = []
         for index, source in enumerate(sources):
-            previous, following = explicit[index]
+            previous, following, prev_unhashable, next_unhashable = explicit[index]
             if previous is _UNSPECIFIED:
                 previous = sources[index - 1] if index > 0 else None
             if following is _UNSPECIFIED:
@@ -1157,6 +1171,8 @@ class TranslationMemory:
                 direction,
                 prev_source=previous if isinstance(previous, str) else None,
                 next_source=following if isinstance(following, str) else None,
+                prev_unhashable=prev_unhashable,
+                next_unhashable=next_unhashable,
                 current_terms_db_revision=terms,
                 current_game_version=game,
                 limit=1,
@@ -1174,6 +1190,20 @@ class TranslationMemory:
         return results
 
     def _match(self, entry: TmEntry, kind: str, terms: str | None, game: str | None) -> TmMatch:
+        """Build a ``TmMatch`` with three-state freshness and full evidence.
+
+        Freshness precedence:
+        1. ``known_stale`` when any verified provenance dimension explicitly
+           mismatches (``terms_db_revision`` or ``game_version``).
+        2. ``provenance_unknown`` when no verified provenance mismatch occurred
+           but ``terms_db_revision`` is missing or ``game_version`` is one-sided.
+        3. ``known_stale`` for a numeric variant with verified provenance.
+        4. ``verified_fresh`` only when terms revision matches, game version is
+           both absent or equal, and the match is not a numeric variant.
+
+        ``stale_reasons`` always preserves ``TM_STALE_PROVENANCE_UNKNOWN`` when
+        any provenance dimension is missing, even alongside a known mismatch.
+        """
         reasons: list[str] = []
         terms_stale = terms is not None and entry.terms_db_revision is not None and entry.terms_db_revision != terms
         game_stale = game is not None and entry.game_version is not None and entry.game_version != game
@@ -1186,11 +1216,12 @@ class TranslationMemory:
             reasons.append(TM_STALE_NUMERIC)
         terms_unknown = terms is None or entry.terms_db_revision is None
         game_unknown = (game is None) != (entry.game_version is None)
-        provenance_unknown = not (terms_stale or game_stale) and (terms_unknown or game_unknown)
+        has_unknown = terms_unknown or game_unknown
+        if has_unknown:
+            reasons.append(TM_STALE_PROVENANCE_UNKNOWN)
         if terms_stale or game_stale:
             freshness = TM_FRESHNESS_STALE
-        elif provenance_unknown:
-            reasons.append(TM_STALE_PROVENANCE_UNKNOWN)
+        elif has_unknown:
             freshness = TM_FRESHNESS_UNKNOWN
         elif numeric:
             freshness = TM_FRESHNESS_STALE
@@ -1311,13 +1342,20 @@ def _later(first: str, second: str) -> str:
     return first if _instant_key(first) >= _instant_key(second) else second
 
 
-def _exact_kind(entry: TmEntry, prev_hash: str | None, next_hash: str | None) -> str:
-    checks = []
-    if prev_hash is not None:
-        checks.append(entry.prev_source_hash == prev_hash)
-    if next_hash is not None:
-        checks.append(entry.next_source_hash == next_hash)
-    return TM_MATCH_CONTEXT_EXACT if checks and all(checks) else TM_MATCH_EXACT
+def _exact_kind(
+    entry: TmEntry,
+    prev_hash: str | None,
+    next_hash: str | None,
+    *,
+    prev_unhashable: bool = False,
+    next_unhashable: bool = False,
+) -> str:
+    if prev_unhashable or next_unhashable:
+        return TM_MATCH_EXACT
+    if (prev_hash is not None or next_hash is not None) \
+            and entry.prev_source_hash == prev_hash and entry.next_source_hash == next_hash:
+        return TM_MATCH_CONTEXT_EXACT
+    return TM_MATCH_EXACT
 
 
 def _bounded_limit(value: object) -> int:

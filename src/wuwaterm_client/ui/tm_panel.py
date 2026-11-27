@@ -71,6 +71,8 @@ class ActiveSegment:
     direction: str
     prev_source: str | None = None
     next_source: str | None = None
+    prev_unhashable: bool = False
+    next_unhashable: bool = False
     terms_db_revision: str | None = None
     game_version: str | None = None
 
@@ -303,6 +305,8 @@ class TranslationMemoryPanel(QFrame):
                 active.direction,
                 prev_source=active.prev_source,
                 next_source=active.next_source,
+                prev_unhashable=active.prev_unhashable,
+                next_unhashable=active.next_unhashable,
                 current_terms_db_revision=active.terms_db_revision,
                 current_game_version=active.game_version,
                 limit=MAX_LISTED_MATCHES,
