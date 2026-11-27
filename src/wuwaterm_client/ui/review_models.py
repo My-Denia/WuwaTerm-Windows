@@ -374,7 +374,10 @@ class ModelListView(QListView):
         return self.visualRect(idx)
 
     def clear(self) -> None:
+        had_current = self._emitted_row != -1 or self.currentRow() != -1
         self.set_rows(())
+        if had_current and not self.signalsBlocked():
+            self.currentRowChanged.emit(-1)
 
     def addItem(self, item: str | ReviewRow) -> None:  # noqa: N802
         row = item if isinstance(item, ReviewRow) else ReviewRow(text=str(item))

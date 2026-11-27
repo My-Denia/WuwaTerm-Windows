@@ -566,6 +566,15 @@ class LosslessEditor(QPlainTextEdit):
         self.restore_view_state(saved_view)
         self.editRejected.emit()
 
+    def cancel_locate_pulse(self) -> None:
+        """Stop any pending locate-highlight settle timer so cleared highlights stay cleared."""
+        self._locate_pulse_timer.stop()
+        self._locate_span_cursor = None
+
+    def setExtraSelections(self, selections) -> None:  # noqa: N802
+        self.cancel_locate_pulse()
+        super().setExtraSelections(selections)
+
     def _settle_locate_selection(self) -> None:
         cursor = self._locate_span_cursor
         self._locate_span_cursor = None
@@ -575,11 +584,9 @@ class LosslessEditor(QPlainTextEdit):
         selection.cursor = cursor
         selection.format.setBackground(self.palette().color(QPalette.ColorRole.Highlight))
         selection.format.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
-        self.setExtraSelections([selection])
+        super().setExtraSelections([selection])
 
     def select_raw_span(self, span: dict | None, *, move_cursor: bool = True, pulse: bool = False) -> bool:
-        self._locate_pulse_timer.stop()
-        self._locate_span_cursor = None
         self.setExtraSelections([])
         if not isinstance(span, dict):
             return False
@@ -615,11 +622,11 @@ class LosslessEditor(QPlainTextEdit):
             accent.setAlpha(210)
             selection.format.setBackground(accent)
             selection.format.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
-            self.setExtraSelections([selection])
+            super().setExtraSelections([selection])
             self._locate_span_cursor = cursor
             self._locate_pulse_timer.start()
         else:
             selection.format.setBackground(base_bg)
             selection.format.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
-            self.setExtraSelections([selection])
+            super().setExtraSelections([selection])
         return True

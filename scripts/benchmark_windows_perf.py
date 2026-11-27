@@ -1,13 +1,15 @@
 """Repeatable offline performance benchmark for WuwaTerm Windows workbench.
 
 Measures five core desktop interactivity metrics under ``QT_QPA_PLATFORM=offscreen``
-without touching the network, real user config, or Windows Credential Manager:
+inside an isolated temporary profile directory without touching the network,
+real user config, ``tm.sqlite3``, or Windows Credential Manager:
 
-1. Cold start / ``MainWindow`` construction latency
+1. ``MainWindow`` construction latency (``window_construct_ms``; after Qt/theme init)
 2. 10,000-character / 500-segment manuscript keystroke latency
 3. 1,024-item review list (``ModelListView``) bulk refresh latency
 4. List scroll & finding locate latency
-5. Process RSS & Python ``tracemalloc`` peak memory
+5. Process RSS (real OS Working Set on Windows / VmRSS on Linux; ``None`` if unavailable)
+   & Python ``tracemalloc`` peak memory
 
 Usage:
     QT_QPA_PLATFORM=offscreen PYTHONPATH=src python scripts/benchmark_windows_perf.py --quick
@@ -16,13 +18,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import gc
 import json
 import os
 import statistics
 import sys
+import tempfile
 import time
 import tracemalloc
+from collections.abc import Iterator
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -39,23 +45,117 @@ from wuwaterm_client.ui.main_window import MainWindow  # noqa: E402
 from wuwaterm_client.ui.manuscript_view import ManuscriptView  # noqa: E402
 from wuwaterm_client.ui.review_models import ModelListView, ReviewRow  # noqa: E402
 
+_PROFILE_ENV_VARS = ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
 
-def _rss_mib() -> float:
-    """Return current process resident set size in MiB (best-effort cross-platform)."""
+
+class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_uint32),
+        ("PageFaultCount", ctypes.c_uint32),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+def _windows_rss_mib() -> float | None:
+    """Query current process WorkingSetSize on Windows via psapi/kernel32."""
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetCurrentProcess()
+        counters = _PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        for dll_name, fn_name in (("psapi", "GetProcessMemoryInfo"), ("kernel32", "K32GetProcessMemoryInfo")):
+            dll = getattr(ctypes.windll, dll_name, None)  # type: ignore[attr-defined]
+            func = getattr(dll, fn_name, None) if dll is not None else None
+            if func is None:
+                continue
+            func.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), ctypes.c_uint32]
+            func.restype = ctypes.c_int
+            if func(handle, ctypes.byref(counters), counters.cb) and counters.WorkingSetSize > 0:
+                return round(counters.WorkingSetSize / (1024.0 * 1024.0), 2)
+    except Exception:
+        return None
+    return None
+
+
+def _rss_mib() -> float | None:
+    """Return current process resident set size in MiB, or None if unavailable."""
+    if sys.platform == "win32":
+        return _windows_rss_mib()
     status = Path("/proc/self/status")
     if status.is_file():
         for line in status.read_text(encoding="utf-8", errors="ignore").splitlines():
             if line.startswith("VmRSS:"):
                 parts = line.split()
                 if len(parts) >= 2:
-                    return round(int(parts[1]) / 1024.0, 2)
+                    val = int(parts[1])
+                    if val > 0:
+                        return round(val / 1024.0, 2)
     try:
         import resource
 
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return round(usage / 1024.0, 2)
+        if usage > 0:
+            divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+            return round(usage / divisor, 2)
     except Exception:
-        return 0.0
+        return None
+    return None
+
+
+@contextlib.contextmanager
+def isolated_profile_env() -> Iterator[Path]:
+    """Isolate APPDATA/XDG profile directories and keyring in a temporary directory."""
+    saved_env = {key: os.environ.get(key) for key in _PROFILE_ENV_VARS}
+    saved_keyring = None
+    keyring_mod = None
+    try:
+        import keyring
+        from keyring.backend import KeyringBackend
+
+        class _MemoryKeyring(KeyringBackend):
+            priority = 1
+
+            def __init__(self) -> None:
+                self._values: dict[tuple[str, str], str] = {}
+
+            def get_password(self, service: str, username: str) -> str | None:
+                return self._values.get((service, username))
+
+            def set_password(self, service: str, username: str, password: str) -> None:
+                self._values[(service, username)] = password
+
+            def delete_password(self, service: str, username: str) -> None:
+                self._values.pop((service, username), None)
+
+        keyring_mod = keyring
+        saved_keyring = keyring.get_keyring()
+        keyring.set_keyring(_MemoryKeyring())
+    except Exception:
+        keyring_mod = None
+
+    with tempfile.TemporaryDirectory(prefix="wuwaterm-bench-") as tmp_dir:
+        for key in _PROFILE_ENV_VARS:
+            os.environ[key] = tmp_dir
+        try:
+            yield Path(tmp_dir)
+        finally:
+            for key, old_val in saved_env.items():
+                if old_val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_val
+            if keyring_mod is not None and saved_keyring is not None:
+                try:
+                    keyring_mod.set_keyring(saved_keyring)
+                except Exception:
+                    pass
 
 
 def _build_large_manuscript(segments: int = 500) -> tuple[str, str]:
@@ -75,7 +175,7 @@ def _summarize(values_ms: list[float]) -> dict[str, float]:
     }
 
 
-def bench_cold_start(app: QApplication, samples: int) -> dict[str, float]:
+def bench_window_construct(app: QApplication, samples: int) -> dict[str, float]:
     timings: list[float] = []
     for _ in range(samples):
         gc.collect()
@@ -197,6 +297,34 @@ def bench_finding_locate(app: QApplication, samples: int) -> dict[str, float]:
     return _summarize(timings)
 
 
+def run_benchmark(*, quick: bool = False, samples: int = 3, items: int = 1024) -> dict:
+    run_samples = 1 if quick else max(1, samples)
+    keystrokes = 8 if quick else 30
+
+    with isolated_profile_env():
+        tracemalloc.start()
+        app = QApplication.instance() or QApplication([])
+        theme.apply_theme(app, theme.SCHEME_LIGHT)
+
+        results = {
+            "mode": "quick" if quick else "standard",
+            "platform": sys.platform,
+            "qpa_platform": os.environ.get("QT_QPA_PLATFORM", ""),
+            "window_construct_ms": bench_window_construct(app, run_samples),
+            "editor_keystrokes_500_segments": bench_editor_keystrokes(app, keystrokes),
+            "review_list_1024": bench_review_list_refresh(app, items, run_samples),
+            "finding_locate_500_segments": bench_finding_locate(app, run_samples),
+        }
+        current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        results["memory"] = {
+            "rss_mib": _rss_mib(),
+            "tracemalloc_current_mib": round(current_bytes / (1024 * 1024), 2),
+            "tracemalloc_peak_mib": round(peak_bytes / (1024 * 1024), 2),
+        }
+        return results
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="WuwaTerm Windows workbench offline performance benchmark")
     parser.add_argument("--quick", action="store_true", help="Single-sample smoke run for fast local checks")
@@ -205,36 +333,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON only")
     args = parser.parse_args(argv)
 
-    samples = 1 if args.quick else max(1, args.samples)
-    keystrokes = 8 if args.quick else 30
-
-    tracemalloc.start()
-    app = QApplication.instance() or QApplication([])
-    theme.apply_theme(app, theme.SCHEME_LIGHT)
-
-    results = {
-        "mode": "quick" if args.quick else "standard",
-        "platform": sys.platform,
-        "qpa_platform": os.environ.get("QT_QPA_PLATFORM", ""),
-        "cold_start": bench_cold_start(app, samples),
-        "editor_keystrokes_500_segments": bench_editor_keystrokes(app, keystrokes),
-        "review_list_1024": bench_review_list_refresh(app, args.items, samples),
-        "finding_locate_500_segments": bench_finding_locate(app, samples),
-    }
-    current_bytes, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    results["memory"] = {
-        "rss_mib": _rss_mib(),
-        "tracemalloc_current_mib": round(current_bytes / (1024 * 1024), 2),
-        "tracemalloc_peak_mib": round(peak_bytes / (1024 * 1024), 2),
-    }
+    results = run_benchmark(quick=args.quick, samples=args.samples, items=args.items)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:
         print("=== WuwaTerm Windows Workbench Offline Benchmark ===")
         print(f"Mode: {results['mode']} | QPA: {results['qpa_platform']} | Platform: {results['platform']}")
-        print(f"1. Cold start (MainWindow)       : median {results['cold_start']['median_ms']:.2f} ms (p95 {results['cold_start']['p95_ms']:.2f} ms)")
+        wc = results["window_construct_ms"]
+        print(f"1. Window construct (MainWindow) : median {wc['median_ms']:.2f} ms (p95 {wc['p95_ms']:.2f} ms)")
         ks = results["editor_keystrokes_500_segments"]
         print(
             f"2. Keystroke (500 seg / {ks['source_chars']}ch): median {ks['median_ms']:.2f} ms (p95 {ks['p95_ms']:.2f} ms)"
@@ -247,8 +354,9 @@ def main(argv: list[str] | None = None) -> int:
         loc = results["finding_locate_500_segments"]
         print(f"4. Finding locate (500 seg)      : median {loc['median_ms']:.2f} ms (p95 {loc['p95_ms']:.2f} ms)")
         mem = results["memory"]
+        rss_text = f"{mem['rss_mib']:.2f} MiB" if mem["rss_mib"] is not None else "unavailable"
         print(
-            f"5. Memory                        : RSS {mem['rss_mib']:.2f} MiB | "
+            f"5. Memory                        : RSS {rss_text} | "
             f"tracemalloc peak {mem['tracemalloc_peak_mib']:.2f} MiB"
         )
         print(json.dumps(results, ensure_ascii=False))

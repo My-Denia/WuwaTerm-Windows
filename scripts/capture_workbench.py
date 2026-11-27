@@ -38,6 +38,12 @@ _ORIGINAL_CWD = Path.cwd()
 # Before any Qt import: the scale factor and platform are read at startup.
 os.environ["QT_SCALE_FACTOR"] = ARGS.scale
 os.environ["APPDATA"] = tempfile.mkdtemp(prefix="wuwaterm-capture-")
+# On Windows, Qt's offscreen plugin uses FreeType and looks in QT_QPA_FONTDIR;
+# point it at the system Fonts directory when unset so CJK/Latin glyphs render.
+if sys.platform == "win32" and not os.environ.get("QT_QPA_FONTDIR"):
+    _win_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    if _win_fonts.is_dir():
+        os.environ["QT_QPA_FONTDIR"] = str(_win_fonts)
 # The default offscreen screen is 800x800, smaller than the workbench's own
 # default size. Describe a desktop that still leaves room for the requested
 # logical size once the scale factor divides it.

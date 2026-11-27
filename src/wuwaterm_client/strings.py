@@ -771,10 +771,10 @@ MANUSCRIPT_NOT_EVALUATED_UNKNOWN = "未评估原因：{reason}"
 # Layer 1 is deterministic and never saved; layer 2 is the experimental model
 # review; layer 3 is a reserved place that sends and stores nothing.
 MANUSCRIPT_LAYERS_TITLE = "快速核查"
-MANUSCRIPT_L1_TITLE = "格式与数字核查（本地规则、不改稿件）"
+MANUSCRIPT_L1_TITLE = "格式与结构核查（按需请求服务、不改稿件）"
 MANUSCRIPT_L1_NOTE = "逐段检查空译文、数字、占位符与标签、段落和换行；某段改动后，这一段的结果随即失效。"
 MANUSCRIPT_L1_NOTE_DETAIL = (
-    "确定性结构核查（不调用模型）：逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
+    "确定性结构核查（按需向服务提交当前段落做规则检查，不调用模型）：逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
     "结果只在本次打开时显示，不写入稿件文件、导出或撤销历史；某段文本改动后，这一段的结果随即失效。"
 )
 MANUSCRIPT_L1_RUN = "运行格式核查（{count} 段）"

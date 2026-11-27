@@ -609,7 +609,6 @@ class DocumentRunController:
         return self.reviews.semantic_texts(payload)
 
     def reset_term_session(self) -> None:
-        self.provenance.live_review_dictionary = None
         self.reviews.reset_term_session()
 
     def reset_known_texts(self, value: Mapping[str, Any] | None = None) -> None:
