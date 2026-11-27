@@ -249,6 +249,9 @@ class StubHost:
     def report_status(self, text: str) -> None:
         self.statuses.append(text)
 
+    def current_status(self) -> str:
+        return self.statuses[-1] if self.statuses else ""
+
     def report_unstorable_report(self, code: str) -> None:
         self.unstorable.append(code)
 

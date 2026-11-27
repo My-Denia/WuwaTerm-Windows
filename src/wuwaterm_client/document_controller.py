@@ -350,6 +350,7 @@ class DocumentRunController:
         self.structure = structure.State()
         self.structure_generation = 0
         self.structure_task: asyncio.Task | None = None
+        self._structure_progress_status: str | None = None
         # Document-mode choices made in this session (by identity): only these
         # go out as resolutions; a file's choices stay on file (Windows short
         # manuscripts never submit them).
@@ -1170,10 +1171,33 @@ class DocumentRunController:
     def cancel_structure_check(self) -> None:
         self.structure_generation += 1
         task, self.structure_task = self.structure_task, None
+        self._structure_progress_status = None
         if task is not None and not task.done():
             task.cancel()
         if self.structure.phase == "running":
             self.structure.phase = "idle"
+
+    def note_structure_progress(self, text: str) -> None:
+        """Remember the active in-progress status message sent for the current L1 run."""
+        self._structure_progress_status = text
+
+    def _abort_stale_structure_check(self) -> str | None:
+        """Reset stale L1 state and clear its progress message only if status is still that message."""
+        self.structure.phase = "idle"
+        self.structure.skipped = 0
+        self.structure.error = None
+        reader = getattr(self.host, "current_status", None)
+        current = reader() if callable(reader) else None
+        if not current:
+            return None
+        if (
+            current == self._structure_progress_status
+            or current == strings.MANUSCRIPT_L1_RUNNING
+            or strings.MANUSCRIPT_TRANSLATE_TM_L1_RUNNING in current
+            or "正在自动运行第一层结构核查" in current
+        ):
+            return strings.MANUSCRIPT_L1_NOT_RUN
+        return None
 
     def start_structure_check(self, *, restart: bool = False) -> bool:
         """Check every checkable segment of the text as it is now.
@@ -1210,8 +1234,7 @@ class DocumentRunController:
                 if generation != self.structure_generation:
                     return
                 if self._structure_snapshot() != snapshot:
-                    self.structure.phase = "idle"
-                    self.structure.skipped = 0
+                    status_note = self._abort_stale_structure_check()
                     return
                 self.host.update_controls()
             if structure.CAPABILITY_STRUCTURE_CHECK not in self.capabilities:
@@ -1227,8 +1250,7 @@ class DocumentRunController:
                 if generation != self.structure_generation:
                     return
                 if self._structure_snapshot() != snapshot:
-                    self.structure.phase = "idle"
-                    self.structure.skipped = 0
+                    status_note = self._abort_stale_structure_check()
                     return
                 # Keyed by content: a result whose texts were edited meanwhile is
                 # stored under the old hashes and so never shown for the new text.
@@ -1236,16 +1258,14 @@ class DocumentRunController:
                 self.host.render_structure()
             if generation == self.structure_generation:
                 if self._structure_snapshot() != snapshot:
-                    self.structure.phase = "idle"
-                    self.structure.skipped = 0
+                    status_note = self._abort_stale_structure_check()
                     return
                 summary = structure.summary(self.structure_views())
                 if not items:
                     self.structure.phase = "done"
                     status_note = strings.MANUSCRIPT_L1_NONE
                 elif summary.checked == 0:
-                    self.structure.phase = "idle"
-                    self.structure.skipped = 0
+                    status_note = self._abort_stale_structure_check()
                 elif summary.findings + summary.omitted == 0:
                     self.structure.phase = "done"
                     status_note = strings.MANUSCRIPT_L1_CLEAN.format(checked=summary.checked)
@@ -1258,15 +1278,19 @@ class DocumentRunController:
                     )
         except ClientError as exc:
             if generation == self.structure_generation:
-                self.structure.phase = "failed"
-                self.structure.error = (exc.message, exc.request_id)
-                status_note = strings.MANUSCRIPT_L1_FAILED.format(reason=exc.message)
+                if self._structure_snapshot() != snapshot:
+                    status_note = self._abort_stale_structure_check()
+                else:
+                    self.structure.phase = "failed"
+                    self.structure.error = (exc.message, exc.request_id)
+                    status_note = strings.MANUSCRIPT_L1_FAILED.format(reason=exc.message)
         except asyncio.CancelledError:
             if generation == self.structure_generation:
                 self.structure.phase = "idle"
         finally:
             if generation == self.structure_generation:
                 self.structure_task = None
+                self._structure_progress_status = None
                 self.host.render_structure()
                 if status_note is not None:
                     mismatched = sum(1 for p in self.current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT)
@@ -2042,6 +2066,8 @@ class DocumentRunController:
                     pairs=pairs,
                 )
                 self.host.report_status(summary_text)
+                if l1_started:
+                    self.note_structure_progress(summary_text)
                 self._translation_ui()
                 return
             pair = remaining[0]
@@ -2326,6 +2352,8 @@ class DocumentRunController:
                 pairs=pairs,
             )
             self.host.report_status(summary_text)
+            if l1_started:
+                self.note_structure_progress(summary_text)
         self.host.refresh_segments_if_shown()
 
     def translation_done(self, run: Translation) -> None:

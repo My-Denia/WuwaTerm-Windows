@@ -984,3 +984,132 @@ def test_undoing_fill_during_inflight_layer_one_does_not_report_zero_checked(qap
             view.close()
 
     asyncio.run(scenario())
+
+
+def test_editing_during_inflight_layer_one_clears_running_status_when_stale_response_returns(qapp, memory) -> None:
+    async def scenario() -> None:
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        l1_started = asyncio.Event()
+        release_l1 = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_started.set()
+                await release_l1.wait()
+                return httpx.Response(200, json={
+                    "request_id": "l1-held",
+                    "check_version": "structure-check-v1",
+                    "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
+                    "segments": [
+                        {"index": i, "segment_id": seg["segment_id"], "findings": [], "omitted_findings": 0,
+                         "layout": {"source_paragraphs": 1, "target_paragraphs": 1,
+                                    "source_lines": 1, "target_lines": 1}}
+                        for i, seg in enumerate(body["segments"])
+                    ],
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION}}
+            install(view, source, target, alignments=alignments)
+            view._check_memory_reuse()
+            view._fill_from_memory()
+            assert "正在自动运行" in view.status_label.text()
+            await asyncio.wait_for(l1_started.wait(), timeout=2.0)
+
+            # Edit one character while Layer 1 is still in flight; the status bar still shows the progress text.
+            view.target_edit.textCursor().insertText("！")
+            view._refresh_derived()
+            assert "正在自动运行" in view.status_label.text()
+
+            task = view._controller.structure_task
+            release_l1.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=2.0)
+
+            assert view._controller.structure.phase == "idle"
+            assert "正在自动运行" not in view.status_label.text()
+            assert view.status_label.text() == strings.MANUSCRIPT_L1_NOT_RUN
+            assert strings.MANUSCRIPT_L1_NOT_RUN in view.l1_status.text()
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_undoing_fill_during_inflight_layer_one_503_keeps_undo_status(qapp, memory) -> None:
+    async def scenario() -> None:
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        l1_started = asyncio.Event()
+        release_l1 = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_started.set()
+                await release_l1.wait()
+                return httpx.Response(503, json={
+                    "error": {"code": "service_unavailable", "message": "Service unavailable"},
+                    "request_id": "l1-503",
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION}}
+            install(view, source, target, alignments=alignments)
+            view._check_memory_reuse()
+            view._fill_from_memory()
+            await asyncio.wait_for(l1_started.wait(), timeout=2.0)
+
+            view._undo_replace()
+            assert view._payload["target"] == target
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+
+            task = view._controller.structure_task
+            release_l1.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=2.0)
+
+            assert view._controller.structure.phase == "idle"
+            assert view._controller.structure.error is None
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())

@@ -834,6 +834,9 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def report_status(self, text: str) -> None:
         self._view.status_label.setText(text)
 
+    def current_status(self) -> str:
+        return self._view.status_label.text()
+
     def report_unstorable_report(self, code: str) -> None:
         self._view._conflict_mode = True
         self._view._refresh_conflicts()
@@ -2069,6 +2072,7 @@ class ManuscriptView(QWidget):
             return
         if self._controller.start_structure_check():
             self.status_label.setText(strings.MANUSCRIPT_L1_RUNNING)
+            self._controller.note_structure_progress(strings.MANUSCRIPT_L1_RUNNING)
 
     def _render_structure(self) -> None:
         """The Layer 1 card from the controller's session state. Results follow
@@ -5251,7 +5255,9 @@ class ManuscriptView(QWidget):
         self.tm_panel.clear_reuse()
         l1_started = self._controller.start_structure_check(restart=True) if self._api_client.is_configured else False
         if l1_started:
-            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=len(plan)))
+            progress = strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=len(plan))
+            self.status_label.setText(progress)
+            self._controller.note_structure_progress(progress)
         elif not self._api_client.is_configured:
             self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_OFFLINE.format(n=len(plan)))
         elif self._controller.structure_known_unavailable():
