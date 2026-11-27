@@ -28,6 +28,7 @@ from wuwaterm_client import document_edits as de
 from wuwaterm_client import segment_records as sr
 from wuwaterm_client import semantic, strings
 from wuwaterm_client import semantic_session as sessions
+from wuwaterm_client import translation_memory as tm
 from wuwaterm_client.manuscript import ReviewReport, empty_workfile
 from wuwaterm_client.segmentation import SEGMENT_LIMIT, segment_text
 from wuwaterm_client.errors import ClientError
@@ -1491,4 +1492,44 @@ def test_incremental_prefill_preserves_middle_segment_review_and_reports_honest_
         assert c3.last_tm_translation_summary["terms_db_revision"] == new_rev
         assert c3.last_tm_translation_summary["mismatched_segments"] == 1
         assert strings.MANUSCRIPT_TRANSLATE_TM_MISMATCH_NOTE.format(count=1) in host3.statuses[-1]
+    asyncio.run(scenario())
+
+
+def test_baseline_requests_with_blank_target_and_explicit_null_alignments(tmp_path) -> None:
+    async def scenario() -> None:
+        memory = tm.TranslationMemory(tmp_path / "tm.sqlite3")
+        s1, s2, s3 = "First line.", "Second line.", "Third line."
+        src = f"{s1}\n\n{s2}\n\n{s3}"
+        aligns = [
+            {"source": {"start": 0, "end": len(s1), "text": s1}, "target": None},
+            {"source": {"start": len(s1) + 2, "end": len(s1) + 2 + len(s2), "text": s2}, "target": None},
+            {"source": {"start": len(src) - len(s3), "end": len(src), "text": s3}, "target": None},
+        ]
+        rev = BASIS["dictionary"]["revision"]
+        memory.add(s2, "中段译文。", "en", prev_source=s1, next_source=s3,
+                   origin=tm.TM_ORIGIN_HUMAN, terms_db_revision=rev)
+
+        client = FakeClient(capabilities=())
+        host = StubHost()
+        draft = empty_workfile()
+        draft.update(source=src, target="", direction="en", alignments=aligns)
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = draft
+        controller.term_basis = dict(BASIS)
+
+        controller.start_translation()
+        await settle(controller)
+
+        summary = controller.last_tm_translation_summary
+        assert summary is not None
+        assert summary["reused_segments"] == 1
+        assert summary["translated_segments"] == 2
+        assert summary["baseline_requests"] == 1
+        assert summary["model_calls"] == 2
+        assert summary["requests_reduced"] is False
+        assert summary["saved_ratio"] == 0.0
+        assert len(client.translation_calls) == 2
+        assert "节省" not in host.statuses[-1]
+
     asyncio.run(scenario())

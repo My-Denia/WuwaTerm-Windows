@@ -1194,11 +1194,11 @@ class TranslationMemory:
 
         Freshness precedence:
         1. ``known_stale`` when any verified provenance dimension explicitly
-           mismatches (``terms_db_revision`` or ``game_version``).
-        2. ``provenance_unknown`` when no verified provenance mismatch occurred
-           but ``terms_db_revision`` is missing or ``game_version`` is one-sided.
-        3. ``known_stale`` for a numeric variant with verified provenance.
-        4. ``verified_fresh`` only when terms revision matches, game version is
+           mismatches (``terms_db_revision`` or ``game_version``) or when the
+           match is a numeric variant.
+        2. ``provenance_unknown`` when not known stale, and ``terms_db_revision``
+           is missing or ``game_version`` is one-sided.
+        3. ``verified_fresh`` only when terms revision matches, game version is
            both absent or equal, and the match is not a numeric variant.
 
         ``stale_reasons`` always preserves ``TM_STALE_PROVENANCE_UNKNOWN`` when
@@ -1219,12 +1219,10 @@ class TranslationMemory:
         has_unknown = terms_unknown or game_unknown
         if has_unknown:
             reasons.append(TM_STALE_PROVENANCE_UNKNOWN)
-        if terms_stale or game_stale:
+        if terms_stale or game_stale or numeric:
             freshness = TM_FRESHNESS_STALE
         elif has_unknown:
             freshness = TM_FRESHNESS_UNKNOWN
-        elif numeric:
-            freshness = TM_FRESHNESS_STALE
         else:
             freshness = TM_FRESHNESS_VERIFIED
         return TmMatch(

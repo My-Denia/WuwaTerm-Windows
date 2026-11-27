@@ -281,9 +281,9 @@ def test_numeric_variants_are_references_never_certified(store):
     assert match.numeric_changed is True and match.needs_recheck is True
     assert match.freshness == tm.TM_FRESHNESS_STALE
     assert match.stale_reasons == ("numeric_changed",)
-    # Without current provenance, numeric variant keeps numeric_changed and also marks provenance_unknown.
+    # Without current provenance, numeric variant still resolves freshness to stale while retaining provenance_unknown.
     (unknown_match,) = store.lookup_segment("攻击力提高 25%，持续 12 秒", "en")
-    assert unknown_match.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert unknown_match.freshness == tm.TM_FRESHNESS_STALE
     assert set(unknown_match.stale_reasons) == {"numeric_changed", "provenance_unknown"}
     assert unknown_match.needs_recheck is True
     # Text that differs outside a number is not a numeric variant.

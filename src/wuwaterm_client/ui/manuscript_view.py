@@ -5088,13 +5088,15 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.TM_PANEL_CONFIRM_TOO_LONG.format(
                 length=len(active.source), max=tm.SOURCE_SCALARS[1]))
             return
+        prev_source = None if (active.prev_unhashable or active.next_unhashable) else active.prev_source
+        next_source = None if (active.prev_unhashable or active.next_unhashable) else active.next_source
         try:
             entry = self._translation_memory.add(
                 active.source,
                 active.target,
                 active.direction,
-                prev_source=active.prev_source,
-                next_source=active.next_source,
+                prev_source=prev_source,
+                next_source=next_source,
                 origin=tm.TM_ORIGIN_HUMAN,
                 terms_db_revision=active.terms_db_revision,
                 game_version=active.game_version,

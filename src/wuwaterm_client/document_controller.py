@@ -1190,13 +1190,28 @@ class DocumentRunController:
         self.host.render_structure()
         return True
 
+    def _structure_snapshot(self) -> tuple[str, str, str, str, int]:
+        """Snapshot of manuscript content used to detect edits or undo mid-L1."""
+        return (
+            self.payload["source"],
+            self.payload["target"],
+            self.payload["direction"],
+            repr(self.payload["alignments"]),
+            self.document_revision,
+        )
+
     async def run_structure_check(self, generation: int) -> None:
         status_note: str | None = None
+        snapshot = self._structure_snapshot()
         try:
             if self.capabilities is None:
                 # Asked for now, when the owner pressed the button; never at startup.
                 self.capabilities = await self.api_client.get_capabilities()
                 if generation != self.structure_generation:
+                    return
+                if self._structure_snapshot() != snapshot:
+                    self.structure.phase = "idle"
+                    self.structure.skipped = 0
                     return
                 self.host.update_controls()
             if structure.CAPABILITY_STRUCTURE_CHECK not in self.capabilities:
@@ -1211,18 +1226,31 @@ class DocumentRunController:
                 response = await self.api_client.structure_check(body)
                 if generation != self.structure_generation:
                     return
+                if self._structure_snapshot() != snapshot:
+                    self.structure.phase = "idle"
+                    self.structure.skipped = 0
+                    return
                 # Keyed by content: a result whose texts were edited meanwhile is
                 # stored under the old hashes and so never shown for the new text.
                 structure.store(self.structure, body, response, keys)
                 self.host.render_structure()
             if generation == self.structure_generation:
-                self.structure.phase = "done"
+                if self._structure_snapshot() != snapshot:
+                    self.structure.phase = "idle"
+                    self.structure.skipped = 0
+                    return
                 summary = structure.summary(self.structure_views())
                 if not items:
+                    self.structure.phase = "done"
                     status_note = strings.MANUSCRIPT_L1_NONE
+                elif summary.checked == 0:
+                    self.structure.phase = "idle"
+                    self.structure.skipped = 0
                 elif summary.findings + summary.omitted == 0:
+                    self.structure.phase = "done"
                     status_note = strings.MANUSCRIPT_L1_CLEAN.format(checked=summary.checked)
                 else:
+                    self.structure.phase = "done"
                     status_note = strings.MANUSCRIPT_L1_SUMMARY.format(
                         checked=summary.checked,
                         segments=summary.with_findings,
@@ -1733,14 +1761,14 @@ class DocumentRunController:
         """How many ``translate()`` requests the original non-TM path would send."""
         payload = self.payload
         source, target = payload["source"], payload["target"]
+        if blank(target):
+            return self._count_translation_pieces(source)
         if payload["alignments"] is not None:
             return sum(
                 self._count_translation_pieces(source[p.source.core_start:p.source.core_end])
                 for p in self.current_pairs()
                 if p.status == STATUS_UNTRANSLATED
             )
-        if blank(target):
-            return self._count_translation_pieces(source)
         partial = self.resumable_partial_prefix()
         if partial is not None:
             return self._count_translation_pieces(partial[1])
