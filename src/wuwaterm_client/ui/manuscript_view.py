@@ -918,6 +918,20 @@ def _dictionary_matches_meta(dictionary: Mapping[str, Any], meta: MetaResult) ->
     )
 
 
+def _identity_matches_meta(identity: DictionaryIdentityResult, meta: MetaResult) -> bool:
+    """Whether the identity describes the dictionary state ``/v1/meta`` names.
+
+    The same three fields the review dictionary is checked against: the revision
+    is what this client trusts, but the tuple is what the other endpoint can say
+    about the same dictionary without one.
+    """
+    return (
+        identity.schema_version == meta.schema_version
+        and identity.source_commit == meta.source_commit
+        and identity.term_count == meta.term_count
+    )
+
+
 class ManuscriptView(QWidget):
     documentChanged = Signal()
     lookup_requested = Signal(str)
@@ -4968,6 +4982,16 @@ class ManuscriptView(QWidget):
             and not _dictionary_matches_meta(self._live_review_dictionary, meta)
         ):
             self._live_review_dictionary = None
+            changed = True
+        identity = self._service_dictionary
+        if identity is not None and not _identity_matches_meta(identity, meta):
+            # The fresh meta names a different dictionary state than the identity
+            # does: the identity describes the dictionary that was served before
+            # this refresh. Dropped here rather than kept until the identity is
+            # fetched again, because a 翻译 pressed in between would reuse
+            # entries confirmed under the previous dictionary. Unknown is the
+            # safe answer, and unknown reuses nothing.
+            self._service_dictionary = None
             changed = True
         if changed:
             self._refresh_tm_panel()

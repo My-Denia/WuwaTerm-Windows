@@ -2484,3 +2484,43 @@ def test_the_identity_wait_shows_cancel_and_cancelling_leaves_the_text_alone(qap
             view.close()
 
     asyncio.run(scenario())
+
+
+def test_a_meta_refresh_that_names_another_dictionary_drops_the_identity(qapp, memory) -> None:
+    """The dictionary can change between two refreshes.
+
+    A `/v1/meta` naming another term count or source commit describes a state
+    the cached identity no longer belongs to, and the replacement identity
+    arrives in its own request afterwards. Keeping the old one in between would
+    let a 翻译 pressed in that window reuse entries confirmed under the previous
+    dictionary - so the identity goes, and only the identity's own request may
+    put one back.
+    """
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        source, target, alignments = two_segments()
+        install(view, source, target, alignments=alignments)
+        identity = DictionaryIdentityResult(
+            revision=REVISION, schema_version="1", source_commit="a" * 40,
+            source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+        )
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0",
+        )))
+        view.set_service_dictionary(identity)
+        assert view._terms_db_revision() == REVISION
+
+        # Same dictionary state: the identity still describes it.
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0",
+        )))
+        assert view._terms_db_revision() == REVISION
+
+        # Another dictionary: the cached revision is not knowledge any more.
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="b" * 40, term_count=43, source_game_version="3.8.0",
+        )))
+        assert view._service_dictionary is None
+        assert view._terms_db_revision() is None
+    finally:
+        view.close()
