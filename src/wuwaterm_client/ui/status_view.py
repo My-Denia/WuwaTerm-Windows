@@ -323,8 +323,12 @@ class StatusView(QWidget):
         error they have already been told about above.
         """
         configured = self._api_client.is_configured
-        idle = self._task is None or self._task.done()
-        self.refresh_button.setEnabled(configured and idle)
+        busy_manual = (
+            self._task is not None
+            and not self._task.done()
+            and (not self._active_silent or self._pending_manual_feedback)
+        )
+        self.refresh_button.setEnabled(configured and not busy_manual)
         self.refresh_button.setToolTip(
             "" if configured else strings.TOOLTIP_NEEDS_ENDPOINT
         )
@@ -365,6 +369,7 @@ class StatusView(QWidget):
             if self._task is not None and not self._task.done():
                 if self._active_silent:
                     self._active_silent = False
+                    self.refresh_button.setEnabled(False)
                     self._banner.clear()
                     self._progress.start()
                     self.status_label.set_text(strings.STATUS_LOADING)
@@ -385,7 +390,7 @@ class StatusView(QWidget):
 
     async def _run_refresh(self, generation: int, *, silent: bool = False) -> None:
         self._active_silent = silent and not self._pending_manual_feedback
-        self.refresh_button.setEnabled(False)
+        self.refresh_button.setEnabled(self._active_silent and self._api_client.is_configured)
         if not self._active_silent:
             self._banner.clear()
             self._progress.start()

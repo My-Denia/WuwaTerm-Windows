@@ -101,6 +101,7 @@ class SettingsDialog(QDialog):
     """
 
     diagnosticsRequested = Signal()
+    credentialChanged = Signal(str)
 
     def __init__(
         self,
@@ -506,6 +507,7 @@ class SettingsDialog(QDialog):
         self.credential_modified = True
         self.credential_banner.clear()
         self._refresh_credential_status()
+        self.credentialChanged.emit(origin)
 
     def _on_forget_token_clicked(self) -> None:
         origin = self._credential_origin()
@@ -545,6 +547,7 @@ class SettingsDialog(QDialog):
             self.credential_modified = True
             self.credential_banner.clear()
             self._refresh_credential_status()
+            self.credentialChanged.emit(origin)
 
     def _on_accepted(self) -> None:
         """A saved address that cannot be used is worse than no change.

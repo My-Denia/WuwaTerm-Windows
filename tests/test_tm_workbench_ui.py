@@ -1833,13 +1833,15 @@ def test_status_view_manual_refresh_never_sticks_loading_when_silent_refresh_req
                 await asyncio.wait_for(view._task, timeout=2.0)
             assert view.status_label.text() == strings.STATUS_BAR_DONE
 
-            # Case 2: silent refresh promoted by manual click, then fails with 503.
+            # Case 2: silent refresh keeps refresh_button enabled, promoted by click(), then fails with 503.
             started.clear()
             release.clear()
             fail_next = True
             view.refresh_meta(silent=True)
             await asyncio.wait_for(started.wait(), timeout=2.0)
-            view._on_refresh_clicked()
+            assert view.refresh_button.isEnabled() is True
+            view.refresh_button.click()
+            assert view.refresh_button.isEnabled() is False
             assert view.status_label.text() == strings.STATUS_LOADING
             release.set()
             if view._task is not None:
@@ -1886,3 +1888,185 @@ def test_invalid_game_version_with_nul_or_surrogate_never_breaks_healthy_tm(qapp
             assert strings.TM_PANEL_CONFIRM_FAILED.split("{")[0] not in view.status_label.text()
     finally:
         view.close()
+
+
+def test_settings_dialog_credential_change_is_origin_scoped_and_immediate(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Changing/deleting a token in SettingsDialog emits credentialChanged(origin):
+    unrelated origins on Cancel must NOT interrupt active reviews/provenance, while
+    changing the active origin invalidates provenance & cancels reviews immediately."""
+    from PySide6.QtWidgets import QDialog, QMessageBox
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import (
+        main_window as main_window_module,
+        settings_dialog as settings_dialog_module,
+        status_view as status_view_module,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        tokens: dict[str, str] = {"https://a.example": "tok-a"}
+        next_token = "tok-b"
+
+        def _fake_has_token(origin=None):
+            return bool(origin and origin in tokens)
+
+        def _fake_read_token(origin=None):
+            return tokens.get(origin) if origin else None
+
+        def _fake_store_token(token, origin=None):
+            assert origin is not None
+            tokens[origin] = token
+
+        def _fake_delete_token(origin=None):
+            assert origin is not None
+            tokens.pop(origin, None)
+
+        monkeypatch.setattr(main_window_module, "has_token", _fake_has_token)
+        monkeypatch.setattr(main_window_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(status_view_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+        monkeypatch.setattr(settings_dialog_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(settings_dialog_module, "store_token", _fake_store_token)
+        monkeypatch.setattr(settings_dialog_module, "delete_token", _fake_delete_token)
+        monkeypatch.setattr(settings_dialog_module, "active_backend_name", lambda: "MemoryKeyring")
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        class _StubTokenDialog:
+            def __init__(self, parent=None):
+                pass
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+            def token(self):
+                return next_token
+
+            def show_store_error(self, _msg):
+                raise AssertionError("unexpected store error")
+
+        monkeypatch.setattr(settings_dialog_module, "TokenDialog", _StubTokenDialog)
+        monkeypatch.setattr(
+            settings_dialog_module.QMessageBox,
+            "exec",
+            lambda _self: QMessageBox.StandardButton.Yes,
+        )
+
+        review_started = asyncio.Event()
+        release_review = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            auth = request.headers.get("authorization", "")
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            if request.url.path == "/v1/meta":
+                gv = "3.7.0" if auth.endswith("tok-a") else "3.8.0"
+                return httpx.Response(200, json=_meta_payload(source_game_version=gv))
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if request.url.path == "/v1/reviews":
+                review_started.set()
+                await release_review.wait()
+                return httpx.Response(200, json=_review_response(
+                    body["source"], body["target"],
+                    source_commit="a" * 40, term_count=42, revision=REVISION,
+                ))
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient(
+            "https://a.example",
+            token_provider=lambda: tokens.get("https://a.example"),
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://a.example"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            live_dict = {
+                "revision": REVISION,
+                "source_commit": window._meta.source_commit,
+                "schema_version": window._meta.schema_version,
+                "term_count": window._meta.term_count,
+                "profile": window._meta.source_profile,
+            }
+            view._record_live_review_dictionary(live_dict)
+
+            # Start an in-flight review on active origin https://a.example.
+            view._start_review()
+            task_a = view._task
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+            gen_before = view._controller.generation
+
+            # 1. Edit & delete credential for another origin https://b.example, then Cancel.
+            def _other_origin_exec(dlg: settings_dialog_module.SettingsDialog) -> int:
+                nonlocal next_token
+                dlg.base_url_edit.setText("https://b.example")
+                next_token = "tok-b"
+                dlg._on_enter_token_clicked()
+                dlg._on_forget_token_clicked()
+                return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(settings_dialog_module.SettingsDialog, "exec", _other_origin_exec)
+            window._on_settings_clicked()
+
+            assert window.api_client.current_origin == "https://a.example"
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+            assert view._service_meta is not None
+            assert view._live_review_dictionary == live_dict
+            assert view._controller.generation == gen_before
+
+            release_review.set()
+            if task_a is not None:
+                await asyncio.wait_for(task_a, timeout=2.0)
+            assert view._controller.generation == gen_before
+
+            # 2. Change token for active origin https://a.example -> cancels BEFORE dialog closes!
+            review_started.clear()
+            release_review.clear()
+            view._start_review()
+            task_b = view._task
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+            gen_before_2 = view._controller.generation
+            seen_inside_exec: dict[str, object] = {}
+
+            def _same_origin_exec(dlg: settings_dialog_module.SettingsDialog) -> int:
+                nonlocal next_token
+                next_token = "tok-a2"
+                dlg._on_enter_token_clicked()
+                seen_inside_exec["meta_is_none"] = window._meta is None
+                seen_inside_exec["service_meta_is_none"] = view._service_meta is None
+                seen_inside_exec["live_dict_is_none"] = view._live_review_dictionary is None
+                seen_inside_exec["gen_bumped"] = view._controller.generation > gen_before_2
+                return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(settings_dialog_module.SettingsDialog, "exec", _same_origin_exec)
+            window._on_settings_clicked()
+
+            assert seen_inside_exec == {
+                "meta_is_none": True,
+                "service_meta_is_none": True,
+                "live_dict_is_none": True,
+                "gen_bumped": True,
+            }
+            assert tokens.get("https://a.example") == "tok-a2"
+
+            release_review.set()
+            if task_b is not None:
+                await asyncio.gather(task_b, return_exceptions=True)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window._meta is not None and window._meta.source_game_version == "3.8.0"
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())

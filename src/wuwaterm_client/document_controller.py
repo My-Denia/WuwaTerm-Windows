@@ -1696,32 +1696,14 @@ class DocumentRunController:
         getter = getattr(self.host, "tm_provenance", None)
         if callable(getter):
             return getter()
-        terms: str | None = None
+        if not isinstance(self.live_review_dictionary, dict):
+            return None, None
+        terms = tm.normalize_provenance_value(self.live_review_dictionary.get("revision"))
         game: str | None = None
-        if isinstance(self.live_review_dictionary, dict):
-            terms = tm.normalize_provenance_value(self.live_review_dictionary.get("revision"))
-            for key in ("game_version", "source_game_version"):
-                game = tm.normalize_provenance_value(self.live_review_dictionary.get(key))
-                if game is not None:
-                    break
-            return terms, game
-        sources: list[dict[str, Any]] = []
-        latest = self.latest_trusted()
-        if isinstance(latest, dict) and isinstance(latest.get("report"), dict):
-            sources.append(latest["report"])
-        if isinstance(self.term_basis, dict):
-            sources.append(self.term_basis)
-        for source in sources:
-            dictionary = source.get("dictionary")
-            if not isinstance(dictionary, dict):
-                continue
-            if terms is None:
-                terms = tm.normalize_provenance_value(dictionary.get("revision"))
-            if game is None:
-                for key in ("game_version", "source_game_version"):
-                    game = tm.normalize_provenance_value(dictionary.get(key))
-                    if game is not None:
-                        break
+        for key in ("game_version", "source_game_version"):
+            game = tm.normalize_provenance_value(self.live_review_dictionary.get(key))
+            if game is not None:
+                break
         return terms, game
 
     @staticmethod

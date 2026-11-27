@@ -278,6 +278,7 @@ class MainWindow(QMainWindow):
         self._meta = None
         self._closed = False
         self._auto_meta_requested = False
+        self._credential_changed_for_active_origin = False
         self._shortcut_sheet: ShortcutSheet | None = None
 
         central = QWidget(self)
@@ -631,6 +632,15 @@ class MainWindow(QMainWindow):
         if has_credential:
             self._schedule_silent_meta_refresh()
 
+    def _on_dialog_credential_changed(self, origin: str) -> None:
+        active_origin = self.api_client.current_origin
+        if active_origin is None or origin != active_origin:
+            return
+        self._credential_changed_for_active_origin = True
+        self.status_view.refresh_credential_state()
+        self._refresh_setup_card()
+        self._on_credential_changed(has_credential=self._has_service_credential())
+
     def _on_scroll_sync_toggled(self, enabled: bool) -> None:
         self.scroll_sync_button.blockSignals(True)
         self.scroll_sync_button.setChecked(enabled)
@@ -935,7 +945,9 @@ class MainWindow(QMainWindow):
     def _on_settings_clicked(self) -> None:
         had_credential = self._has_service_credential()
         token_before = self._current_service_token()
+        self._credential_changed_for_active_origin = False
         dialog = self._new_settings_dialog()
+        has_credential_signal = getattr(dialog, "credentialChanged", None) is not None
         applied_address_change = False
         if dialog.exec() == QDialog.DialogCode.Accepted:
             previous_base_url = self.config.base_url
@@ -946,12 +958,15 @@ class MainWindow(QMainWindow):
         # immediately, and Cancel does not undo that.
         self.status_view.refresh_credential_state()
         self._refresh_setup_card()
-        if not applied_address_change:
+        if not applied_address_change and not self._credential_changed_for_active_origin:
             has_credential_now = self._has_service_credential()
             token_after = self._current_service_token()
             token_changed = (
                 (token_before != token_after)
-                or bool(getattr(dialog, "credential_modified", False))
+                or (
+                    not has_credential_signal
+                    and bool(getattr(dialog, "credential_modified", False))
+                )
                 or (had_credential != has_credential_now)
                 or (not has_credential_now and self._meta is not None)
             )
@@ -975,6 +990,9 @@ class MainWindow(QMainWindow):
         signal = getattr(dialog, "diagnosticsRequested", None)
         if signal is not None:
             signal.connect(lambda: self.show_page(PAGE_STATUS))
+        credential_signal = getattr(dialog, "credentialChanged", None)
+        if credential_signal is not None:
+            credential_signal.connect(self._on_dialog_credential_changed)
         return dialog
 
     def _apply_settings(self, new_config: ClientConfig) -> None:
