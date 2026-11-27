@@ -45,6 +45,7 @@ from ..credentials import (
     credential_origin,
     has_token,
     migrate_legacy_token,
+    read_token,
     store_token,
 )
 _REAL_STORE_TOKEN = store_token
@@ -299,7 +300,7 @@ class MainWindow(QMainWindow):
         self.manuscript_view.documentOpened.connect(self._on_document_opened)
         # Only the debounced signal: documentChanged fires on every keystroke.
         self.manuscript_view.workbenchStatusChanged.connect(self._refresh_status_bar)
-        self.manuscript_view.serviceMetaStale.connect(self._on_service_meta_stale)
+        self.manuscript_view.serviceMetaRefreshRequested.connect(self._on_service_meta_refresh_requested)
         self.status_view.metaChanged.connect(self._on_meta_changed)
         sync = self.manuscript_view.scroll_sync
         self.scroll_sync_button.setChecked(sync.is_enabled())
@@ -602,16 +603,33 @@ class MainWindow(QMainWindow):
         self._auto_meta_requested = True
         self.status_view.refresh_meta(silent=True)
 
+    def _current_service_token(self) -> str | None:
+        if not self.api_client.is_configured:
+            return None
+        try:
+            return call_with_origin(read_token, origin=self.config.base_url)
+        except CredentialStoreUnavailable:
+            return None
+
     def _on_meta_changed(self, meta) -> None:
         self._meta = meta
         self.manuscript_view.set_service_meta(meta)
         self._refresh_status_bar()
 
-    def _on_service_meta_stale(self) -> None:
+    def _on_service_meta_refresh_requested(self) -> None:
+        # Non-destructive: retain known _meta / _service_meta until a fresh
+        # GET /v1/meta succeeds.
+        if self._has_service_credential():
+            self._schedule_silent_meta_refresh()
+
+    def _on_credential_changed(self, *, has_credential: bool) -> None:
+        self._auto_meta_requested = False
         self._meta = None
         self.status_view.clear_stale_meta()
+        self.manuscript_view.reset_for_credential_change()
         self._refresh_status_bar()
-        self._schedule_silent_meta_refresh()
+        if has_credential:
+            self._schedule_silent_meta_refresh()
 
     def _on_scroll_sync_toggled(self, enabled: bool) -> None:
         self.scroll_sync_button.blockSignals(True)
@@ -861,8 +879,7 @@ class MainWindow(QMainWindow):
         # The status area reports whether a credential is stored; it read that
         # when it was built, which was before this.
         self.status_view.refresh_credential_state()
-        if self._meta is None and self._has_service_credential():
-            self._schedule_silent_meta_refresh()
+        self._on_credential_changed(has_credential=self._has_service_credential())
 
     def _show_refusal(self, exc: ClientError) -> None:
         """Report an address the transport would not take.
@@ -917,6 +934,7 @@ class MainWindow(QMainWindow):
 
     def _on_settings_clicked(self) -> None:
         had_credential = self._has_service_credential()
+        token_before = self._current_service_token()
         dialog = self._new_settings_dialog()
         applied_address_change = False
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -930,14 +948,16 @@ class MainWindow(QMainWindow):
         self._refresh_setup_card()
         if not applied_address_change:
             has_credential_now = self._has_service_credential()
-            if not has_credential_now and (had_credential or self._meta is not None):
-                self._meta = None
-                self.status_view.clear_stale_meta()
-                self.manuscript_view.set_service_meta(None)
-                self._refresh_status_bar()
-            elif (not had_credential and has_credential_now) or (
-                has_credential_now and self._meta is None and not self._auto_meta_requested
-            ):
+            token_after = self._current_service_token()
+            token_changed = (
+                (token_before != token_after)
+                or bool(getattr(dialog, "credential_modified", False))
+                or (had_credential != has_credential_now)
+                or (not has_credential_now and self._meta is not None)
+            )
+            if token_changed:
+                self._on_credential_changed(has_credential=has_credential_now)
+            elif has_credential_now and self._meta is None and not self._auto_meta_requested:
                 self._schedule_silent_meta_refresh()
 
     def _new_settings_dialog(self) -> QDialog:
@@ -1083,7 +1103,6 @@ class MainWindow(QMainWindow):
             # checklist would keep showing step two unfinished.
             self.status_view.refresh_credential_state()
             self._refresh_setup_card()
-            if self._meta is None and self._has_service_credential():
-                self._schedule_silent_meta_refresh()
+            self._on_credential_changed(has_credential=self._has_service_credential())
             return True
         return False

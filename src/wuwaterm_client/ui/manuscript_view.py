@@ -901,12 +901,7 @@ class _WorkbenchHostAdapter(WorkbenchHost):
 
 
 def _normalized_game_version(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    cleaned = value.strip()
-    if not cleaned or cleaned.lower() == "unavailable" or len(cleaned) > tm.REVISION_SCALARS[1]:
-        return None
-    return cleaned
+    return tm.normalize_provenance_value(value)
 
 
 def _dictionary_matches_meta(dictionary: Mapping[str, Any], meta: MetaResult) -> bool:
@@ -933,8 +928,9 @@ class ManuscriptView(QWidget):
     # The status bar's facts (counts, the caret's segment, the dictionary)
     # changed; sent at most once per caret or typing pause.
     workbenchStatusChanged = Signal()
-    # A newer live /v1/reviews response disagreed with the cached /v1/meta snapshot.
-    serviceMetaStale = Signal()
+    # A live /v1/reviews response disagreed with the cached /v1/meta snapshot;
+    # MainWindow triggers a non-destructive silent refresh while keeping known meta.
+    serviceMetaRefreshRequested = Signal()
 
     def __init__(
         self,
@@ -4970,16 +4966,33 @@ class ManuscriptView(QWidget):
         if not isinstance(dictionary, Mapping):
             return
         recorded = copy.deepcopy(dict(dictionary))
-        self._live_review_dictionary = recorded
         if (
             self._service_meta is not None
             and not _dictionary_matches_meta(recorded, self._service_meta)
         ):
-            # The live review response proved the cached /v1/meta snapshot is stale.
-            self._service_meta = None
-            self.serviceMetaStale.emit()
+            # Do not discard or downgrade known _service_meta and do not adopt
+            # a stale/conflicting review dictionary; trigger a non-destructive
+            # silent /v1/meta check while keeping auto reuse paused.
+            self._live_review_dictionary = None
+            self.serviceMetaRefreshRequested.emit()
+            self._refresh_tm_panel()
+            self.workbenchStatusChanged.emit()
+            return
+        self._live_review_dictionary = recorded
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
+
+    def reset_for_credential_change(self) -> None:
+        """Clear live service provenance and advance both review generations so
+        in-flight requests issued under the previous credential cannot commit."""
+        self._service_meta = None
+        self._live_review_dictionary = None
+        self._controller.invalidate_provenance_for_credential_change()
+        if self._review_state == "reviewing":
+            self._set_review_state("stopped")
+        self._refresh_tm_panel()
+        self.workbenchStatusChanged.emit()
+        self._update_controls()
 
     def _terms_db_revision(self) -> str | None:
         """The verified live dictionary revision from this session's ``/v1/reviews``,
@@ -4993,10 +5006,7 @@ class ManuscriptView(QWidget):
             return None
         if self._service_meta is not None and not _dictionary_matches_meta(dictionary, self._service_meta):
             return None
-        revision = dictionary.get("revision")
-        if isinstance(revision, str) and revision.strip() and len(revision) <= tm.REVISION_SCALARS[1]:
-            return revision
-        return None
+        return tm.normalize_provenance_value(dictionary.get("revision"))
 
     def _game_version(self) -> str | None:
         """The live game version from ``/v1/meta`` (preferred), or explicit

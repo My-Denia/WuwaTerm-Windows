@@ -112,6 +112,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle(strings.SETTINGS_TITLE)
         self._config = config
         self._validator = validator
+        self.credential_modified = False
 
         title = QLabel(strings.SETTINGS_TITLE, self)
         title.setObjectName("pageTitle")
@@ -502,6 +503,7 @@ class SettingsDialog(QDialog):
                 dialog.show_store_error(strings.CREDENTIAL_STORE_ERROR_MESSAGE)
                 continue
             break
+        self.credential_modified = True
         self.credential_banner.clear()
         self._refresh_credential_status()
 
@@ -540,6 +542,7 @@ class SettingsDialog(QDialog):
                     strings.CREDENTIAL_STORE_FORGET_ERROR_MESSAGE, SEVERITY_DANGER
                 )
                 return
+            self.credential_modified = True
             self.credential_banner.clear()
             self._refresh_credential_status()
 

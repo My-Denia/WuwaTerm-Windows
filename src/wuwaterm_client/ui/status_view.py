@@ -102,6 +102,11 @@ class StatusView(QWidget):
         # only that warning: `_show_meta` must not become a second place where
         # an unrelated message is silently swept off the screen.
         self._api_version_warned = False
+        # Tracks whether the user explicitly requested visible progress/result
+        # feedback for the current or upcoming refresh (so a silent refresh
+        # never leaves the view stuck on STATUS_LOADING).
+        self._pending_manual_feedback = False
+        self._active_silent = True
 
         self.service_version_value = QLabel(strings.STATUS_UNKNOWN_VALUE, self)
         self.data_profile_value = QLabel(strings.STATUS_UNKNOWN_VALUE, self)
@@ -243,6 +248,8 @@ class StatusView(QWidget):
         self.status_label.clear()
         self._banner.clear()
         self._api_version_warned = False
+        self._pending_manual_feedback = False
+        self._active_silent = True
         self._progress.stop()
         self._has_data = False
         self._endpoint_changed = True
@@ -251,8 +258,8 @@ class StatusView(QWidget):
         self.metaChanged.emit(None)
 
     def clear_stale_meta(self) -> None:
-        """Clear a cached meta snapshot on the same endpoint when a live review
-        proves the service has moved on."""
+        """Clear a cached meta snapshot on the same endpoint when credentials
+        change or are removed."""
         self._generation += 1
         if self._task is not None and not self._task.done():
             self._task.cancel()
@@ -265,9 +272,13 @@ class StatusView(QWidget):
             self.model_configured_value,
         ):
             value_label.setText(strings.STATUS_UNKNOWN_VALUE)
+        if self.status_label.text() == strings.STATUS_LOADING:
+            self.status_label.clear()
         if self._api_version_warned:
             self._banner.clear()
             self._api_version_warned = False
+        self._pending_manual_feedback = False
+        self._active_silent = True
         self._progress.stop()
         self._has_data = False
         self._apply_empty_state()
@@ -348,10 +359,20 @@ class StatusView(QWidget):
 
     def refresh_meta(self, *, silent: bool = False) -> None:
         """Fetch service metadata. When ``silent`` is True, keep quiet on failure
-        and do not show loading banners."""
-        if self._task is not None and not self._task.done():
+        and do not show loading banners unless a manual refresh is already active."""
+        if not silent:
+            self._pending_manual_feedback = True
+            if self._task is not None and not self._task.done():
+                if self._active_silent:
+                    self._active_silent = False
+                    self._banner.clear()
+                    self._progress.start()
+                    self.status_label.set_text(strings.STATUS_LOADING)
+                return
+        elif self._task is not None and not self._task.done():
             return
         if not self._api_client.is_configured:
+            self._pending_manual_feedback = False
             return
         self._generation += 1
         self._task = asyncio.ensure_future(self._run_refresh(self._generation, silent=silent))
@@ -363,8 +384,9 @@ class StatusView(QWidget):
         self.refresh_meta(silent=False)
 
     async def _run_refresh(self, generation: int, *, silent: bool = False) -> None:
+        self._active_silent = silent and not self._pending_manual_feedback
         self.refresh_button.setEnabled(False)
-        if not silent:
+        if not self._active_silent:
             self._banner.clear()
             self._progress.start()
             self.status_label.set_text(strings.STATUS_LOADING)
@@ -376,16 +398,22 @@ class StatusView(QWidget):
             # say, including about its own failure.
             if generation != self._generation:
                 return
-            if not silent:
+            if not self._active_silent:
                 self._show_error(exc)
+            elif self.status_label.text() == strings.STATUS_LOADING:
+                self.status_label.clear()
         else:
             if generation != self._generation:
                 return
             self._show_meta(meta)
-            if not silent:
+            if not self._active_silent:
                 self.status_label.set_text(strings.STATUS_BAR_DONE)
+            elif self.status_label.text() == strings.STATUS_LOADING:
+                self.status_label.clear()
         finally:
             if generation == self._generation:
+                self._pending_manual_feedback = False
+                self._active_silent = True
                 self._progress.stop()
                 self._task = None
                 self._refresh_credential_labels()

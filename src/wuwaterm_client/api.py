@@ -36,6 +36,7 @@ from .errors import (
 from . import structure
 from .manuscript import REVIEW_FEATURE_AMBIGUOUS_MENTION, ReviewReport, valid_report
 from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
+from .translation_memory import normalize_provenance_value
 
 TokenProvider = Callable[..., "str | None"]
 
@@ -126,10 +127,7 @@ def _normalize_optional_meta_version(value: Any, field: str) -> "str | None":
     text = _as_optional_str(value, field)
     if text is None:
         return None
-    cleaned = text.strip()
-    if not cleaned or cleaned.lower() == "unavailable":
-        return None
-    return cleaned
+    return normalize_provenance_value(text)
 
 
 # -- Response models (direct pass-through of the wire schema) --------------

@@ -365,6 +365,9 @@ def test_get_meta_keeps_known_fields_when_the_server_adds_fields() -> None:
         ("   ", None),
         ("unavailable", None),
         ("Unavailable", None),
+        ("3.7.0\x00", None),
+        ("3.7.\ud800", None),
+        ("g" * 129, None),
     ],
 )
 def test_meta_result_parses_and_normalizes_source_game_version(raw_value, expected) -> None:

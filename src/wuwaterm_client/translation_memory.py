@@ -302,6 +302,23 @@ def _optional_string(value: object, path: str, bounds: tuple[int, int]) -> str |
     return None if value is None else _bounded_string(value, path, bounds)
 
 
+def normalize_provenance_value(value: object) -> str | None:
+    """Normalize an optional provenance scalar (terms revision or game version).
+
+    Returns ``None`` for non-strings, blank or ``"unavailable"`` values, values
+    containing NUL or lone UTF-16 surrogates, or values exceeding
+    ``REVISION_SCALARS[1]`` scalars so untrusted metadata never breaks a healthy TM.
+    """
+    if not isinstance(value, str):
+        return None
+    if "\u0000" in value or _has_lone_surrogate(value):
+        return None
+    cleaned = value.strip()
+    if not cleaned or cleaned.lower() == "unavailable" or len(cleaned) > REVISION_SCALARS[1]:
+        return None
+    return cleaned
+
+
 def _hash_or_none(value: object, path: str) -> str | None:
     if value is None:
         return None
