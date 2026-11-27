@@ -5,11 +5,11 @@ pairs and imports and exports ``wuwaterm-tm-v1`` files. Every change is saved
 to the local SQLite file before the list shows it.
 
 The dialog reads and writes nothing but the memory file and the files the
-person picks, and it calls no service. It is deliberately not wired into a view
-yet; the manuscript pass that uses the store is a separate change. Nothing here
-is machine translation: only confirmed pairs are stored, a match is a
-reference, and provenance (terms revision, game version, use count) is shown
-next to it rather than folded into it.
+person picks, and it calls no service. The workbench reads the same store for
+the segment at the caret (``tm_panel``); this is the manager for every entry.
+Nothing here is machine translation: only confirmed pairs are stored, a match
+is a reference, and provenance (terms revision, game version, use count) is
+shown next to it rather than folded into it.
 """
 
 from __future__ import annotations

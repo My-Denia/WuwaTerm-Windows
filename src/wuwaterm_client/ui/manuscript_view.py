@@ -32,6 +32,7 @@ from .. import markdown_report as mdr
 from .. import segment_records as sr
 from .. import semantic, strings
 from .. import structure as l1
+from .. import translation_memory as tm
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .error_presentation import SEVERITY_INFO, SEVERITY_WARN
 from .. import semantic_session as sessions
@@ -42,7 +43,7 @@ from ..document_controller import (
 from ..document_edits import (
     NOTICE_ALL, NOTICE_PARTIAL, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM,
     REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome, copy_payload as _copy_payload,
-    normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_splice,
+    normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_for_target_fill, remap_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
@@ -50,13 +51,17 @@ from ..manuscript import (
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..search_replace import SearchReplaceController
-from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
+from ..segmentation import (
+    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
+)
 from ..termbase import TermbaseStore
 from . import review_states
 from .components import Banner, ChevronComboBox
 from .icons import icon
 from .scroll_sync import ScrollSync
 from .termbase_dialog import MyTermsPanel, TermbaseDialog
+from .tm_dialog import TranslationMemoryDialog, refusal_text as tm_refusal_text
+from .tm_panel import ActiveSegment, ReuseSummary, TranslationMemoryPanel, stale_labels
 
 # Precedents (the owner's earlier choices in this manuscript) go with both
 # translation and semantic review by default, as on the Web, because the
@@ -892,6 +897,7 @@ class ManuscriptView(QWidget):
         *,
         recovery_path: Path | None = None,
         termbase_store: TermbaseStore | None = None,
+        translation_memory: tm.TranslationMemory | None = None,
     ) -> None:
         super().__init__(parent)
         self._recovery_path = recovery_path
@@ -899,10 +905,22 @@ class ManuscriptView(QWidget):
         # source text on screen and never reaches a request, a review or a
         # manuscript file.
         self._termbase_store = termbase_store if termbase_store is not None else TermbaseStore()
+        # Confirmed translations, read for the segment at the caret. None means
+        # this workbench was opened without one: the panel then says so and
+        # nothing is read or written. It reaches no request and no file either,
+        # and only the person's own confirmation puts text into it.
+        self._translation_memory = translation_memory
+        self._tm_fill_plan: list[tuple[int, int, str, int, int]] = []
         self._my_terms_timer = QTimer(self)
         self._my_terms_timer.setSingleShot(True)
         self._my_terms_timer.setInterval(300)
         self._my_terms_timer.timeout.connect(self._refresh_my_terms)
+        # The memory lookup wakes on the same pause as the terms: a caret only
+        # passing through a segment does not query it.
+        self._tm_timer = QTimer(self)
+        self._tm_timer.setSingleShot(True)
+        self._tm_timer.setInterval(300)
+        self._tm_timer.timeout.connect(self._refresh_tm_panel)
         self._recovery_pending = False
         self._recovery_timer = QTimer(self)
         self._recovery_timer.setSingleShot(True)
@@ -1274,6 +1292,16 @@ class ManuscriptView(QWidget):
         self.my_terms.manage_requested.connect(self.show_termbase_dialog)
         details.addWidget(self.my_terms)
         self._refresh_my_terms()
+        # Confirmed translations for the segment at the caret: beside the terms,
+        # because both are references read from local files while translating.
+        self.tm_panel = TranslationMemoryPanel(self._translation_memory, inspector_body)
+        self.tm_panel.manage_requested.connect(self.show_tm_dialog)
+        self.tm_panel.apply_requested.connect(self._apply_tm_match)
+        self.tm_panel.confirm_requested.connect(self._confirm_segment_to_memory)
+        self.tm_panel.check_requested.connect(self._check_memory_reuse)
+        self.tm_panel.fill_requested.connect(self._fill_from_memory)
+        details.addWidget(self.tm_panel)
+        self._refresh_tm_panel()
         details.addWidget(self.layers_card)
         tracks = QHBoxLayout()
         tracks.setSpacing(4)
@@ -2252,6 +2280,9 @@ class ManuscriptView(QWidget):
                 self._highlight_segment_row(pairs, self._pair_index_at(pairs, side, offset))
             self._highlight_finding_at(side, offset)
             self._highlight_issue_at(side, offset)
+            # The memory panel is not a row of the segment list: when the terms
+            # track is the one showing, nothing above would refresh it.
+            self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
 
     def _highlight_segment_row(self, pairs: list, index: int) -> None:
@@ -3096,6 +3127,10 @@ class ManuscriptView(QWidget):
         self._render_segment_choices(pair.index if record is not None else None)
         self._update_segment_actions()
         self._render_translate_offer()
+        # The memory lists what is confirmed for this segment, so it follows the
+        # same event as the segment details. A read of a local file: cheap, and
+        # nothing is written.
+        self._refresh_tm_panel()
 
     def _render_segment_choices(self, index: int | None) -> None:
         """The segment's choices, then history choices that can come back to it.
@@ -4168,6 +4203,9 @@ class ManuscriptView(QWidget):
         # The status bar's counts follow on the next pause, not every keystroke.
         self._caret_timer.start()
         self._my_terms_timer.start()
+        self._tm_timer.start()
+        # An earlier reuse count described text this edit just replaced.
+        self._tm_fill_plan = []
 
     def _alignment_notice_text(self, outcome: EditOutcome) -> str:
         """What an edit did to the explicit alignments, in the workbench's words.
@@ -4468,6 +4506,9 @@ class ManuscriptView(QWidget):
         elif quiet and row < 0:
             row = self._quiet_row
         self._report = report
+        # A report is where the dictionary revision comes from: the memory's
+        # staleness reading follows it, without waiting for the next caret stop.
+        self._refresh_tm_panel()
         self._finding_refs = list(refs or [])
         self._finding_recheck = list(recheck or [False] * len(report["findings"]))
         self._finding_saved = list(saved or [False] * len(report["findings"]))
@@ -4793,6 +4834,8 @@ class ManuscriptView(QWidget):
         # The status bar's counts follow a replaced text after the same pause.
         self._caret_timer.start()
         self._my_terms_timer.start()
+        self._tm_timer.start()
+        self._tm_fill_plan = []
 
     def _refresh_my_terms(self) -> None:
         """The person's own terms found in the source text now on screen."""
@@ -4822,6 +4865,336 @@ class ManuscriptView(QWidget):
         dialog.changed.connect(self._refresh_my_terms)
         dialog.exec()
         self._refresh_my_terms()
+
+    # -- translation memory (confirmed pairs, a reference) --------------------
+    def show_tm_dialog(self, _checked: bool = False) -> None:
+        """Manage the confirmed pairs; the listed candidates follow every change."""
+        memory = self._translation_memory
+        if memory is None:
+            self.status_label.setText(strings.TM_PANEL_NO_MEMORY)
+            return
+        dialog = TranslationMemoryDialog(memory, self)
+        dialog.changed.connect(self._refresh_tm_panel)
+        dialog.exec()
+        self._refresh_tm_panel()
+
+    def _terms_db_revision(self) -> str | None:
+        """The dictionary revision the open document's review named, if any.
+
+        It is the only revision this client can know: the memory compares an
+        entry's recorded revision with it, and an entry that cannot say which
+        dictionary it was confirmed under is listed as a reference.
+        """
+        # A document report names it; a long manuscript keeps the basis per
+        # record, and the controller's common basis is the same fact for the
+        # dictionary. Either is the revision to compare an entry with.
+        for source in (self._report, self._term_basis):
+            if not isinstance(source, dict):
+                continue
+            dictionary = source.get("dictionary")
+            revision = dictionary.get("revision") if isinstance(dictionary, dict) else None
+            if isinstance(revision, str) and revision:
+                return revision
+        return None
+
+    def _active_segment_pair(self):
+        """The segment the memory is read for: the selected row, else the caret's."""
+        pairs = self._current_pairs()
+        if not pairs:
+            return None
+        pair = self._current_segment()
+        if pair is not None:
+            return pair
+        side = self._caret_side
+        return pairs[self._pair_index_at(pairs, side, self._caret_offset(side))]
+
+    @staticmethod
+    def _memory_text(text: str) -> str | None:
+        """A text the store can hold, or None where it cannot.
+
+        The store refuses a blank value and one longer than ``SOURCE_SCALARS``;
+        such a neighbour is no context it can hash, which is what None means
+        here. Passing the text anyway would raise a refused-value error, and the
+        workbench would report the memory file as broken.
+        """
+        return text if text.strip() and len(text) <= tm.SOURCE_SCALARS[1] else None
+
+    def _active_segment_context(self) -> ActiveSegment | None:
+        """The active segment's texts and neighbours, as the memory wants them."""
+        pair = self._active_segment_pair()
+        if pair is None:
+            return None
+        pairs = self._current_pairs()
+        source, target = self._payload["source"], self._payload["target"]
+        index = pair.index
+
+        def core(text: str, region) -> str:
+            return text[region.core_start:region.core_end]
+
+        def neighbour(position: int) -> str | None:
+            if not 0 <= position < len(pairs):
+                return None
+            return self._memory_text(core(source, pairs[position].source))
+
+        return ActiveSegment(
+            source=core(source, pair.source),
+            target=core(target, pair.target),
+            direction=self._payload["direction"],
+            prev_source=neighbour(index - 1),
+            next_source=neighbour(index + 1),
+            terms_db_revision=self._terms_db_revision(),
+        )
+
+    def _refresh_tm_panel(self) -> None:
+        """Re-read the memory for the active segment. Reads only."""
+        self._tm_timer.stop()
+        # A fill plan belongs to the text it counted; a refresh is a new reading.
+        self._tm_fill_plan = []
+        self.tm_panel.set_context(self._active_segment_context())
+
+    def _memory_problem(self) -> str | None:
+        """Why the memory cannot be written to, in the workbench's words."""
+        memory = self._translation_memory
+        if memory is None:
+            return strings.TM_PANEL_NO_MEMORY
+        if not memory.usable:
+            return strings.TM_PANEL_UNUSABLE.format(reason=tm_refusal_text(memory.error))
+        return None
+
+    def _apply_tm_match(self, match) -> None:
+        """Adopt one confirmed candidate into the active segment's target.
+
+        One edit and one history step: Ctrl+Z puts the previous translation
+        back, including the alignments the edit moved. A candidate that only
+        references (its numbers changed, or it was confirmed under another
+        dictionary) is still the person's choice; the status line says what
+        the memory warned about it.
+        """
+        if not self._input_ready():
+            return
+        problem = self._memory_problem()
+        if problem is not None:
+            self.status_label.setText(problem)
+            return
+        pair = self._active_segment_pair()
+        if pair is None:
+            self.status_label.setText(strings.TM_PANEL_APPLY_NO_SEGMENT)
+            return
+        text = match.entry.target_text
+        raw = self._payload["target"]
+        start, end = pair.target.core_start, pair.target.core_end
+        if start == end:
+            # An untranslated segment: this is a fill, and a fill is what tells
+            # the alignment which entry it completes (remap_for_target_fill). A
+            # plain splice here would leave that entry's target empty and the
+            # segment would come back as needing a manual split.
+            left = "\n\n" if start > 0 and raw[start - 1] not in WHITESPACE else ""
+            right = "\n\n" if start < len(raw) and raw[start] not in WHITESPACE else ""
+            inserted = left + text + right
+            changed = raw[:start] + inserted + raw[start:]
+            fill_start = start + len(left)
+            remap = remap_for_target_fill(self._payload["alignments"], self._payload["source"], changed,
+                                          pair.source.start, pair.source.end, start,
+                                          fill_start, fill_start + len(text), len(inserted))
+            edit = ("target", start, start, len(inserted))
+        else:
+            changed = raw[:start] + text + raw[end:]
+            remap = remap_splice(self._payload["alignments"], "target", self._payload["source"], changed,
+                                 start, end, len(text))
+            edit = ("target", start, end, len(text))
+        if not self.target_edit.can_display(changed):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        value = self._draft_snapshot()
+        value["target"] = changed
+        value["alignments"] = remap.alignments
+        self._apply_edit(value, edits=[edit], remap=remap)
+        if match.needs_recheck:
+            self.status_label.setText(strings.TM_PANEL_APPLIED_RECHECK.format(
+                reasons="、".join(stale_labels(match.stale_reasons))))
+        else:
+            self.status_label.setText(strings.TM_PANEL_APPLIED)
+        self._update_controls()
+
+    def _confirm_segment_to_memory(self) -> None:
+        """Record the active segment as a confirmed pair, because the person said so.
+
+        This is the only path from the workbench into the memory: a finished
+        translation, a review verdict or an accepted suggestion never writes
+        one, so unconfirmed machine output cannot become a trusted pair.
+        """
+        if not self._input_ready():
+            return
+        problem = self._memory_problem()
+        if problem is not None:
+            self.status_label.setText(problem)
+            return
+        active = self._active_segment_context()
+        if active is None:
+            self.status_label.setText(strings.TM_PANEL_CONFIRM_NO_SEGMENT)
+            return
+        if not active.source.strip() or not active.target.strip():
+            self.status_label.setText(strings.TM_PANEL_CONFIRM_EMPTY)
+            return
+        if len(active.source) > tm.SOURCE_SCALARS[1]:
+            self.status_label.setText(strings.TM_PANEL_CONFIRM_TOO_LONG.format(
+                length=len(active.source), max=tm.SOURCE_SCALARS[1]))
+            return
+        try:
+            entry = self._translation_memory.add(
+                active.source,
+                active.target,
+                active.direction,
+                prev_source=active.prev_source,
+                next_source=active.next_source,
+                origin=tm.TM_ORIGIN_HUMAN,
+                terms_db_revision=active.terms_db_revision,
+            )
+        except (tm.TmError, OSError) as error:
+            self.status_label.setText(strings.TM_PANEL_CONFIRM_FAILED.format(reason=tm_refusal_text(error)))
+            self._refresh_tm_panel()
+            return
+        self._refresh_tm_panel()
+        self.status_label.setText(strings.TM_PANEL_CONFIRMED.format(count=entry.use_count))
+
+    def _classify_reuse(self, sources: list[str]) -> list[tm.TmSegmentClassification | None]:
+        """Classify the segments the store can hold, keeping each one's neighbours.
+
+        ``classify_segments_for_tm`` refuses a blank or over-long source (a value
+        it cannot store, which is not a broken file), so those segments are
+        skipped and the rest are classified in runs. Each run is given its
+        neighbours explicitly: a skipped neighbour cannot be hashed by the store
+        either, so it is passed as none - the truth about the context - instead
+        of the text that would be refused.
+        """
+        def readable(text: str) -> bool:
+            return self._memory_text(text) is not None
+
+        def neighbour(index: int) -> str | None:
+            return self._memory_text(sources[index]) if 0 <= index < len(sources) else None
+
+        classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
+        run: list[int] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            items = [{"source": sources[index], "prev_source": neighbour(index - 1),
+                      "next_source": neighbour(index + 1)} for index in run]
+            found = self._translation_memory.classify_segments_for_tm(
+                items, self._payload["direction"], current_terms_db_revision=self._terms_db_revision())
+            for index, item in zip(run, found):
+                classes[index] = item
+            run.clear()
+
+        for position, text in enumerate(sources):
+            if readable(text):
+                run.append(position)
+            else:
+                flush()
+        flush()
+        return classes
+
+    def _check_memory_reuse(self) -> None:
+        """Count what the memory offers for the current pairing. Reads the memory only.
+
+        A segment counts as fresh when the same text (with the same neighbours,
+        or anywhere) was confirmed under this document's dictionary revision;
+        anything else is a reference, which is never filled silently.
+        """
+        problem = self._memory_problem()
+        if problem is not None:
+            self.status_label.setText(problem)
+            return
+        pairs = self._current_pairs()
+        if not pairs:
+            self.status_label.setText(strings.TM_PANEL_CHECK_EMPTY)
+            return
+        source = self._payload["source"]
+        sources = [source[pair.source.core_start:pair.source.core_end] for pair in pairs]
+        if all(not text.strip() for text in sources):
+            self.status_label.setText(strings.TM_PANEL_CHECK_NO_SOURCE)
+            return
+        try:
+            classes = self._classify_reuse(sources)
+        except (tm.TmError, OSError) as error:
+            self.status_label.setText(strings.TM_PANEL_UNUSABLE.format(reason=tm_refusal_text(error)))
+            return
+        classified = [item for item in classes if item is not None]
+        fresh = sum(1 for item in classified
+                    if item.status in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH))
+        stale = sum(1 for item in classified if item.status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        unmatched = len(classified) - fresh - stale
+        skipped = len(classes) - len(classified)
+        self._tm_fill_plan = []
+        for item, pair in zip(classes, pairs):
+            if item is None or item.status not in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH):
+                continue
+            # Only a segment with no translation at all: filling one that has
+            # text would replace somebody's work without them choosing it.
+            if pair.target.core_end > pair.target.core_start:
+                continue
+            text = item.match.entry.target_text if item.match is not None else ""
+            if text.strip():
+                self._tm_fill_plan.append((pair.target.core_start, pair.target.core_end, text,
+                                           pair.source.start, pair.source.end))
+        self.tm_panel.show_reuse(ReuseSummary(fresh=fresh, stale=stale, unmatched=unmatched,
+                                              fillable=len(self._tm_fill_plan), skipped=skipped))
+        note = strings.TM_PANEL_CHECK_SUMMARY.format(fresh=fresh, stale=stale, unmatched=unmatched)
+        if skipped:
+            note += strings.TM_PANEL_CHECK_SKIPPED.format(n=skipped, max=tm.SOURCE_SCALARS[1])
+        self.status_label.setText(note)
+
+    def _fill_from_memory(self) -> None:
+        """Fill the empty targets the reuse check certified, as one undoable edit."""
+        if not self._input_ready():
+            return
+        if not self._tm_fill_plan:
+            self.status_label.setText(strings.TM_PANEL_CHECK_NOTHING)
+            return
+        # Target position, then the source position: several untranslated
+        # segments can share one target offset, and sorting on the translation
+        # text would write them in the wrong order (and fail the fill remap).
+        plan = sorted(self._tm_fill_plan, key=lambda item: (item[0], item[1], item[3], item[4]))
+        raw = self._payload["target"]
+        source = self._payload["source"]
+        changed = raw
+        for start, end, text, _source_start, _source_end in reversed(plan):
+            changed = changed[:start] + text + changed[end:]
+        if not self.target_edit.can_display(changed):
+            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
+            return
+        # Each fill is its own transaction against the text it lands in, in
+        # order, as a translation run writes one segment at a time; what the
+        # transactions invalidated is reported together, as one edit step.
+        alignments = self._payload["alignments"]
+        current = raw
+        shift = 0
+        invalidated: list[dict] = []
+        emptied: list[dict] = []
+        for start, end, text, source_start, source_end in plan:
+            position = start + shift
+            filled = current[:position] + text + current[end + shift:]
+            remap = remap_for_target_fill(alignments, source, filled, source_start, source_end, position,
+                                          position, position + len(text), len(text))
+            alignments = remap.alignments
+            invalidated.extend(remap.invalidated)
+            emptied.extend(remap.emptied_targets)
+            current = filled
+            shift += len(text) - (end - start)
+        value = self._draft_snapshot()
+        value["target"] = changed
+        value["alignments"] = alignments
+        # Every edit is read in the text the ones before it left, so the list
+        # runs from the last segment back to the first: a segment's own offset
+        # is still the one the document gave it, and an insertion never moves
+        # an edit that has already been applied.
+        edits = [("target", start, end, len(text)) for start, end, text, _s, _e in reversed(plan)]
+        self._apply_edit(value, edits=edits, remap=AlignmentRemap(alignments, tuple(invalidated), tuple(emptied)))
+        self._tm_fill_plan = []
+        self.tm_panel.clear_reuse()
+        self.status_label.setText(strings.TM_PANEL_CHECK_FILLED.format(n=len(plan)))
+        self._update_controls()
 
     def _promote_from_term_finding(self) -> None:
         if not self._input_ready():
