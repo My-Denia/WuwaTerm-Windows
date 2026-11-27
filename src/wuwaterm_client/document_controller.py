@@ -593,7 +593,13 @@ class DocumentRunController:
             self.clear_live_provenance()
             return None
         if identity is None:
+            # The endpoint answered "no identity": an older server, or a
+            # same-origin fallback standing in front of one. Any identity this
+            # session cached earlier is not confirmable now, so it goes with the
+            # answer. The review basis stays - that is the fallback ADR 0023
+            # keeps for a server without the endpoint.
             self.identity_probe_state = IDENTITY_UNSUPPORTED
+            self.record_live_dictionary_identity(None)
             return None
         self.record_live_dictionary_identity(identity)
         self.identity_probe_state = IDENTITY_FRESH

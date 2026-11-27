@@ -2190,3 +2190,70 @@ def test_an_alignment_change_during_the_identity_wait_ends_the_press(tmp_path) -
         assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_CHANGED
 
     asyncio.run(scenario())
+
+
+def test_a_404_after_a_cached_identity_forgets_it(tmp_path) -> None:
+    """An identity the server no longer confirms is not an identity.
+
+    A same-origin fallback can stand in front of a Core that has no
+    `/v1/dictionary`: a session that read one earlier and gets a 404 now must
+    stop reusing the revision it cached.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev, None)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+        assert controller._tm_provenance() == (rev, None)
+        assert controller.payload["target"] == "\n\n".join(targets)
+        assert host.service_dictionaries[-1] is client.dictionary
+
+        # The endpoint is gone now (a fallback in front of an older Core).
+        client.dictionary = None
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_UNSUPPORTED
+        assert controller.live_dictionary_identity is None, "a cached identity survived a 404"
+        assert host.service_dictionaries[-1] is None, "the view kept a cached identity"
+        assert controller._tm_provenance() == (None, None)
+        assert [call["text"] for call in client.translation_calls] == sources, (
+            "the cached identity was still reused after the server stopped confirming it"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_a_404_keeps_the_review_basis_as_the_fallback(tmp_path) -> None:
+    """Only the identity goes: the review basis is the fallback ADR 0023 keeps."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = None  # the server has no /v1/dictionary
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.record_live_review_dictionary({"schema_version": "test-schema", "source_commit": "test-commit",
+                                                  "term_count": 1, "revision": rev})
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_UNSUPPORTED
+        assert controller._tm_provenance() == (rev, None)
+        assert client.translation_calls == [], "the review basis was not used as the fallback"
+        assert controller.payload["target"] == "\n\n".join(targets)
+
+    asyncio.run(scenario())
