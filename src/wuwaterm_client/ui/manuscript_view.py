@@ -51,7 +51,9 @@ from ..manuscript import (
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..search_replace import SearchReplaceController
-from ..segmentation import SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED
+from ..segmentation import (
+    SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
+)
 from ..termbase import TermbaseStore
 from . import review_states
 from .components import Banner, ChevronComboBox
@@ -2278,6 +2280,9 @@ class ManuscriptView(QWidget):
                 self._highlight_segment_row(pairs, self._pair_index_at(pairs, side, offset))
             self._highlight_finding_at(side, offset)
             self._highlight_issue_at(side, offset)
+            # The memory panel is not a row of the segment list: when the terms
+            # track is the one showing, nothing above would refresh it.
+            self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
 
     def _highlight_segment_row(self, pairs: list, index: int) -> None:
@@ -4199,6 +4204,8 @@ class ManuscriptView(QWidget):
         self._caret_timer.start()
         self._my_terms_timer.start()
         self._tm_timer.start()
+        # An earlier reuse count described text this edit just replaced.
+        self._tm_fill_plan = []
 
     def _alignment_notice_text(self, outcome: EditOutcome) -> str:
         """What an edit did to the explicit alignments, in the workbench's words.
@@ -4499,6 +4506,9 @@ class ManuscriptView(QWidget):
         elif quiet and row < 0:
             row = self._quiet_row
         self._report = report
+        # A report is where the dictionary revision comes from: the memory's
+        # staleness reading follows it, without waiting for the next caret stop.
+        self._refresh_tm_panel()
         self._finding_refs = list(refs or [])
         self._finding_recheck = list(recheck or [False] * len(report["findings"]))
         self._finding_saved = list(saved or [False] * len(report["findings"]))
@@ -4825,6 +4835,7 @@ class ManuscriptView(QWidget):
         self._caret_timer.start()
         self._my_terms_timer.start()
         self._tm_timer.start()
+        self._tm_fill_plan = []
 
     def _refresh_my_terms(self) -> None:
         """The person's own terms found in the source text now on screen."""
@@ -4874,12 +4885,17 @@ class ManuscriptView(QWidget):
         entry's recorded revision with it, and an entry that cannot say which
         dictionary it was confirmed under is listed as a reference.
         """
-        report = self._report
-        if not isinstance(report, dict):
-            return None
-        dictionary = report.get("dictionary")
-        revision = dictionary.get("revision") if isinstance(dictionary, dict) else None
-        return revision if isinstance(revision, str) and revision else None
+        # A document report names it; a long manuscript keeps the basis per
+        # record, and the controller's common basis is the same fact for the
+        # dictionary. Either is the revision to compare an entry with.
+        for source in (self._report, self._term_basis):
+            if not isinstance(source, dict):
+                continue
+            dictionary = source.get("dictionary")
+            revision = dictionary.get("revision") if isinstance(dictionary, dict) else None
+            if isinstance(revision, str) and revision:
+                return revision
+        return None
 
     def _active_segment_pair(self):
         """The segment the memory is read for: the selected row, else the caret's."""
@@ -4916,6 +4932,8 @@ class ManuscriptView(QWidget):
     def _refresh_tm_panel(self) -> None:
         """Re-read the memory for the active segment. Reads only."""
         self._tm_timer.stop()
+        # A fill plan belongs to the text it counted; a refresh is a new reading.
+        self._tm_fill_plan = []
         self.tm_panel.set_context(self._active_segment_context())
 
     def _memory_problem(self) -> str | None:
@@ -4949,15 +4967,32 @@ class ManuscriptView(QWidget):
         text = match.entry.target_text
         raw = self._payload["target"]
         start, end = pair.target.core_start, pair.target.core_end
-        changed = raw[:start] + text + raw[end:]
+        if start == end:
+            # An untranslated segment: this is a fill, and a fill is what tells
+            # the alignment which entry it completes (remap_for_target_fill). A
+            # plain splice here would leave that entry's target empty and the
+            # segment would come back as needing a manual split.
+            left = "\n\n" if start > 0 and raw[start - 1] not in WHITESPACE else ""
+            right = "\n\n" if start < len(raw) and raw[start] not in WHITESPACE else ""
+            inserted = left + text + right
+            changed = raw[:start] + inserted + raw[start:]
+            fill_start = start + len(left)
+            remap = remap_for_target_fill(self._payload["alignments"], self._payload["source"], changed,
+                                          pair.source.start, pair.source.end, start,
+                                          fill_start, fill_start + len(text), len(inserted))
+            edit = ("target", start, start, len(inserted))
+        else:
+            changed = raw[:start] + text + raw[end:]
+            remap = remap_splice(self._payload["alignments"], "target", self._payload["source"], changed,
+                                 start, end, len(text))
+            edit = ("target", start, end, len(text))
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
         value = self._draft_snapshot()
         value["target"] = changed
-        remap = remap_splice(value["alignments"], "target", value["source"], changed, start, end, len(text))
         value["alignments"] = remap.alignments
-        self._apply_edit(value, edits=[("target", start, end, len(text))], remap=remap)
+        self._apply_edit(value, edits=[edit], remap=remap)
         if match.needs_recheck:
             self.status_label.setText(strings.TM_PANEL_APPLIED_RECHECK.format(
                 reasons="、".join(stale_labels(match.stale_reasons))))
@@ -4985,6 +5020,10 @@ class ManuscriptView(QWidget):
         if not active.source.strip() or not active.target.strip():
             self.status_label.setText(strings.TM_PANEL_CONFIRM_EMPTY)
             return
+        if len(active.source) > tm.SOURCE_SCALARS[1]:
+            self.status_label.setText(strings.TM_PANEL_CONFIRM_TOO_LONG.format(
+                length=len(active.source), max=tm.SOURCE_SCALARS[1]))
+            return
         try:
             entry = self._translation_memory.add(
                 active.source,
@@ -5001,6 +5040,48 @@ class ManuscriptView(QWidget):
             return
         self._refresh_tm_panel()
         self.status_label.setText(strings.TM_PANEL_CONFIRMED.format(count=entry.use_count))
+
+    def _classify_reuse(self, sources: list[str]) -> list[tm.TmSegmentClassification | None]:
+        """Classify the segments the store can hold, keeping each one's neighbours.
+
+        ``classify_segments_for_tm`` refuses a blank or over-long source (a value
+        it cannot store, which is not a broken file), so those segments are
+        skipped and the rest are classified in runs. Each run is given its
+        neighbours explicitly: a skipped neighbour cannot be hashed by the store
+        either, so it is passed as none - the truth about the context - instead
+        of the text that would be refused.
+        """
+        limit = tm.SOURCE_SCALARS[1]
+
+        def readable(text: str) -> bool:
+            return bool(text.strip()) and len(text) <= limit
+
+        def neighbour(index: int) -> str | None:
+            if not 0 <= index < len(sources) or not readable(sources[index]):
+                return None
+            return sources[index]
+
+        classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
+        run: list[int] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            items = [{"source": sources[index], "prev_source": neighbour(index - 1),
+                      "next_source": neighbour(index + 1)} for index in run]
+            found = self._translation_memory.classify_segments_for_tm(
+                items, self._payload["direction"], current_terms_db_revision=self._terms_db_revision())
+            for index, item in zip(run, found):
+                classes[index] = item
+            run.clear()
+
+        for position, text in enumerate(sources):
+            if readable(text):
+                run.append(position)
+            else:
+                flush()
+        flush()
+        return classes
 
     def _check_memory_reuse(self) -> None:
         """Count what the memory offers for the current pairing. Reads the memory only.
@@ -5019,22 +5100,23 @@ class ManuscriptView(QWidget):
             return
         source = self._payload["source"]
         sources = [source[pair.source.core_start:pair.source.core_end] for pair in pairs]
-        if any(not item.strip() for item in sources):
+        if all(not text.strip() for text in sources):
             self.status_label.setText(strings.TM_PANEL_CHECK_NO_SOURCE)
             return
         try:
-            classes = self._translation_memory.classify_segments_for_tm(
-                sources, self._payload["direction"],
-                current_terms_db_revision=self._terms_db_revision())
+            classes = self._classify_reuse(sources)
         except (tm.TmError, OSError) as error:
             self.status_label.setText(strings.TM_PANEL_UNUSABLE.format(reason=tm_refusal_text(error)))
             return
-        fresh = sum(1 for item in classes
+        classified = [item for item in classes if item is not None]
+        fresh = sum(1 for item in classified
                     if item.status in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH))
-        stale = sum(1 for item in classes if item.status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        stale = sum(1 for item in classified if item.status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        unmatched = len(classified) - fresh - stale
+        skipped = len(classes) - len(classified)
         self._tm_fill_plan = []
         for item, pair in zip(classes, pairs):
-            if item.status not in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH):
+            if item is None or item.status not in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH):
                 continue
             # Only a segment with no translation at all: filling one that has
             # text would replace somebody's work without them choosing it.
@@ -5044,10 +5126,12 @@ class ManuscriptView(QWidget):
             if text.strip():
                 self._tm_fill_plan.append((pair.target.core_start, pair.target.core_end, text,
                                            pair.source.start, pair.source.end))
-        self.tm_panel.show_reuse(ReuseSummary(
-            fresh=fresh, stale=stale, unmatched=len(classes) - fresh - stale, fillable=len(self._tm_fill_plan)))
-        self.status_label.setText(strings.TM_PANEL_CHECK_SUMMARY.format(
-            fresh=fresh, stale=stale, unmatched=len(classes) - fresh - stale))
+        self.tm_panel.show_reuse(ReuseSummary(fresh=fresh, stale=stale, unmatched=unmatched,
+                                              fillable=len(self._tm_fill_plan), skipped=skipped))
+        note = strings.TM_PANEL_CHECK_SUMMARY.format(fresh=fresh, stale=stale, unmatched=unmatched)
+        if skipped:
+            note += strings.TM_PANEL_CHECK_SKIPPED.format(n=skipped, max=tm.SOURCE_SCALARS[1])
+        self.status_label.setText(note)
 
     def _fill_from_memory(self) -> None:
         """Fill the empty targets the reuse check certified, as one undoable edit."""
@@ -5056,7 +5140,10 @@ class ManuscriptView(QWidget):
         if not self._tm_fill_plan:
             self.status_label.setText(strings.TM_PANEL_CHECK_NOTHING)
             return
-        plan = sorted(self._tm_fill_plan)
+        # Target position, then the source position: several untranslated
+        # segments can share one target offset, and sorting on the translation
+        # text would write them in the wrong order (and fail the fill remap).
+        plan = sorted(self._tm_fill_plan, key=lambda item: (item[0], item[1], item[3], item[4]))
         raw = self._payload["target"]
         source = self._payload["source"]
         changed = raw
@@ -5086,7 +5173,11 @@ class ManuscriptView(QWidget):
         value = self._draft_snapshot()
         value["target"] = changed
         value["alignments"] = alignments
-        edits = [("target", start, end, len(text)) for start, end, text, _s, _e in plan]
+        # Every edit is read in the text the ones before it left, so the list
+        # runs from the last segment back to the first: a segment's own offset
+        # is still the one the document gave it, and an insertion never moves
+        # an edit that has already been applied.
+        edits = [("target", start, end, len(text)) for start, end, text, _s, _e in reversed(plan)]
         self._apply_edit(value, edits=edits, remap=AlignmentRemap(alignments, tuple(invalidated), tuple(emptied)))
         self._tm_fill_plan = []
         self.tm_panel.clear_reuse()

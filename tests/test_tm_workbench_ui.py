@@ -31,6 +31,7 @@ from wuwaterm_client import translation_memory as tm
 from wuwaterm_client.api import ApiClient
 from wuwaterm_client.config import ClientConfig
 from wuwaterm_client.manuscript import empty_workfile
+from wuwaterm_client.semantic_session import SegmentResult
 from wuwaterm_client.ui.main_window import MainWindow
 from wuwaterm_client.ui.manuscript_view import ManuscriptView
 from wuwaterm_client.ui.tm_dialog import TranslationMemoryDialog
@@ -68,12 +69,15 @@ def alignments_for(source: str, target: str, pairs: list[tuple[str, str]]) -> li
 
 
 def install(view: ManuscriptView, source: str, target: str, *, direction: str = "en",
-            alignments: list[dict] | None = None) -> None:
+            alignments: list[dict] | None = None, list_segments: bool = True) -> None:
+    """Put a document in the view. ``list_segments`` False leaves the segment
+    list unbuilt, as it is while the terms track is the one showing."""
     value = empty_workfile()
     value.update(source=source, target=target, direction=direction, alignments=alignments)
     view._set_payload(value)
     view._update_controls()
-    view._refresh_segments()
+    if list_segments:
+        view._refresh_segments()
     view._refresh_tm_panel()
 
 
@@ -277,7 +281,250 @@ def test_a_segment_with_only_a_translation_is_not_read_as_a_broken_memory(qapp, 
         assert view.tm_panel.matches == []
         assert view.tm_panel.confirm_button.isEnabled() is False
         view._check_memory_reuse()
-        assert view.status_label.text() == strings.TM_PANEL_CHECK_NO_SOURCE
+        # It is skipped and counted, not reported as a broken memory file.
+        assert view.tm_panel.summary.skipped == 1
+        assert view.tm_panel.summary.fresh == 1
+        assert strings.TM_PANEL_CHECK_SKIPPED.format(n=1, max=tm.SOURCE_SCALARS[1]) in view.status_label.text()
+        assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.status_label.text()
+        assert view.tm_panel.check_button.isEnabled() is True
+    finally:
+        view.close()
+
+
+# -- the fill: order, spans and one undo step -------------------------------------
+
+
+def test_consecutive_untranslated_segments_are_filled_in_document_order(qapp, memory) -> None:
+    """Two empty targets at one offset: the later translation can sort first."""
+    source = "First line. Second line. Third line."
+    target = "甲句。"
+    alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", ""),
+                                                 ("Third line.", "")])
+    memory.add("First line.", "甲句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("Second line.", "zulu.", "en", prev_source="First line.", next_source="Third line.",
+               origin="human_confirmed")
+    memory.add("Third line.", "alpha.", "en", prev_source="Second line.", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, source, target, alignments=alignments)
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fillable == 2
+        view._fill_from_memory()
+        # Both segments are empty at target offset 3; the text must follow the
+        # source order, not the translations' alphabetical order.
+        assert view._payload["target"] == "甲句。zulu.alpha."
+        view._refresh_derived()
+        filled = view._payload["alignments"]
+        assert [entry["target"]["text"] for entry in filled] == ["甲句。", "zulu.", "alpha."]
+        assert all(entry["target"] is not None for entry in filled)
+        assert "needs_manual_split" not in [pair.status for pair in view._current_pairs()]
+        # One edit step: undo puts the single translated paragraph back.
+        view.target_edit.setFocus()
+        QTest.keyClick(view.target_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+        assert view._payload["target"] == target
+    finally:
+        view.close()
+
+
+def test_filling_keeps_every_reviewed_segment_span_on_its_own_text(qapp, memory) -> None:
+    """Four segments, translated and untranslated alternating: the semantic
+    session's spans must land on the same text after two insertions."""
+    source = "Alpha line. Beta line. Gamma line. Delta line. Epsilon line."
+    target = "甲句。丙句。戊句。"
+    alignments = alignments_for(source, target, [("Alpha line.", "甲句。"), ("Beta line.", ""),
+                                                 ("Gamma line.", "丙句。"), ("Delta line.", ""),
+                                                 ("Epsilon line.", "戊句。")])
+    memory.add("Beta line.", "zulu.", "en", prev_source="Alpha line.", next_source="Gamma line.",
+               origin="human_confirmed")
+    memory.add("Delta line.", "alpha.", "en", prev_source="Gamma line.", next_source="Epsilon line.",
+               origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, source, target, alignments=alignments)
+        pairs = view._current_pairs()
+        assert [pair.status for pair in pairs] == [
+            "ready", "untranslated", "ready", "untranslated", "ready"]
+        results = []
+        for index in (0, 2, 4):
+            pair = pairs[index]
+            result = SegmentResult(
+                sent_source=source[pair.source.core_start:pair.source.core_end],
+                sent_target=target[pair.target.core_start:pair.target.core_end],
+                source_core=(pair.source.core_start, pair.source.core_end),
+                target_core=(pair.target.core_start, pair.target.core_end),
+                hard_cut=pair.hard_cut, report=None, index=index)
+            view._controller.session.add(result)
+            results.append(result)
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fillable == 2
+        view._fill_from_memory()
+        assert view._payload["target"] == "甲句。zulu.丙句。alpha.戊句。"
+        # Every reviewed span lies on its own translation in the new text.
+        for result, text in zip(results, ("甲句。", "丙句。", "戊句。")):
+            start, end = result.target_core
+            assert view._payload["target"][start:end] == text
+            assert result.invalid is False
+        assert view._payload["alignments"][1]["target"]["text"] == "zulu."
+        assert view._payload["alignments"][3]["target"]["text"] == "alpha."
+    finally:
+        view.close()
+
+
+# -- adopting a candidate into an untranslated segment ----------------------------
+
+
+def test_adopting_a_candidate_fills_an_untranslated_segment_into_its_alignment(qapp, memory) -> None:
+    source, target, alignments = two_segments()
+    memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(1)
+        view._refresh_tm_panel()
+        assert view._active_segment_context().target == ""
+        view.tm_panel.apply_at(0)
+        # The pair is a fill, so its own alignment entry receives the text and
+        # the segment does not fall back to needing a manual split.
+        assert view._payload["alignments"][1]["target"] is not None
+        assert view._payload["alignments"][1]["target"]["text"] == "乙句。"
+        filled = view._payload["target"]
+        assert filled.endswith("乙句。") and filled.startswith("甲句。")
+        view._refresh_derived()
+        assert "needs_manual_split" not in [pair.status for pair in view._current_pairs()]
+        assert "乙句。" in view._payload["target"]
+    finally:
+        view.close()
+
+
+# -- the panel follows the caret on every track -----------------------------------
+
+
+def test_the_panel_follows_the_caret_while_the_terms_track_is_showing(qapp, memory) -> None:
+    source, target, alignments = two_segments()
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        # The terms track is the default; its segment list is never built, so
+        # nothing but the caret follow can refresh the memory panel.
+        install(view, source, target, alignments=alignments, list_segments=False)
+        assert view.track_stack.currentIndex() == 0
+        assert view._segment_rows_from is None
+        view.target_edit.setFocus()
+        view.target_edit.set_raw_cursor_offset(0)
+        view._caret_side = "target"
+        view._follow_caret()
+        assert view.tm_panel.matches[0].entry.target_text == "首句。"
+        view.target_edit.set_raw_cursor_offset(len("甲句。"))
+        view._follow_caret()
+        assert view.tm_panel.matches[0].entry.target_text == "乙句。"
+    finally:
+        view.close()
+
+
+# -- a source the store cannot hold ------------------------------------------------
+
+
+def test_a_segment_longer_than_the_memory_holds_is_not_a_broken_file(qapp, memory) -> None:
+    limit = tm.SOURCE_SCALARS[1]
+    long_source = "字" * (limit + 1)
+    memory.add("First line.", "首句。", "en", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, long_source, "甲句。",
+                alignments=[{"source": {"start": 0, "end": len(long_source), "text": long_source},
+                             "target": {"start": 0, "end": 3, "text": "甲句。"}}])
+        assert len(view._active_segment_context().source) == limit + 1
+        view._refresh_tm_panel()
+        assert view.tm_panel.notice_label.text() == strings.TM_PANEL_SOURCE_TOO_LONG.format(
+            length=limit + 1, max=limit)
+        assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.tm_panel.notice_label.text()
+        assert view.tm_panel.confirm_button.isEnabled() is False
+        # The check still runs: it skips this segment and says so.
+        assert view.tm_panel.check_button.isEnabled() is True
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.skipped == 1
+        assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.status_label.text()
+        # Confirming is refused in the workbench's words, not the file's.
+        view._confirm_segment_to_memory()
+        assert view.status_label.text() == strings.TM_PANEL_CONFIRM_TOO_LONG.format(
+            length=limit + 1, max=limit)
+        assert len(memory) == 1
+    finally:
+        view.close()
+
+
+def test_the_reuse_check_classifies_the_segments_it_can_read(qapp, memory) -> None:
+    limit = tm.SOURCE_SCALARS[1]
+    memory.add("Alpha line.", "甲句。", "en", origin="human_confirmed")
+    memory.add("Gamma line.", "丙句。", "en", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        classes = view._classify_reuse(["Alpha line.", "字" * (limit + 1), "Gamma line."])
+        # The unreadable middle segment is skipped; the others are still read,
+        # with no context on the side the skip took away.
+        assert classes[1] is None
+        assert [item.status for item in (classes[0], classes[2])] == ["exact_fresh", "exact_fresh"]
+        assert classes[2].match.entry.target_text == "丙句。"
+    finally:
+        view.close()
+
+
+# -- opening the memory, and what a failure means ---------------------------------
+
+
+def test_a_memory_that_cannot_be_opened_leaves_the_workbench_running(qapp, monkeypatch) -> None:
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    for failure in (tm.TmError("tm_schema_mismatch", "format"), OSError("no such device")):
+        def refuse(*_args, error=failure, **_kwargs):
+            raise error
+        monkeypatch.setattr(main_window_module, "TranslationMemory", refuse)
+        assert main_window_module.open_translation_memory() is None
+        window = MainWindow(config=ClientConfig())
+        try:
+            assert window.manuscript_view.tm_panel.memory is None
+            assert window.manuscript_view.tm_panel.notice_label.text() == strings.TM_PANEL_NO_MEMORY
+        finally:
+            window.close()
+
+
+# -- which dictionary revision the panel compares against -------------------------
+
+
+def test_the_revision_comes_from_the_report_and_from_a_long_mode_basis(qapp, memory) -> None:
+    source, target, alignments = two_segments()
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        # Nothing has named a revision yet, so nothing can be out of date.
+        assert view._terms_db_revision() is None
+        assert strings.TM_STALE_TERMS not in view.tm_panel.hit_texts()[0]
+        report = {
+            "request_id": "example", "source_revision": "a" * 64, "target_revision": "b" * 64,
+            "rule_version": "review-v2", "matcher_revision": "c" * 64,
+            "dictionary": {"schema_version": "1", "source_commit": "d" * 40, "term_count": 1,
+                           "revision": OTHER_REVISION},
+            "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["review.term_pair"]},
+            "findings": [], "truncated": False,
+        }
+        # A document report names the revision, and the panel follows at once:
+        # no caret stop is needed to see that the entry is out of date.
+        view._show_term_report(report, state="current")
+        assert view._terms_db_revision() == OTHER_REVISION
+        assert strings.TM_STALE_TERMS in view.tm_panel.hit_texts()[0]
+        # A long manuscript keeps the basis per record instead of one report.
+        view._report = None
+        view._term_basis = {"rule_version": "review-v2", "matcher_revision": "c" * 64,
+                            "dictionary": {"schema_version": "1", "source_commit": "d" * 40,
+                                           "term_count": 1, "revision": OTHER_REVISION}}
+        assert view._terms_db_revision() == OTHER_REVISION
+        view._refresh_tm_panel()
+        assert strings.TM_STALE_TERMS in view.tm_panel.hit_texts()[0]
     finally:
         view.close()
 

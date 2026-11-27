@@ -29,6 +29,9 @@ from .tm_dialog import origin_label, refusal_text
 # Five candidates, as in the terms panel: enough to pick from, few enough that
 # the inspector does not become a list to scroll past.
 MAX_LISTED_MATCHES = 5
+# The longest source the store holds (``tm.SOURCE_SCALARS``); a longer one is
+# refused as a value, which is not the same thing as a broken file.
+MAX_SOURCE = tm.SOURCE_SCALARS[1]
 
 _MATCH_LABELS = {
     tm.TM_MATCH_CONTEXT_EXACT: strings.TM_MATCH_CONTEXT_EXACT,
@@ -78,6 +81,7 @@ class ReuseSummary:
     stale: int
     unmatched: int
     fillable: int
+    skipped: int = 0
 
 
 class TranslationMemoryPanel(QFrame):
@@ -268,6 +272,14 @@ class TranslationMemoryPanel(QFrame):
             self._set_notice(strings.TM_PANEL_NO_SOURCE)
             self._set_actions_enabled(False, True)
             return
+        if len(active.source) > MAX_SOURCE:
+            # Longer than the store holds: the value would be refused, so it is
+            # not looked up and not reported as a file problem. Checking reuse
+            # still works, because it skips only the segments it cannot read.
+            self._set_notice(strings.TM_PANEL_SOURCE_TOO_LONG.format(
+                length=len(active.source), max=MAX_SOURCE))
+            self._set_actions_enabled(False, True)
+            return
         self._set_actions_enabled(bool(active.target.strip()), True)
         try:
             self._matches = memory.lookup_segment(
@@ -305,8 +317,11 @@ class TranslationMemoryPanel(QFrame):
     def show_reuse(self, summary: ReuseSummary) -> None:
         """List what the reuse check found, with the fill action it allows."""
         self._summary = summary
-        self.reuse_label.setText(strings.TM_PANEL_CHECK_SUMMARY.format(
-            fresh=summary.fresh, stale=summary.stale, unmatched=summary.unmatched))
+        lines = [strings.TM_PANEL_CHECK_SUMMARY.format(
+            fresh=summary.fresh, stale=summary.stale, unmatched=summary.unmatched)]
+        if summary.skipped:
+            lines.append(strings.TM_PANEL_CHECK_SKIPPED.format(n=summary.skipped, max=MAX_SOURCE))
+        self.reuse_label.setText("\n".join(lines))
         self.reuse_label.show()
         if summary.fillable:
             self.fill_button.setText(strings.TM_PANEL_CHECK_FILL.format(n=summary.fillable))
