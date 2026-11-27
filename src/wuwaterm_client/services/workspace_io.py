@@ -126,6 +126,7 @@ def save_manuscript_file(
     payload: dict[str, Any],
     *,
     segment_cursor: int | None,
+    writer: Callable[[Path, dict[str, Any]], Any] = save_workfile,
 ) -> tuple[dict[str, Any], sr.Parts, tuple[str, ...]]:
     """Save ``payload`` to ``path`` and return normalized post-save metadata.
 
@@ -135,7 +136,7 @@ def save_manuscript_file(
     to_write = payload
     if parts.segments and segment_cursor is not None and 0 <= segment_cursor < len(parts.segments):
         to_write = sr.with_parts(payload, sr.set_current(parts, segment_cursor))
-    save_workfile(path, to_write)
+    writer(path, to_write)
     written = parse_workfile(serialize_workfile(to_write))
     adopted_parts, features = sr.adopt_file_features(to_write, written.get("review_features") or ())
     return written, adopted_parts, features

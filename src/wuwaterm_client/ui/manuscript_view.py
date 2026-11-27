@@ -48,7 +48,7 @@ from ..document_edits import (
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
-    load_workfile, sanitize_duplicate_choices,
+    load_workfile, sanitize_duplicate_choices, save_workfile,
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..search_replace import SearchReplaceController
@@ -4529,7 +4529,9 @@ class ManuscriptView(QWidget):
         parts = sr.parts_of(payload)
         cursor = self._segment_cursor
         try:
-            written, adopted_parts, features = save_manuscript_file(path, payload, segment_cursor=cursor)
+            written, adopted_parts, features = save_manuscript_file(
+                path, payload, segment_cursor=cursor, writer=save_workfile
+            )
         except WorkfileError as exc:
             if exc.code == "workfile_duplicate_choices":
                 self._conflict_mode = True

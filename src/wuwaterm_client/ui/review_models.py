@@ -365,6 +365,14 @@ class ModelListView(QListView):
         if idx.isValid():
             self.scrollTo(idx)
 
+    def visualItemRect(self, item: _ModelRowProxy | None) -> QRect:  # noqa: N802
+        if item is None:
+            return QRect()
+        idx = self.proxy_model.index(item._row, 0)
+        if not idx.isValid():
+            return QRect()
+        return self.visualRect(idx)
+
     def clear(self) -> None:
         self.set_rows(())
 
