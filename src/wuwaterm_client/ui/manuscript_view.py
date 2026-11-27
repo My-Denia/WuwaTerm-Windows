@@ -869,11 +869,16 @@ class _WorkbenchHostAdapter(WorkbenchHost):
             return False
         value = view._draft_snapshot()
         value["target"] = changed
-        if value["alignments"] is not None:
-            value["alignments"] = [] if remap is None else remap.alignments
+        if remap is not None:
+            value["alignments"] = remap.alignments
+        elif value["alignments"] is not None:
+            value["alignments"] = []
         view._apply_edit(value, edits=[edit], remap=remap)
         view._save_recovery_snapshot()
         return True
+
+    def tm_provenance(self) -> tuple[str | None, str | None]:
+        return self._view._terms_db_revision(), self._view._game_version()
 
 
 class ManuscriptView(QWidget):
@@ -929,7 +934,11 @@ class ManuscriptView(QWidget):
         # The runs and the document state they commit to. Its host is
         # _WorkbenchHostAdapter below: it renders state and performs the one
         # edit a run cannot do itself.
-        self._controller = DocumentRunController(api_client, _WorkbenchHostAdapter(self))
+        self._controller = DocumentRunController(
+            api_client,
+            _WorkbenchHostAdapter(self),
+            translation_memory=self._translation_memory,
+        )
         self._saved_payload = _copy_payload(self._payload)
         self._path: Path | None = None
         self._report: dict | None = None
@@ -4897,6 +4906,25 @@ class ManuscriptView(QWidget):
                 return revision
         return None
 
+    def _game_version(self) -> str | None:
+        """The dictionary data/game version from the open document's review, if any.
+
+        Uses ``game_version`` when present, otherwise ``dictionary.source_commit``
+        (which ``/v1/reviews`` actually supplies). Kept consistent between storing
+        confirmed entries and querying freshness so no false match is ever formed.
+        """
+        for source in (self._report, self._term_basis):
+            if not isinstance(source, dict):
+                continue
+            dictionary = source.get("dictionary")
+            if not isinstance(dictionary, dict):
+                continue
+            for key in ("game_version", "source_commit"):
+                value = dictionary.get(key)
+                if isinstance(value, str) and value.strip() and len(value) <= tm.REVISION_SCALARS[1]:
+                    return value
+        return None
+
     def _active_segment_pair(self):
         """The segment the memory is read for: the selected row, else the caret's."""
         pairs = self._current_pairs()
@@ -4943,6 +4971,7 @@ class ManuscriptView(QWidget):
             prev_source=neighbour(index - 1),
             next_source=neighbour(index + 1),
             terms_db_revision=self._terms_db_revision(),
+            game_version=self._game_version(),
         )
 
     def _refresh_tm_panel(self) -> None:
@@ -5049,6 +5078,7 @@ class ManuscriptView(QWidget):
                 next_source=active.next_source,
                 origin=tm.TM_ORIGIN_HUMAN,
                 terms_db_revision=active.terms_db_revision,
+                game_version=active.game_version,
             )
         except (tm.TmError, OSError) as error:
             self.status_label.setText(strings.TM_PANEL_CONFIRM_FAILED.format(reason=tm_refusal_text(error)))
@@ -5082,7 +5112,11 @@ class ManuscriptView(QWidget):
             items = [{"source": sources[index], "prev_source": neighbour(index - 1),
                       "next_source": neighbour(index + 1)} for index in run]
             found = self._translation_memory.classify_segments_for_tm(
-                items, self._payload["direction"], current_terms_db_revision=self._terms_db_revision())
+                items,
+                self._payload["direction"],
+                current_terms_db_revision=self._terms_db_revision(),
+                current_game_version=self._game_version(),
+            )
             for index, item in zip(run, found):
                 classes[index] = item
             run.clear()
@@ -5121,14 +5155,18 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.TM_PANEL_UNUSABLE.format(reason=tm_refusal_text(error)))
             return
         classified = [item for item in classes if item is not None]
-        fresh = sum(1 for item in classified
-                    if item.status in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH))
-        stale = sum(1 for item in classified if item.status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        # Only context-exact + verified-fresh entries qualify for trusted batch reuse;
+        # context-less exact matches (TM_STATUS_EXACT_FRESH) stay reference-only.
+        fresh = sum(1 for item in classified if item.status == tm.TM_STATUS_CONTEXT_EXACT_FRESH)
+        stale = sum(
+            1 for item in classified
+            if item.status in (tm.TM_STATUS_EXACT_FRESH, tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        )
         unmatched = len(classified) - fresh - stale
         skipped = len(classes) - len(classified)
         self._tm_fill_plan = []
         for item, pair in zip(classes, pairs):
-            if item is None or item.status not in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH):
+            if item is None or item.status != tm.TM_STATUS_CONTEXT_EXACT_FRESH:
                 continue
             # Only a segment with no translation at all: filling one that has
             # text would replace somebody's work without them choosing it.
@@ -5193,7 +5231,15 @@ class ManuscriptView(QWidget):
         self._apply_edit(value, edits=edits, remap=AlignmentRemap(alignments, tuple(invalidated), tuple(emptied)))
         self._tm_fill_plan = []
         self.tm_panel.clear_reuse()
-        self.status_label.setText(strings.TM_PANEL_CHECK_FILLED.format(n=len(plan)))
+        l1_started = self._controller.start_structure_check() if self._api_client.is_configured else False
+        if l1_started:
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=len(plan)))
+        elif not self._api_client.is_configured:
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_OFFLINE.format(n=len(plan)))
+        elif self._controller.structure_known_unavailable():
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_UNAVAILABLE.format(n=len(plan)))
+        else:
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED.format(n=len(plan)))
         self._update_controls()
 
     def _promote_from_term_finding(self) -> None:

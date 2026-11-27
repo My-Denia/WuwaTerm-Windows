@@ -1176,3 +1176,159 @@ def test_batch_resume_reopened_untranslated_partial_prefix_and_retranslate_undo(
         assert controller.payload["alignments"][1]["target"]["text"] == t2
         assert controller.payload["alignments"][2]["target"]["text"] == t3
     asyncio.run(scenario())
+
+
+def test_incremental_translation_skips_trusted_context_matches_and_runs_layer1(tmp_path) -> None:
+    from wuwaterm_client import translation_memory as tm
+
+    async def scenario() -> None:
+        memory = tm.TranslationMemory(tmp_path / "tm.sqlite3", clock=lambda: "2026-11-27T00:00:00Z")
+        rev = BASIS["dictionary"]["revision"]
+        commit = BASIS["dictionary"]["source_commit"]
+        # Keep each paragraph > 950 scalars so ready pairs stay distinct under segmentation's 1800-scalar merge cap.
+        original_sources = [f"第{i}段原文内容。" + "文" * 960 for i in range(6)]
+        original_targets = [f"Segment {i} target." + "x" * 960 for i in range(6)]
+        for i in range(6):
+            memory.add(
+                original_sources[i],
+                original_targets[i],
+                "en",
+                prev_source=original_sources[i - 1] if i > 0 else None,
+                next_source=original_sources[i + 1] if i + 1 < 6 else None,
+                origin=tm.TM_ORIGIN_HUMAN,
+                terms_db_revision=rev,
+                game_version=commit,
+            )
+
+        # Case 1: Edit segment 2 -> affects segment 2 (unmatched) and its neighbours 1 & 3 (exact_fresh, not context_exact).
+        # Untouched segments 0, 4, 5 remain context_exact_fresh and must incur 0 model calls.
+        edited_sources = list(original_sources)
+        edited_sources[2] = "第2段已修改的新内容。" + "文" * 960
+        client = FakeClient(capabilities=(
+            dc.semantic.CAPABILITY_TRANSLATION_CONTEXT,
+            dc.structure.CAPABILITY_STRUCTURE_CHECK,
+        ))
+        host = StubHost()
+        draft = empty_workfile()
+        draft.update(source="\n\n".join(edited_sources), target="", direction="en")
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = draft
+        controller.term_basis = dict(BASIS)
+
+        controller.start_translation()
+        await settle(controller)
+
+        # Only segments 1, 2, 3 were sent to the model; 0, 4, 5 had zero model calls.
+        assert [c["text"] for c in client.translation_calls] == [
+            edited_sources[1], edited_sources[2], edited_sources[3],
+        ]
+        assert controller.payload["target"] == "\n\n".join([
+            original_targets[0],
+            f"[{edited_sources[1]}]",
+            f"[{edited_sources[2]}]",
+            f"[{edited_sources[3]}]",
+            original_targets[4],
+            original_targets[5],
+        ])
+        assert len(controller.payload["alignments"]) == 6
+        assert [a["target"]["text"] for a in controller.payload["alignments"]] == [
+            original_targets[0],
+            f"[{edited_sources[1]}]",
+            f"[{edited_sources[2]}]",
+            f"[{edited_sources[3]}]",
+            original_targets[4],
+            original_targets[5],
+        ]
+        # Layer 1 structure check ran after incremental translation.
+        assert len(client.structure_calls) == 1
+        assert len(client.structure_calls[0]["segments"]) == 6
+        assert controller.structure.phase == "done"
+
+        summary = controller.last_tm_translation_summary
+        assert summary is not None
+        assert summary["reused_segments"] == 3
+        assert summary["translated_segments"] == 3
+        assert summary["total_segments"] == 6
+        assert summary["model_calls"] == 3
+        assert summary["saved_ratio"] == 0.5
+        assert summary["terms_db_revision"] == rev
+        assert summary["l1_triggered"] is True
+        # Status summary reports counts & revision and never leaks source or target text.
+        status_text = host.statuses[-1]
+        assert "3" in status_text and "50%" in status_text
+        for secret in (*edited_sources, *original_targets):
+            assert secret not in status_text
+
+        # Case 2: All 6 segments unchanged -> 0 model calls, 100% reused, Layer 1 triggered.
+        client2 = FakeClient(capabilities=(dc.structure.CAPABILITY_STRUCTURE_CHECK,))
+        host2 = StubHost()
+        draft2 = empty_workfile()
+        draft2.update(source="\n\n".join(original_sources), target="", direction="en")
+        c2 = dc.DocumentRunController(client2, host2, translation_memory=memory)
+        host2.controller = c2
+        c2.payload = draft2
+        c2.term_basis = dict(BASIS)
+
+        c2.start_translation()
+        await settle(c2)
+
+        assert client2.translation_calls == []
+        assert c2.payload["target"] == "\n\n".join(original_targets)
+        assert len(client2.structure_calls) == 1
+        assert c2.structure.phase == "done"
+        assert c2.last_tm_translation_summary["reused_segments"] == 6
+        assert c2.last_tm_translation_summary["model_calls"] == 0
+        assert c2.last_tm_translation_summary["saved_ratio"] == 1.0
+        assert "100%" in host2.statuses[-1]
+
+        # Case 3: Missing verified terms_db_revision (term_basis=None) -> falls back to original full model path.
+        client3 = FakeClient(capabilities=(dc.structure.CAPABILITY_STRUCTURE_CHECK,))
+        host3 = StubHost()
+        draft3 = empty_workfile()
+        draft3.update(source="\n\n".join(original_sources[:2]), target="", direction="en")
+        c3 = dc.DocumentRunController(client3, host3, translation_memory=memory)
+        host3.controller = c3
+        c3.payload = draft3
+        c3.start_translation()
+        await settle(c3)
+        assert [c["text"] for c in client3.translation_calls] == original_sources[:2]
+        assert c3.last_tm_translation_summary is None
+
+        # Case 4: Homograph Encore! whose neighbour changed (exact_fresh, not context_exact_fresh)
+        # is never skipped when resuming untranslated segments in an aligned draft.
+        story_prev, encore, story_next = "角色剧情台词。", "Encore!", "她露出了微笑。"
+        memory.add(encore, "安可！", "en", prev_source=story_prev, next_source=story_next,
+                   origin=tm.TM_ORIGIN_HUMAN, terms_db_revision=rev, game_version=commit)
+        review_intro = "演出评论开场。" + "评" * 960
+        review_outro = "观众鼓掌喝彩。" + "赞" * 960
+        memory.add(review_outro, "Audience applauds.", "en", prev_source=encore,
+                   origin=tm.TM_ORIGIN_HUMAN, terms_db_revision=rev, game_version=commit)
+        homograph_src = f"{review_intro}\n\n{encore}\n\n{review_outro}"
+        intro_target = "Performance review intro." + "x" * 960
+        c4_align = [
+            {"source": {"start": 0, "end": len(review_intro), "text": review_intro},
+             "target": {"start": 0, "end": len(intro_target), "text": intro_target}},
+            {"source": {"start": len(review_intro) + 2, "end": len(review_intro) + 2 + len(encore), "text": encore},
+             "target": None},
+            {"source": {"start": len(homograph_src) - len(review_outro), "end": len(homograph_src), "text": review_outro},
+             "target": None},
+        ]
+        client4 = FakeClient(capabilities=(dc.structure.CAPABILITY_STRUCTURE_CHECK,))
+        host4 = StubHost()
+        draft4 = empty_workfile()
+        draft4.update(source=homograph_src, target=intro_target, direction="en", alignments=c4_align)
+        c4 = dc.DocumentRunController(client4, host4, translation_memory=memory)
+        host4.controller = c4
+        c4.payload = draft4
+        c4.term_basis = dict(BASIS)
+
+        c4.start_translation()
+        await settle(c4)
+        # review_outro matches context_exact_fresh (skipped, 0 model calls); Encore! is exact_fresh -> sent to model!
+        assert [c["text"] for c in client4.translation_calls] == [encore]
+        assert c4.last_tm_translation_summary["reused_segments"] == 1
+        assert c4.last_tm_translation_summary["translated_segments"] == 1
+        assert "Audience applauds." in c4.payload["target"]
+        assert f"[{encore}]" in c4.payload["target"]
+    asyncio.run(scenario())

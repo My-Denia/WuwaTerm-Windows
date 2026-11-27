@@ -62,9 +62,10 @@ from . import markdown_report as mdr
 from . import segment_records as sr, semantic, strings
 from . import semantic_session as sessions
 from . import structure
+from . import translation_memory as tm
 from .document_edits import (
-    TYPING_COALESCE_MS, AlignmentRemap, HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory, EditOutcome,
-    PART_KEYS, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED,
+    MAX_SPAN_SCALARS, TYPING_COALESCE_MS, AlignmentRemap, HistoryEntry, HistoryOutcome, CommandOutcome, EditHistory,
+    EditOutcome, PART_KEYS, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM, REASON_REJECTED,
     REASON_STALE, REVIEW_KEYS, append_invalidations, compute_minimal_splice, copy_payload, draft_of,
     merge_draft, narrow_splice, normalize_semantic, remap_for_edit, remap_for_free_edit, remap_for_target_fill,
     remap_splice, restore_draft_into, valid_invalidation,
@@ -144,6 +145,10 @@ class Translation:
     batch_remaining: list[tuple[int, int]] = field(default_factory=list)
     batch_total: int = 0
     batch_done: int = 0
+    tm_reused: int = 0
+    tm_revision: str | None = None
+    tm_game_version: str | None = None
+    tm_model_calls: int = 0
 
 
 class TranslationResponse(Protocol):
@@ -281,9 +286,12 @@ class DocumentRunController:
     """The workbench's runs, its document commands and the state both commit to."""
 
     def __init__(self, api_client: WorkbenchApiClient, host: WorkbenchHost,
-                 clock: Callable[[], float] | None = None) -> None:
+                 clock: Callable[[], float] | None = None,
+                 translation_memory: tm.TranslationMemory | None = None) -> None:
         self.api_client = api_client
         self.host = host
+        self.translation_memory = translation_memory
+        self.last_tm_translation_summary: dict[str, Any] | None = None
         # The manuscript. Everything that commits writes it; the view reads it.
         self.payload: dict[str, Any] = empty_workfile()
         # The undo and redo steps of edits, term choices and decisions.
@@ -1581,6 +1589,302 @@ class DocumentRunController:
                 )
         return None
 
+    def _tm_provenance(self) -> tuple[str | None, str | None]:
+        """Current verified (terms_db_revision, game_version) from this session."""
+        terms: str | None = None
+        game: str | None = None
+        sources: list[dict[str, Any]] = []
+        if isinstance(self.term_basis, dict):
+            sources.append(self.term_basis)
+        latest = self.latest_trusted()
+        if isinstance(latest, dict) and isinstance(latest.get("report"), dict):
+            sources.append(latest["report"])
+        for source in sources:
+            dictionary = source.get("dictionary")
+            if not isinstance(dictionary, dict):
+                continue
+            if terms is None:
+                rev = dictionary.get("revision")
+                if isinstance(rev, str) and rev:
+                    terms = rev
+            if game is None:
+                for key in ("game_version", "source_commit"):
+                    val = dictionary.get(key)
+                    if isinstance(val, str) and val.strip() and len(val) <= tm.REVISION_SCALARS[1]:
+                        game = val
+                        break
+        if terms is None and game is None:
+            getter = getattr(self.host, "tm_provenance", None)
+            if callable(getter):
+                terms, game = getter()
+        return terms, game
+
+    @staticmethod
+    def _tm_revision_label(revision: str | None) -> str:
+        if not revision:
+            return strings.TM_NOT_RECORDED
+        return revision if len(revision) <= 16 else revision[:12]
+
+    def _client_configured(self) -> bool:
+        if hasattr(self.api_client, "is_configured"):
+            return bool(self.api_client.is_configured)
+        if hasattr(self.api_client, "configured"):
+            return bool(self.api_client.configured)
+        return True
+
+    def _tm_l1_status_note(self, l1_started: bool) -> str:
+        if l1_started:
+            return strings.MANUSCRIPT_TRANSLATE_TM_L1_RUNNING
+        if not self._client_configured():
+            return strings.MANUSCRIPT_TRANSLATE_TM_L1_OFFLINE
+        if self.structure_known_unavailable():
+            return strings.MANUSCRIPT_TRANSLATE_TM_L1_UNAVAILABLE
+        return ""
+
+    def _classify_tm_sources(
+        self,
+        sources: Sequence[str],
+        direction: str,
+        terms_rev: str,
+        game_ver: str | None,
+    ) -> list[tm.TmSegmentClassification | None]:
+        memory = self.translation_memory
+        assert memory is not None
+
+        def readable(text: str) -> bool:
+            return bool(text.strip()) and len(text) <= tm.SOURCE_SCALARS[1]
+
+        def neighbour(index: int) -> str | None:
+            return sources[index] if 0 <= index < len(sources) and readable(sources[index]) else None
+
+        classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
+        run: list[int] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            items = [
+                {
+                    "source": sources[index],
+                    "prev_source": neighbour(index - 1),
+                    "next_source": neighbour(index + 1),
+                }
+                for index in run
+            ]
+            found = memory.classify_segments_for_tm(
+                items,
+                direction,
+                current_terms_db_revision=terms_rev,
+                current_game_version=game_ver,
+            )
+            for index, item in zip(run, found):
+                classes[index] = item
+            run.clear()
+
+        for position, text in enumerate(sources):
+            if readable(text):
+                run.append(position)
+            else:
+                flush()
+        flush()
+        return classes
+
+    def _apply_tm_fill_transaction(
+        self,
+        raw_target: str,
+        alignments: list[dict[str, Any]] | None,
+        fills: Sequence[tuple[int, int, str, int, int]],
+    ) -> bool:
+        """Write matched TM segments into target in one undoable transaction."""
+        source = self.payload["source"]
+        current = raw_target
+        working_alignments = copy.deepcopy(alignments)
+        shift = 0
+        invalidated: list[dict] = []
+        emptied: list[dict] = []
+        for start, end, text, source_start, source_end in fills:
+            position = start + shift
+            left = "\n\n" if position > 0 and current[position - 1] not in WHITESPACE else ""
+            right = "\n\n" if position < len(current) and current[position] not in WHITESPACE else ""
+            inserted = left + text + right
+            filled = current[:position] + inserted + current[end + shift:]
+            fill_start = position + len(left)
+            remap = remap_for_target_fill(
+                working_alignments,
+                source,
+                filled,
+                source_start,
+                source_end,
+                position,
+                fill_start,
+                fill_start + len(text),
+                len(inserted),
+            )
+            working_alignments = remap.alignments
+            invalidated.extend(remap.invalidated)
+            emptied.extend(remap.emptied_targets)
+            current = filled
+            shift += len(inserted) - (end - start)
+        splice = compute_minimal_splice(raw_target, current) or (0, 0, 0)
+        edit = ("target", *splice)
+        combined_remap = AlignmentRemap(working_alignments, tuple(invalidated), tuple(emptied))
+        return self.host.apply_target_write(current, edit, remap=combined_remap)
+
+    def _prefill_from_translation_memory(
+        self,
+        terms_rev: str,
+        game_ver: str | None,
+    ) -> tuple[bool, int]:
+        """Pre-fill strictly trusted (context_exact + verified_fresh) segments.
+
+        Returns ``(rejected_by_editor, reused_count)``.
+        """
+        memory = self.translation_memory
+        if memory is None or not memory.usable:
+            return False, 0
+        payload = self.payload
+        source, target, direction = payload["source"], payload["target"], payload["direction"]
+        if blank(source):
+            return False, 0
+        try:
+            if payload["alignments"] is not None:
+                pairs = self.current_pairs()
+                if not pairs:
+                    return False, 0
+                sources = [source[p.source.core_start:p.source.core_end] for p in pairs]
+                classes = self._classify_tm_sources(sources, direction, terms_rev, game_ver)
+                fills: list[tuple[int, int, str, int, int]] = []
+                for p, item in zip(pairs, classes):
+                    if p.status != STATUS_UNTRANSLATED:
+                        continue
+                    if item is None or item.status != tm.TM_STATUS_CONTEXT_EXACT_FRESH or item.match is None:
+                        continue
+                    text = item.match.entry.target_text
+                    if text.strip():
+                        fills.append((p.target.core_start, p.target.core_end, text, p.source.start, p.source.end))
+                if not fills:
+                    return False, 0
+                fills.sort(key=lambda item: (item[0], item[1], item[3], item[4]))
+                if not self._apply_tm_fill_transaction(target, payload["alignments"], fills):
+                    return True, 0
+                return False, len(fills)
+
+            if blank(target):
+                para_ranges = seg_paragraph_ranges(source)
+                if not para_ranges:
+                    return False, 0
+                para_cores = [seg_core(source, ps, pe) for ps, pe in para_ranges]
+                sources = [source[cs:ce] for cs, ce in para_cores]
+                classes = self._classify_tm_sources(sources, direction, terms_rev, game_ver)
+                matched = [
+                    i for i, item in enumerate(classes)
+                    if item is not None and item.status == tm.TM_STATUS_CONTEXT_EXACT_FRESH
+                    and item.match is not None and item.match.entry.target_text.strip()
+                ]
+                if not matched:
+                    return False, 0
+                if len(para_cores) > 64:
+                    if len(matched) == len(para_cores):
+                        changed = "\n\n".join(classes[i].match.entry.target_text for i in matched)  # type: ignore[union-attr]
+                        ok = self.host.apply_target_write(
+                            changed, ("target", 0, 0, len(changed)), remap=AlignmentRemap(None),
+                        )
+                        return (not ok), (len(matched) if ok else 0)
+                    return False, 0
+                align_cores = [(cs, ce) for cs, ce in para_cores if 0 < ce - cs <= MAX_SPAN_SCALARS]
+                base_alignments = [
+                    {"source": {"start": cs, "end": ce, "text": source[cs:ce]}, "target": None}
+                    for cs, ce in align_cores
+                ]
+                fills = [
+                    (0, 0, classes[i].match.entry.target_text, para_cores[i][0], para_cores[i][1])  # type: ignore[union-attr]
+                    for i in matched
+                ]
+                if not self._apply_tm_fill_transaction("", base_alignments, fills):
+                    return True, 0
+                return False, len(fills)
+
+            partial = self.resumable_partial_prefix()
+            if partial is not None:
+                s_paras = seg_paragraph_ranges(source)
+                t_paras = seg_paragraph_ranges(target)
+                if not (1 <= len(t_paras) < len(s_paras)) or len(s_paras) > 64:
+                    return False, 0
+                s_cores = [seg_core(source, ps, pe) for ps, pe in s_paras]
+                t_cores = [seg_core(target, ps, pe) for ps, pe in t_paras]
+                if any(ce - cs > MAX_SPAN_SCALARS for cs, ce in (*s_cores, *t_cores)):
+                    return False, 0
+                sources = [source[cs:ce] for cs, ce in s_cores]
+                classes = self._classify_tm_sources(sources, direction, terms_rev, game_ver)
+                matched = [
+                    i for i in range(len(t_cores), len(s_cores))
+                    if classes[i] is not None and classes[i].status == tm.TM_STATUS_CONTEXT_EXACT_FRESH  # type: ignore[union-attr]
+                    and classes[i].match is not None and classes[i].match.entry.target_text.strip()  # type: ignore[union-attr]
+                ]
+                if not matched:
+                    return False, 0
+                base_alignments = [
+                    {
+                        "source": {"start": cs, "end": ce, "text": source[cs:ce]},
+                        "target": {"start": tcs, "end": tce, "text": target[tcs:tce]},
+                    }
+                    for (cs, ce), (tcs, tce) in zip(s_cores[:len(t_cores)], t_cores, strict=True)
+                ] + [
+                    {"source": {"start": cs, "end": ce, "text": source[cs:ce]}, "target": None}
+                    for cs, ce in s_cores[len(t_cores):]
+                ]
+                insert_at = t_cores[-1][1]
+                fills = [
+                    (insert_at, insert_at, classes[i].match.entry.target_text, s_cores[i][0], s_cores[i][1])  # type: ignore[union-attr]
+                    for i in matched
+                ]
+                if not self._apply_tm_fill_transaction(target, base_alignments, fills):
+                    return True, 0
+                return False, len(fills)
+        except (tm.TmError, OSError):
+            return False, 0
+        return False, 0
+
+    def _record_tm_summary(
+        self,
+        *,
+        reused: int,
+        translated: int,
+        model_calls: int,
+        terms_rev: str | None,
+        game_ver: str | None,
+        l1_started: bool,
+    ) -> str:
+        total = reused + translated
+        saved_ratio = (reused / total) if total > 0 else 0.0
+        self.last_tm_translation_summary = {
+            "reused_segments": reused,
+            "translated_segments": translated,
+            "total_segments": total,
+            "model_calls": model_calls,
+            "saved_ratio": saved_ratio,
+            "terms_db_revision": terms_rev,
+            "game_version": game_ver,
+            "l1_triggered": l1_started,
+        }
+        rev_label = self._tm_revision_label(terms_rev)
+        l1_note = self._tm_l1_status_note(l1_started)
+        if translated == 0:
+            return strings.MANUSCRIPT_TRANSLATE_TM_ALL_REUSED.format(
+                reused=reused,
+                revision=rev_label,
+                l1_note=l1_note,
+            )
+        pct = round(saved_ratio * 100)
+        return strings.MANUSCRIPT_TRANSLATE_TM_SUMMARY.format(
+            reused=reused,
+            translated=translated,
+            total=total,
+            pct=pct,
+            revision=rev_label,
+            l1_note=l1_note,
+        )
+
     def start_translation(self, *, single_segment: bool = False) -> None:
         """Translate a blank target, resume remaining untranslated paragraphs,
         or translate/re-translate one segment without overwriting finished work."""
@@ -1598,7 +1902,51 @@ class DocumentRunController:
         partial_tail = None
         batch_spans: list[tuple[int, int]] = []
         retranslate_pair = None
-        if cursor is None and blank(target):
+        tm_reused = 0
+        tm_revision: str | None = None
+        tm_game_version: str | None = None
+        if cursor is None and not single_segment and (blank(target) or not self.translation_withdrawn):
+            if self.translation_memory is not None and self.translation_memory.usable:
+                terms_rev, game_ver = self._tm_provenance()
+                if terms_rev is not None:
+                    rejected, tm_reused = self._prefill_from_translation_memory(terms_rev, game_ver)
+                    if rejected:
+                        self.host.report_status(strings.MANUSCRIPT_EDIT_REJECTED)
+                        self._translation_ui()
+                        return
+                    if tm_reused > 0:
+                        tm_revision, tm_game_version = terms_rev, game_ver
+                        payload = self.payload
+                        source, target, direction = payload["source"], payload["target"], payload["direction"]
+
+        if tm_reused > 0:
+            self.stop_translation()
+            self.translation_withdrawn = False
+            pairs = self.current_pairs()
+            remaining = [p for p in pairs if p.status == STATUS_UNTRANSLATED]
+            if not remaining:
+                mismatched = sum(1 for p in pairs if p.status == STATUS_NEEDS_MANUAL_SPLIT)
+                self.host.report_translation_complete(mismatched)
+                l1_started = self.start_structure_check() if self._client_configured() else False
+                summary_text = self._record_tm_summary(
+                    reused=tm_reused,
+                    translated=0,
+                    model_calls=0,
+                    terms_rev=tm_revision,
+                    game_ver=tm_game_version,
+                    l1_started=l1_started,
+                )
+                self.host.report_status(summary_text)
+                self._translation_ui()
+                return
+            pair = remaining[0]
+            batch_spans = [(p.source.core_start, p.source.core_end) for p in remaining]
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_TM_PREFILL.format(
+                reused=tm_reused,
+                remaining=len(batch_spans),
+                revision=self._tm_revision_label(tm_revision),
+            ))
+        elif cursor is None and blank(target):
             self.translation_withdrawn = False
         elif cursor is None:
             selected = self.host.selected_segment()
@@ -1635,8 +1983,9 @@ class DocumentRunController:
             return
 
         retry = cursor is not None and self.translate_state == "failed"
-        self.stop_translation()
-        self.translation_withdrawn = False
+        if tm_reused == 0:
+            self.stop_translation()
+            self.translation_withdrawn = False
         if cursor is not None and cursor.batch_remaining:
             self._launch_batch_untranslated(cursor, retry=retry)
             return
@@ -1650,6 +1999,9 @@ class DocumentRunController:
                 batch_remaining=list(batch_spans),
                 batch_total=len(batch_spans),
                 batch_done=0,
+                tm_reused=tm_reused,
+                tm_revision=tm_revision,
+                tm_game_version=tm_game_version,
             )
             self._launch_batch_untranslated(initial, retry=False)
             return
@@ -1751,6 +2103,10 @@ class DocumentRunController:
             batch_remaining=list(base_run.batch_remaining),
             batch_total=base_run.batch_total or len(base_run.batch_remaining),
             batch_done=base_run.batch_done,
+            tm_reused=base_run.tm_reused,
+            tm_revision=base_run.tm_revision,
+            tm_game_version=base_run.tm_game_version,
+            tm_model_calls=base_run.tm_model_calls,
         )
         self.translate_run, self.translate_state = run, "retrying" if retry else "waiting"
         self.translate_task = asyncio.ensure_future(self.run_batch_untranslated(run))
@@ -1793,6 +2149,7 @@ class DocumentRunController:
                         )
                         context = {**({"before": before} if before is not None else {}),
                                    **({"precedents": precedents} if precedents else {})} or None
+                    run.tm_model_calls += 1
                     result = await self.api_client.translate(core, to=run.direction, context=context)
                     if generation != self.translate_generation:
                         return
@@ -1842,6 +2199,17 @@ class DocumentRunController:
         self.translate_run, self.translate_state = None, TRANSLATION_IDLE
         mismatched = sum(1 for p in self.current_pairs() if p.status == STATUS_NEEDS_MANUAL_SPLIT)
         self.host.report_translation_complete(mismatched)
+        if run.tm_reused > 0:
+            l1_started = self.start_structure_check() if self._client_configured() else False
+            summary_text = self._record_tm_summary(
+                reused=run.tm_reused,
+                translated=run.batch_done,
+                model_calls=run.tm_model_calls,
+                terms_rev=run.tm_revision,
+                game_ver=run.tm_game_version,
+                l1_started=l1_started,
+            )
+            self.host.report_status(summary_text)
         self.host.refresh_segments_if_shown()
 
     def translation_done(self, run: Translation) -> None:

@@ -43,6 +43,7 @@ _STALE_LABELS = {
     tm.TM_STALE_TERMS_REVISION: strings.TM_STALE_TERMS,
     tm.TM_STALE_GAME_VERSION: strings.TM_STALE_GAME,
     tm.TM_STALE_NUMERIC: strings.TM_STALE_NUMERIC,
+    tm.TM_STALE_PROVENANCE_UNKNOWN: strings.TM_STALE_PROVENANCE_UNKNOWN,
 }
 
 
@@ -71,17 +72,32 @@ class ActiveSegment:
     prev_source: str | None = None
     next_source: str | None = None
     terms_db_revision: str | None = None
+    game_version: str | None = None
 
 
 @dataclass(frozen=True)
 class ReuseSummary:
-    """What ``classify_segments_for_tm`` found, counted for the heading line."""
+    """What ``classify_segments_for_tm`` found, counted for the heading line.
+
+    ``fresh`` counts only trusted reuse candidates (``context_exact`` with
+    verified provenance); ``stale`` counts all reference-only candidates
+    (different/unknown context, unknown provenance, stale version, or numeric
+    / normalized variants).
+    """
 
     fresh: int
     stale: int
     unmatched: int
     fillable: int
     skipped: int = 0
+
+    @property
+    def trusted(self) -> int:
+        return self.fresh
+
+    @property
+    def reference(self) -> int:
+        return self.stale
 
 
 class TranslationMemoryPanel(QFrame):
@@ -288,6 +304,7 @@ class TranslationMemoryPanel(QFrame):
                 prev_source=active.prev_source,
                 next_source=active.next_source,
                 current_terms_db_revision=active.terms_db_revision,
+                current_game_version=active.game_version,
                 limit=MAX_LISTED_MATCHES,
             )
         except (tm.TmError, OSError) as error:
@@ -355,6 +372,10 @@ class TranslationMemoryPanel(QFrame):
         lines.setContentsMargins(10, 4, 10, 4)
         lines.setSpacing(1)
         badges = [match_kind_label(match.match_kind)]
+        if match.match_kind == tm.TM_MATCH_CONTEXT_EXACT and match.freshness == tm.TM_FRESHNESS_VERIFIED:
+            badges.append(strings.TM_BADGE_TRUSTED_REUSE)
+        elif match.match_kind == tm.TM_MATCH_EXACT and match.freshness == tm.TM_FRESHNESS_VERIFIED:
+            badges.append(strings.TM_BADGE_REFERENCE_ONLY)
         warnings = stale_labels(match.stale_reasons)
         if warnings:
             badges.append(" · ".join(warnings))

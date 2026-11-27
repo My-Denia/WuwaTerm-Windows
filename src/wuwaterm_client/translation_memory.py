@@ -75,9 +75,14 @@ TM_STATUS_EXACT_FRESH: Final = "exact_fresh"
 TM_STATUS_STALE_OR_NUMERIC_REFERENCE: Final = "stale_or_numeric_reference"
 TM_STATUS_UNMATCHED: Final = "unmatched"
 
+TM_FRESHNESS_VERIFIED: Final = "verified_fresh"
+TM_FRESHNESS_STALE: Final = "known_stale"
+TM_FRESHNESS_UNKNOWN: Final = "provenance_unknown"
+
 TM_STALE_TERMS_REVISION: Final = "terms_revision_changed"
 TM_STALE_GAME_VERSION: Final = "game_version_changed"
 TM_STALE_NUMERIC: Final = "numeric_changed"
+TM_STALE_PROVENANCE_UNKNOWN: Final = "provenance_unknown"
 
 # A segment core is 1..2000 scalars in the manuscript contract; a memory stores
 # the same text, so it uses the same bound rather than inventing a second one.
@@ -526,6 +531,7 @@ class TmMatch:
     stale_reasons: tuple[str, ...]
     numeric_changed: bool
     needs_recheck: bool
+    freshness: str = TM_FRESHNESS_VERIFIED
 
 
 @dataclass(frozen=True)
@@ -1158,9 +1164,9 @@ class TranslationMemory:
             best = matches[0] if matches else None
             if best is None:
                 status = TM_STATUS_UNMATCHED
-            elif best.match_kind == TM_MATCH_CONTEXT_EXACT and not best.stale_reasons:
+            elif best.match_kind == TM_MATCH_CONTEXT_EXACT and best.freshness == TM_FRESHNESS_VERIFIED:
                 status = TM_STATUS_CONTEXT_EXACT_FRESH
-            elif best.match_kind == TM_MATCH_EXACT and not best.stale_reasons:
+            elif best.match_kind == TM_MATCH_EXACT and best.freshness == TM_FRESHNESS_VERIFIED:
                 status = TM_STATUS_EXACT_FRESH
             else:
                 status = TM_STATUS_STALE_OR_NUMERIC_REFERENCE
@@ -1169,19 +1175,34 @@ class TranslationMemory:
 
     def _match(self, entry: TmEntry, kind: str, terms: str | None, game: str | None) -> TmMatch:
         reasons: list[str] = []
-        if terms is not None and entry.terms_db_revision != terms:
+        terms_stale = terms is not None and entry.terms_db_revision is not None and entry.terms_db_revision != terms
+        game_stale = game is not None and entry.game_version is not None and entry.game_version != game
+        if terms_stale:
             reasons.append(TM_STALE_TERMS_REVISION)
-        if game is not None and entry.game_version != game:
+        if game_stale:
             reasons.append(TM_STALE_GAME_VERSION)
         numeric = kind == TM_MATCH_NUMERIC_VARIANT
         if numeric:
             reasons.append(TM_STALE_NUMERIC)
+        terms_unknown = terms is None or entry.terms_db_revision is None
+        game_unknown = (game is None) != (entry.game_version is None)
+        provenance_unknown = not (terms_stale or game_stale) and (terms_unknown or game_unknown)
+        if terms_stale or game_stale:
+            freshness = TM_FRESHNESS_STALE
+        elif provenance_unknown:
+            reasons.append(TM_STALE_PROVENANCE_UNKNOWN)
+            freshness = TM_FRESHNESS_UNKNOWN
+        elif numeric:
+            freshness = TM_FRESHNESS_STALE
+        else:
+            freshness = TM_FRESHNESS_VERIFIED
         return TmMatch(
             entry=entry,
             match_kind=kind,
             stale_reasons=tuple(reasons),
             numeric_changed=numeric,
-            needs_recheck=bool(reasons),
+            needs_recheck=freshness != TM_FRESHNESS_VERIFIED or numeric,
+            freshness=freshness,
         )
 
     # -- portable files ----------------------------------------------------
