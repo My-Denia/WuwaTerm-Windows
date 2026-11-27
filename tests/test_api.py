@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from wuwaterm_client import errors, strings
-from wuwaterm_client.api import ApiClient
+from wuwaterm_client.api import ApiClient, MetaResult
 from wuwaterm_client.errors import ERROR_TIMEOUT, ERROR_UNKNOWN, ClientError
 
 
@@ -346,10 +346,71 @@ def test_get_meta_keeps_known_fields_when_the_server_adds_fields() -> None:
     assert result.schema_version == "1"
     assert result.source_profile == "official"
     assert result.source_commit == "abc123"
+    assert result.source_game_version == "3.7.0"
     assert result.term_count == 42
     assert result.llm_configured is True
     assert result.request_id == "req-meta"
-    assert "source_game_version" not in result.__dataclass_fields__
+    assert "source_resource_version" not in result.__dataclass_fields__
+    assert "source_changelist" not in result.__dataclass_fields__
+    assert "future_field" not in result.__dataclass_fields__
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("3.7.0", "3.7.0"),
+        ("  3.7.0  ", "3.7.0"),
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("unavailable", None),
+        ("Unavailable", None),
+    ],
+)
+def test_meta_result_parses_and_normalizes_source_game_version(raw_value, expected) -> None:
+    payload = {
+        "service_version": "0.4.0",
+        "api_version": "v1",
+        "schema_version": "1",
+        "source_profile": "official",
+        "source_commit": "abc123",
+        "source_game_version": raw_value,
+        "term_count": 42,
+        "llm_configured": True,
+        "request_id": "req-meta-gv",
+    }
+    result = MetaResult.from_json(payload)
+    assert result.source_game_version == expected
+
+
+def test_meta_result_defaults_missing_source_game_version_to_none_and_rejects_non_string() -> None:
+    base = {
+        "service_version": "0.4.0",
+        "api_version": "v1",
+        "schema_version": "1",
+        "source_profile": "official",
+        "source_commit": "abc123",
+        "term_count": 42,
+        "llm_configured": True,
+        "request_id": "req-meta-gv",
+    }
+    assert MetaResult.from_json(base).source_game_version is None
+
+    async def bad_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**base, "source_game_version": 370})
+
+    client = _client(bad_handler)
+
+    async def scenario() -> ClientError:
+        try:
+            await client.get_meta()
+        except ClientError as exc:
+            return exc
+        finally:
+            await client.aclose()
+        raise AssertionError("expected ClientError")
+
+    assert asyncio.run(scenario()).code == ERROR_UNKNOWN
 
 
 def test_a_request_without_a_stored_credential_is_refused_before_transport() -> None:

@@ -1100,6 +1100,9 @@ class DocumentRunController:
             break
         if generation != self.generation:
             return False
+        recorder = getattr(self.host, "record_live_review_dictionary", None)
+        if callable(recorder) and isinstance(report, Mapping):
+            recorder(report.get("dictionary"))
         # The resolutions this check sent: only this session's own choices,
         # and [] (not unknown) lets the next check compare with it, as on the Web.
         snapshot = {"source": source, "target": target, "direction": direction,
@@ -1405,6 +1408,9 @@ class DocumentRunController:
                 return exc
             if generation != self.semantic_generation:
                 return "changed"
+            recorder = getattr(self.host, "record_live_review_dictionary", None)
+            if callable(recorder) and isinstance(report, Mapping):
+                recorder(report.get("dictionary"))
             applied = sr.apply_response(self.payload, request, report, self.term_basis)
             self.term_basis = applied.basis
             self.put_parts(applied.parts)
@@ -1692,9 +1698,13 @@ class DocumentRunController:
                 if isinstance(rev, str) and rev:
                     terms = rev
             if game is None:
-                val = dictionary.get("game_version")
-                if isinstance(val, str) and val.strip() and len(val) <= tm.REVISION_SCALARS[1]:
-                    game = val
+                for key in ("game_version", "source_game_version"):
+                    val = dictionary.get(key)
+                    if isinstance(val, str):
+                        cleaned = val.strip()
+                        if cleaned and cleaned.lower() != "unavailable" and len(cleaned) <= tm.REVISION_SCALARS[1]:
+                            game = cleaned
+                            break
         return terms, game
 
     @staticmethod

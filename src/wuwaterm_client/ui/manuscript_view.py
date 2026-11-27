@@ -14,9 +14,11 @@ one write a run cannot do itself, the editor's own translation edit.
 from __future__ import annotations
 
 import bisect
+import copy
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
@@ -33,6 +35,7 @@ from .. import segment_records as sr
 from .. import semantic, strings
 from .. import structure as l1
 from .. import translation_memory as tm
+from ..api import MetaResult
 from ..config import MAX_PANEL_WIDTH, MIN_PANEL_WIDTH
 from .error_presentation import SEVERITY_INFO, SEVERITY_WARN
 from .. import semantic_session as sessions
@@ -893,6 +896,29 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def tm_provenance(self) -> tuple[str | None, str | None]:
         return self._view._terms_db_revision(), self._view._game_version()
 
+    def record_live_review_dictionary(self, dictionary: Mapping[str, Any] | None) -> None:
+        self._view._record_live_review_dictionary(dictionary)
+
+
+def _normalized_game_version(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or cleaned.lower() == "unavailable" or len(cleaned) > tm.REVISION_SCALARS[1]:
+        return None
+    return cleaned
+
+
+def _dictionary_matches_meta(dictionary: Mapping[str, Any], meta: MetaResult) -> bool:
+    term_count = dictionary.get("term_count")
+    if isinstance(term_count, bool) or not isinstance(term_count, (int, float)):
+        return False
+    return (
+        dictionary.get("schema_version") == meta.schema_version
+        and dictionary.get("source_commit") == meta.source_commit
+        and term_count == meta.term_count
+    )
+
 
 class ManuscriptView(QWidget):
     documentChanged = Signal()
@@ -907,6 +933,8 @@ class ManuscriptView(QWidget):
     # The status bar's facts (counts, the caret's segment, the dictionary)
     # changed; sent at most once per caret or typing pause.
     workbenchStatusChanged = Signal()
+    # A newer live /v1/reviews response disagreed with the cached /v1/meta snapshot.
+    serviceMetaStale = Signal()
 
     def __init__(
         self,
@@ -955,6 +983,8 @@ class ManuscriptView(QWidget):
         self._saved_payload = _copy_payload(self._payload)
         self._path: Path | None = None
         self._report: dict | None = None
+        self._service_meta: MetaResult | None = None
+        self._live_review_dictionary: dict | None = None
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
         # an edit undo must never erase a report added later or undo a save.
@@ -2466,13 +2496,20 @@ class ManuscriptView(QWidget):
         if pairs:
             current = self._pair_index_at(pairs, self._caret_side, self._caret_offset(self._caret_side)) + 1
         basis = self._term_basis
+        live_dictionary = self._live_review_dictionary
+        dictionary = (
+            dict(live_dictionary)
+            if isinstance(live_dictionary, dict)
+            else dict(basis["dictionary"])
+            if isinstance(basis, dict) and isinstance(basis.get("dictionary"), dict)
+            else None
+        )
         return {
             "source_chars": len(_WHITESPACE_RUN.sub("", payload["source"])),
             "target_chars": len(_WHITESPACE_RUN.sub("", payload["target"])),
             "segments": None if pairs is None else len(pairs),
             "current_segment": current,
-            "dictionary": dict(basis["dictionary"]) if isinstance(basis, dict) and isinstance(
-                basis.get("dictionary"), dict) else None,
+            "dictionary": dictionary,
         }
 
     # -- semantic review: derived state --------------------------------------
@@ -4431,8 +4468,12 @@ class ManuscriptView(QWidget):
         self._stop_translation()
         self._clear_semantic()
         self._capabilities = None
+        self._service_meta = None
+        self._live_review_dictionary = None
         # Another service: its basis is unknown until its first check.
         self._reset_term_session(self._segment_cursor)
+        self._refresh_tm_panel()
+        self.workbenchStatusChanged.emit()
         self.status_label.setText(strings.MANUSCRIPT_ENDPOINT_CHANGED)
         self._update_controls()
 
@@ -4901,42 +4942,78 @@ class ManuscriptView(QWidget):
         dialog.exec()
         self._refresh_tm_panel()
 
-    def _terms_db_revision(self) -> str | None:
-        """The dictionary revision the open document's review named, if any.
+    def set_service_meta(self, meta: MetaResult | None) -> None:
+        """Update the live service metadata from ``GET /v1/meta``."""
+        if meta is None:
+            changed = self._service_meta is not None or self._live_review_dictionary is not None
+            self._service_meta = None
+            self._live_review_dictionary = None
+            if changed:
+                self._refresh_tm_panel()
+                self.workbenchStatusChanged.emit()
+            return
+        changed = self._service_meta != meta
+        self._service_meta = meta
+        if (
+            self._live_review_dictionary is not None
+            and not _dictionary_matches_meta(self._live_review_dictionary, meta)
+        ):
+            self._live_review_dictionary = None
+            changed = True
+        if changed:
+            self._refresh_tm_panel()
+            self.workbenchStatusChanged.emit()
 
-        It is the only revision this client can know: the memory compares an
-        entry's recorded revision with it, and an entry that cannot say which
-        dictionary it was confirmed under is listed as a reference.
+    def _record_live_review_dictionary(self, dictionary: Mapping[str, Any] | None) -> None:
+        """Record the dictionary metadata returned by a live ``POST /v1/reviews``
+        call in this session against the active endpoint."""
+        if not isinstance(dictionary, Mapping):
+            return
+        recorded = copy.deepcopy(dict(dictionary))
+        self._live_review_dictionary = recorded
+        if (
+            self._service_meta is not None
+            and not _dictionary_matches_meta(recorded, self._service_meta)
+        ):
+            # The live review response proved the cached /v1/meta snapshot is stale.
+            self._service_meta = None
+            self.serviceMetaStale.emit()
+        self._refresh_tm_panel()
+        self.workbenchStatusChanged.emit()
+
+    def _terms_db_revision(self) -> str | None:
+        """The verified live dictionary revision from this session's ``/v1/reviews``,
+        checked against live ``/v1/meta`` when available.
+
+        Never treats historical ``.wuwaterm`` report/basis state on disk as the
+        currently running service's dictionary revision.
         """
-        # A document report names it; a long manuscript keeps the basis per
-        # record, and the controller's common basis is the same fact for the
-        # dictionary. Either is the revision to compare an entry with.
-        for source in (self._report, self._term_basis):
-            if not isinstance(source, dict):
-                continue
-            dictionary = source.get("dictionary")
-            revision = dictionary.get("revision") if isinstance(dictionary, dict) else None
-            if isinstance(revision, str) and revision:
-                return revision
+        dictionary = self._live_review_dictionary
+        if not isinstance(dictionary, dict):
+            return None
+        if self._service_meta is not None and not _dictionary_matches_meta(dictionary, self._service_meta):
+            return None
+        revision = dictionary.get("revision")
+        if isinstance(revision, str) and revision.strip() and len(revision) <= tm.REVISION_SCALARS[1]:
+            return revision
         return None
 
     def _game_version(self) -> str | None:
-        """The explicit ``dictionary.game_version`` from the open document's review, if any.
+        """The live game version from ``/v1/meta`` (preferred), or explicit
+        ``game_version`` / ``source_game_version`` from a live review dictionary
+        when ``/v1/meta`` has not been fetched yet.
 
-        Never substitutes ``source_commit`` for ``game_version``, so confirming a
-        segment without an explicit server ``game_version`` preserves any
-        previously recorded ``game_version`` rather than overwriting it with a
-        commit SHA.
+        Never substitutes ``source_commit`` for ``game_version``, and never
+        reads historical ``.wuwaterm`` report/basis state.
         """
-        for source in (self._report, self._term_basis):
-            if not isinstance(source, dict):
-                continue
-            dictionary = source.get("dictionary")
-            if not isinstance(dictionary, dict):
-                continue
-            value = dictionary.get("game_version")
-            if isinstance(value, str) and value.strip() and len(value) <= tm.REVISION_SCALARS[1]:
-                return value
+        if self._service_meta is not None:
+            return _normalized_game_version(self._service_meta.source_game_version)
+        dictionary = self._live_review_dictionary
+        if isinstance(dictionary, dict):
+            for key in ("game_version", "source_game_version"):
+                version = _normalized_game_version(dictionary.get(key))
+                if version is not None:
+                    return version
         return None
 
     def _active_segment_pair(self):

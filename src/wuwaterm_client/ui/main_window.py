@@ -7,12 +7,13 @@ not a claim that a service connection has been tested.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import os
 from collections.abc import Callable
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog,
@@ -274,6 +275,8 @@ class MainWindow(QMainWindow):
         footer_layout.addWidget(self.diagnostics_button)
         content_layout.addWidget(footer)
         self._meta = None
+        self._closed = False
+        self._auto_meta_requested = False
         self._shortcut_sheet: ShortcutSheet | None = None
 
         central = QWidget(self)
@@ -296,6 +299,7 @@ class MainWindow(QMainWindow):
         self.manuscript_view.documentOpened.connect(self._on_document_opened)
         # Only the debounced signal: documentChanged fires on every keystroke.
         self.manuscript_view.workbenchStatusChanged.connect(self._refresh_status_bar)
+        self.manuscript_view.serviceMetaStale.connect(self._on_service_meta_stale)
         self.status_view.metaChanged.connect(self._on_meta_changed)
         sync = self.manuscript_view.scroll_sync
         self.scroll_sync_button.setChecked(sync.is_enabled())
@@ -307,6 +311,7 @@ class MainWindow(QMainWindow):
         self.show_page(PAGE_MANUSCRIPT)
         self._refresh_endpoint_state()
         self._fit_to_workspace()
+        self._schedule_initial_meta_refresh()
 
     # -- construction ------------------------------------------------------
 
@@ -556,9 +561,57 @@ class MainWindow(QMainWindow):
         self._shortcut_sheet.raise_()
         self._shortcut_sheet.activateWindow()
 
+    def _has_service_credential(self) -> bool:
+        if not self.api_client.is_configured:
+            return False
+        if self.status_view.credential_status_value.text() == strings.SETTINGS_TOKEN_STATUS_UNKNOWN:
+            return False
+        try:
+            return bool(call_with_origin(has_token, origin=self.config.base_url))
+        except CredentialStoreUnavailable:
+            return False
+
+    def _schedule_initial_meta_refresh(self) -> None:
+        if self._auto_meta_requested or self._meta is not None:
+            return
+        if self.stack.currentIndex() != PAGE_MANUSCRIPT:
+            return
+        if not self._has_service_credential():
+            return
+        self._schedule_silent_meta_refresh()
+
+    def _schedule_silent_meta_refresh(self) -> None:
+        if self._closed or not self._has_service_credential():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            QTimer.singleShot(0, self._trigger_silent_meta_refresh)
+        else:
+            loop.call_soon(self._trigger_silent_meta_refresh)
+
+    def _trigger_silent_meta_refresh(self) -> None:
+        if self._closed or not self._has_service_credential():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self.status_view._task is not None and not self.status_view._task.done():
+            return
+        self._auto_meta_requested = True
+        self.status_view.refresh_meta(silent=True)
+
     def _on_meta_changed(self, meta) -> None:
         self._meta = meta
+        self.manuscript_view.set_service_meta(meta)
         self._refresh_status_bar()
+
+    def _on_service_meta_stale(self) -> None:
+        self._meta = None
+        self.status_view.clear_stale_meta()
+        self._refresh_status_bar()
+        self._schedule_silent_meta_refresh()
 
     def _on_scroll_sync_toggled(self, enabled: bool) -> None:
         self.scroll_sync_button.blockSignals(True)
@@ -808,6 +861,8 @@ class MainWindow(QMainWindow):
         # The status area reports whether a credential is stored; it read that
         # when it was built, which was before this.
         self.status_view.refresh_credential_state()
+        if self._meta is None and self._has_service_credential():
+            self._schedule_silent_meta_refresh()
 
     def _show_refusal(self, exc: ClientError) -> None:
         """Report an address the transport would not take.
@@ -842,6 +897,7 @@ class MainWindow(QMainWindow):
         Nothing here coordinates the cancellations or waits for them: they
         are fire-and-forget, exactly as the Cancel button's are.
         """
+        self._auto_meta_requested = False
         for view in (self.translate_view, self.terms_view, self.status_view, self.manuscript_view):
             view.reset_for_endpoint_change()
         self._meta = None
@@ -851,21 +907,38 @@ class MainWindow(QMainWindow):
         if not self.manuscript_view.confirm_discard():
             event.ignore()
             return
+        self._closed = True
         self._remember_position()
+        self.status_view.cancel_refresh()
         self.manuscript_view.cancel_background_work(clear_recovery_draft=True)
         super().closeEvent(event)
 
     # -- settings ----------------------------------------------------------
 
     def _on_settings_clicked(self) -> None:
+        had_credential = self._has_service_credential()
         dialog = self._new_settings_dialog()
+        applied_address_change = False
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            previous_base_url = self.config.base_url
             self._apply_settings(dialog.result_config())
+            applied_address_change = self.config.base_url != previous_base_url
         # Whether or not the dialog was accepted: entering, changing or
         # forgetting a token inside it writes to the credential store
         # immediately, and Cancel does not undo that.
         self.status_view.refresh_credential_state()
         self._refresh_setup_card()
+        if not applied_address_change:
+            has_credential_now = self._has_service_credential()
+            if not has_credential_now and (had_credential or self._meta is not None):
+                self._meta = None
+                self.status_view.clear_stale_meta()
+                self.manuscript_view.set_service_meta(None)
+                self._refresh_status_bar()
+            elif (not had_credential and has_credential_now) or (
+                has_credential_now and self._meta is None and not self._auto_meta_requested
+            ):
+                self._schedule_silent_meta_refresh()
 
     def _new_settings_dialog(self) -> QDialog:
         """Hand the dialog the address check, so it can refuse before closing.
@@ -917,6 +990,8 @@ class MainWindow(QMainWindow):
         if address_changed:
             self._discard_previous_endpoint_state()
             self.status_view.refresh_credential_state()
+            if self._has_service_credential():
+                self._schedule_silent_meta_refresh()
         # ...and the address on screen, which is the whole point of showing
         # it: a client that has just been configured must stop saying it is
         # not. This also takes down any refusal banner the last attempt left.
@@ -1008,5 +1083,7 @@ class MainWindow(QMainWindow):
             # checklist would keep showing step two unfinished.
             self.status_view.refresh_credential_state()
             self._refresh_setup_card()
+            if self._meta is None and self._has_service_credential():
+                self._schedule_silent_meta_refresh()
             return True
         return False

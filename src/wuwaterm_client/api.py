@@ -122,6 +122,16 @@ def _as_optional_str(value: Any, field: str) -> "str | None":
     return _as_str(value, field)
 
 
+def _normalize_optional_meta_version(value: Any, field: str) -> "str | None":
+    text = _as_optional_str(value, field)
+    if text is None:
+        return None
+    cleaned = text.strip()
+    if not cleaned or cleaned.lower() == "unavailable":
+        return None
+    return cleaned
+
+
 # -- Response models (direct pass-through of the wire schema) --------------
 
 
@@ -191,6 +201,7 @@ class MetaResult:
     term_count: int
     llm_configured: bool
     request_id: str
+    source_game_version: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "MetaResult":
@@ -206,6 +217,9 @@ class MetaResult:
             term_count=_as_int(data["term_count"], "term_count"),
             llm_configured=_as_bool(data["llm_configured"], "llm_configured"),
             request_id=_as_str(data["request_id"], "request_id"),
+            source_game_version=_normalize_optional_meta_version(
+                data.get("source_game_version"), "source_game_version"
+            ),
         )
 
 

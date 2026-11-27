@@ -250,6 +250,36 @@ class StatusView(QWidget):
         self._apply_endpoint_state()
         self.metaChanged.emit(None)
 
+    def clear_stale_meta(self) -> None:
+        """Clear a cached meta snapshot on the same endpoint when a live review
+        proves the service has moved on."""
+        self._generation += 1
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+        for value_label in (
+            self.service_version_value,
+            self.data_profile_value,
+            self.data_commit_value,
+            self.term_count_value,
+            self.model_configured_value,
+        ):
+            value_label.setText(strings.STATUS_UNKNOWN_VALUE)
+        if self._api_version_warned:
+            self._banner.clear()
+            self._api_version_warned = False
+        self._progress.stop()
+        self._has_data = False
+        self._apply_empty_state()
+        self._apply_endpoint_state()
+
+    def cancel_refresh(self) -> None:
+        """Cancel any in-flight meta refresh during window teardown."""
+        self._generation += 1
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
     # -- internals ---------------------------------------------------------
 
     def _refresh_credential_labels(self) -> None:
@@ -316,22 +346,28 @@ class StatusView(QWidget):
         self._empty_card.setVisible(True)
         self._service_card.setVisible(False)
 
-    def _on_refresh_clicked(self) -> None:
-        # The button is disabled inside the coroutine, which does not run
-        # until the loop gets a turn. Two activations before that start two
-        # refreshes whose replies can land in either order.
+    def refresh_meta(self, *, silent: bool = False) -> None:
+        """Fetch service metadata. When ``silent`` is True, keep quiet on failure
+        and do not show loading banners."""
         if self._task is not None and not self._task.done():
             return
         if not self._api_client.is_configured:
             return
         self._generation += 1
-        self._task = asyncio.ensure_future(self._run_refresh(self._generation))
+        self._task = asyncio.ensure_future(self._run_refresh(self._generation, silent=silent))
 
-    async def _run_refresh(self, generation: int) -> None:
+    def _on_refresh_clicked(self) -> None:
+        # The button is disabled inside the coroutine, which does not run
+        # until the loop gets a turn. Two activations before that start two
+        # refreshes whose replies can land in either order.
+        self.refresh_meta(silent=False)
+
+    async def _run_refresh(self, generation: int, *, silent: bool = False) -> None:
         self.refresh_button.setEnabled(False)
-        self._banner.clear()
-        self._progress.start()
-        self.status_label.set_text(strings.STATUS_LOADING)
+        if not silent:
+            self._banner.clear()
+            self._progress.start()
+            self.status_label.set_text(strings.STATUS_LOADING)
         try:
             meta = await self._api_client.get_meta()
         except ClientError as exc:
@@ -340,12 +376,14 @@ class StatusView(QWidget):
             # say, including about its own failure.
             if generation != self._generation:
                 return
-            self._show_error(exc)
+            if not silent:
+                self._show_error(exc)
         else:
             if generation != self._generation:
                 return
             self._show_meta(meta)
-            self.status_label.set_text(strings.STATUS_BAR_DONE)
+            if not silent:
+                self.status_label.set_text(strings.STATUS_BAR_DONE)
         finally:
             if generation == self._generation:
                 self._progress.stop()
