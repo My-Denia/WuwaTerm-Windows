@@ -1006,6 +1006,11 @@ class ManuscriptView(QWidget):
         # the revision the service is serving now, which needs no review in this
         # session to be authoritative. None means "not known", never "unchanged".
         self._service_dictionary: DictionaryIdentityResult | None = None
+        # How many times that statement has changed - by either producer (this
+        # window's background refresh and a press's own probe). Whichever answer
+        # is newer wins, and a request that captured this value before it started
+        # drops its answer when the value has moved since.
+        self._dictionary_identity_epoch = 0
         self._live_review_dictionary: dict | None = None
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
@@ -5004,6 +5009,18 @@ class ManuscriptView(QWidget):
             self._refresh_tm_panel()
             self.workbenchStatusChanged.emit()
 
+    def dictionary_identity_epoch(self) -> int:
+        """How many times the live identity statement has changed.
+
+        Two producers write it: the window's background refresh and the probe a
+        press runs before it may reuse. Only one order is correct - the newer
+        statement wins - so a request reads this before it starts and drops its
+        answer if the value moved while it was out. That is what keeps an older
+        in-flight answer from overwriting a newer identity, and it needs no
+        agreement between the two callers.
+        """
+        return self._dictionary_identity_epoch
+
     def set_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
         """Update the live dictionary identity from ``GET /v1/dictionary``.
 
@@ -5021,6 +5038,7 @@ class ManuscriptView(QWidget):
         if identity is self._service_dictionary or identity == self._service_dictionary:
             return
         self._service_dictionary = identity
+        self._dictionary_identity_epoch += 1
         if identity is not None:
             self._drop_conflicting_review_dictionary(identity.revision)
         self._refresh_tm_panel()
@@ -5036,6 +5054,8 @@ class ManuscriptView(QWidget):
         """
         if self._service_dictionary is None and self._live_review_dictionary is None:
             return
+        if self._service_dictionary is not None:
+            self._dictionary_identity_epoch += 1
         self._service_dictionary = None
         self._live_review_dictionary = None
         self._refresh_tm_panel()
@@ -5065,18 +5085,9 @@ class ManuscriptView(QWidget):
         if not isinstance(dictionary, Mapping):
             return
         recorded = copy.deepcopy(dict(dictionary))
-        if (
-            self._service_meta is not None
-            and not _dictionary_matches_meta(recorded, self._service_meta)
-        ):
-            # Do not discard or downgrade known _service_meta and do not adopt
-            # a stale/conflicting review dictionary; trigger a non-destructive
-            # silent /v1/meta check while keeping auto reuse paused.
-            self._live_review_dictionary = None
-            self.serviceMetaRefreshRequested.emit()
-            self._refresh_tm_panel()
-            self.workbenchStatusChanged.emit()
-            return
+        # The revision conflict is checked FIRST. A review that reports both a new
+        # revision and a new metadata tuple would otherwise leave through the
+        # metadata branch below with the contradicted identity still installed.
         identity = self._service_dictionary
         if identity is not None:
             review_revision = tm.normalize_provenance_value(recorded.get("revision"))
@@ -5090,10 +5101,23 @@ class ManuscriptView(QWidget):
                 # entries confirmed under a dictionary the service replaced.
                 self._live_review_dictionary = None
                 self._service_dictionary = None
+                self._dictionary_identity_epoch += 1
                 self.serviceMetaRefreshRequested.emit()
                 self._refresh_tm_panel()
                 self.workbenchStatusChanged.emit()
                 return
+        if (
+            self._service_meta is not None
+            and not _dictionary_matches_meta(recorded, self._service_meta)
+        ):
+            # Do not discard or downgrade known _service_meta and do not adopt
+            # a stale/conflicting review dictionary; trigger a non-destructive
+            # silent /v1/meta check while keeping auto reuse paused.
+            self._live_review_dictionary = None
+            self.serviceMetaRefreshRequested.emit()
+            self._refresh_tm_panel()
+            self.workbenchStatusChanged.emit()
+            return
         self._live_review_dictionary = recorded
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()

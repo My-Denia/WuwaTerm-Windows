@@ -689,6 +689,12 @@ class MainWindow(QMainWindow):
         """
         client = self.api_client
         origin = client.current_origin
+        # The statement this answer will replace must be the one that was there
+        # when the request started. A press runs its own probe against the same
+        # view, and the newer of the two answers wins: if the value moved while
+        # this one was out, the answer describes a dictionary that has already
+        # been superseded.
+        epoch = self.manuscript_view.dictionary_identity_epoch()
         identity: "DictionaryIdentityResult | None" = None
         failed = False
         try:
@@ -702,6 +708,8 @@ class MainWindow(QMainWindow):
         if client.current_origin != origin:
             # The address changed while the request was in flight; the reply
             # describes the previous service.
+            return
+        if self.manuscript_view.dictionary_identity_epoch() != epoch:
             return
         if failed:
             self.manuscript_view.clear_live_provenance()

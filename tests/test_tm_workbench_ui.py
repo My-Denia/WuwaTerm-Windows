@@ -2818,3 +2818,109 @@ def test_switching_to_an_endpoint_without_a_credential_asks_it_nothing(
             window.close()
 
     asyncio.run(scenario())
+
+
+def test_a_press_probe_outranks_a_background_identity_answer_already_in_flight(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """One statement, two writers, newest wins.
+
+    The window refreshes the identity in the background and a 翻译 press probes
+    it again. When the press has already installed a newer revision, the older
+    background answer must not land on top of it - otherwise the panel and the
+    next confirmation record the dictionary the service replaced.
+    """
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    newer = OTHER_REVISION
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        held = asyncio.Event()
+        started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                started.set()
+                await held.wait()
+                return httpx.Response(200, json=_dictionary_payload())
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            background = window._dictionary_task
+            assert background is not None
+
+            # What a 翻译 press does when its own probe answers first.
+            view = window.manuscript_view
+            view._controller.record_live_dictionary_identity(DictionaryIdentityResult(
+                revision=newer, schema_version="1", source_commit="a" * 40,
+                source_game_version="3.7.0", term_count=42, request_id="req-press",
+            ))
+            assert view._terms_db_revision() == newer
+
+            held.set()
+            await asyncio.gather(background, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            assert view._terms_db_revision() == newer, "the older background answer won"
+            assert view._service_dictionary.revision == newer
+        finally:
+            held.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_review_contradicting_both_revision_and_metadata_clears_the_identity(qapp, memory) -> None:
+    """The revision conflict is checked before the metadata one.
+
+    A review that reports a new revision *and* a new metadata tuple used to leave
+    through the metadata branch with the contradicted identity still installed -
+    and the identity outlived the refresh if that refresh failed.
+    """
+    identity = DictionaryIdentityResult(
+        revision=REVISION, schema_version="1", source_commit="a" * 40,
+        source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    requested: list[int] = []
+    view.serviceMetaRefreshRequested.connect(lambda: requested.append(1))
+    try:
+        source, target, alignments = two_segments()
+        install(view, source, target, alignments=alignments)
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0",
+        )))
+        view.set_service_dictionary(identity)
+
+        # Another revision AND another tuple in the same review answer.
+        view._record_live_review_dictionary({"schema_version": "2", "source_commit": "b" * 40,
+                                             "term_count": 43, "revision": OTHER_REVISION})
+
+        assert view._service_dictionary is None, "an identity the review contradicted stayed installed"
+        assert view._live_review_dictionary is None
+        assert requested, "nothing asked for a refresh"
+        assert view._terms_db_revision() is None
+    finally:
+        view.close()
