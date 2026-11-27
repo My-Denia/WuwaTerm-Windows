@@ -228,3 +228,5 @@ def test_benchmark_isolates_user_profile_and_reports_window_construct_and_none_r
 
 def test_structure_check_title_does_not_claim_local_rules() -> None:
     assert "本地规则" not in strings.MANUSCRIPT_L1_TITLE
+    assert "提交当前段落" not in strings.MANUSCRIPT_L1_NOTE_DETAIL
+    assert "分批核查当前稿件中符合条件的各段" in strings.MANUSCRIPT_L1_NOTE_DETAIL
