@@ -4497,7 +4497,7 @@ class ManuscriptView(QWidget):
         self._capabilities = None
         self._service_meta = None
         self._live_review_dictionary = None
-        self._service_dictionary = None
+        self._forget_service_dictionary()
         self._controller.live_dictionary_identity = None
         self._controller.identity_probe_state = None
         # Another service: its basis is unknown until its first check.
@@ -4982,12 +4982,17 @@ class ManuscriptView(QWidget):
             )
             self._service_meta = None
             self._live_review_dictionary = None
-            self._service_dictionary = None
+            changed = self._forget_service_dictionary() or changed
             if changed:
                 self._refresh_tm_panel()
                 self.workbenchStatusChanged.emit()
             return
         changed = self._service_meta != meta
+        if changed:
+            # A service can be upgraded in place. What it lists is part of this
+            # refresh's question, so the answer from the previous meta is not
+            # reused for it.
+            self._capabilities = None
         self._service_meta = meta
         if (
             self._live_review_dictionary is not None
@@ -5003,11 +5008,24 @@ class ManuscriptView(QWidget):
             # fetched again, because a 翻译 pressed in between would reuse
             # entries confirmed under the previous dictionary. Unknown is the
             # safe answer, and unknown reuses nothing.
-            self._service_dictionary = None
-            changed = True
+            changed = self._forget_service_dictionary() or changed
         if changed:
             self._refresh_tm_panel()
             self.workbenchStatusChanged.emit()
+
+    def _forget_service_dictionary(self) -> bool:
+        """Drop the live identity statement, and count it as a change.
+
+        Every path that takes the statement away goes through here - a cleared
+        `/v1/meta`, a refused meta tuple, a review that contradicts it, another
+        address, a new credential - so the epoch the two producers compare is
+        moved by all of them, not only by the two writers.
+        """
+        if self._service_dictionary is None:
+            return False
+        self._service_dictionary = None
+        self._dictionary_identity_epoch += 1
+        return True
 
     def dictionary_identity_epoch(self) -> int:
         """How many times the live identity statement has changed.
@@ -5054,9 +5072,7 @@ class ManuscriptView(QWidget):
         """
         if self._service_dictionary is None and self._live_review_dictionary is None:
             return
-        if self._service_dictionary is not None:
-            self._dictionary_identity_epoch += 1
-        self._service_dictionary = None
+        self._forget_service_dictionary()
         self._live_review_dictionary = None
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
@@ -5100,8 +5116,7 @@ class ManuscriptView(QWidget):
                 # served now. Keeping the identity here would let 翻译 reuse
                 # entries confirmed under a dictionary the service replaced.
                 self._live_review_dictionary = None
-                self._service_dictionary = None
-                self._dictionary_identity_epoch += 1
+                self._forget_service_dictionary()
                 self.serviceMetaRefreshRequested.emit()
                 self._refresh_tm_panel()
                 self.workbenchStatusChanged.emit()
@@ -5127,7 +5142,7 @@ class ManuscriptView(QWidget):
         in-flight requests issued under the previous credential cannot commit."""
         self._service_meta = None
         self._live_review_dictionary = None
-        self._service_dictionary = None
+        self._forget_service_dictionary()
         self._controller.invalidate_provenance_for_credential_change()
         if self._review_state == "reviewing":
             self._set_review_state("stopped")

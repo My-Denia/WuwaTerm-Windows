@@ -109,6 +109,10 @@ TRANSLATION_PROBING = "probing"
 IDENTITY_FRESH = "fresh"
 IDENTITY_UNSUPPORTED = "unsupported"
 IDENTITY_FAILED = "failed"
+# The statement moved while this request was out (a newer background refresh, a
+# meta that invalidated it, or a failed probe that cleared it). This answer is
+# older than what is installed now, so it is not adopted.
+IDENTITY_SUPERSEDED = "superseded"
 
 # The draft primitives (``copy_payload``, ``normalize_semantic``, ``PART_KEYS``)
 # live in ``document_edits``: the runs and the commands commit through them,
@@ -578,19 +582,44 @@ class DocumentRunController:
             return None
         client = self.api_client
         getter = getattr(client, "get_dictionary", None)
+        # The statement this answer would replace must be the one that was there
+        # when the request started. The window refreshes the same statement in
+        # the background, and the newer of the two answers wins whichever caller
+        # it came from.
+        start_epoch = self._identity_epoch()
         try:
-            if self.capabilities is None:
-                self.capabilities = await client.get_capabilities()
+            # Capabilities are part of this press's basis, not a session-wide
+            # constant: a service can be upgraded or rolled back in place, and a
+            # cached "no dictionary-identity-v1" would then keep the older review
+            # revision in charge for the rest of the session.
+            self.capabilities = await client.get_capabilities()
             if semantic.CAPABILITY_DICTIONARY_IDENTITY not in self.capabilities:
                 self.identity_probe_state = IDENTITY_UNSUPPORTED
+                # A server that has stopped advertising the endpoint cannot
+                # confirm the identity this session read earlier, so it goes.
+                self.record_live_dictionary_identity(None)
                 return None
             if not callable(getter):
                 self.identity_probe_state = IDENTITY_UNSUPPORTED
+                self.record_live_dictionary_identity(None)
                 return None
             identity = await getter()
+        except ClientError as exc:
+            if exc.code == ERROR_CANCELLED:
+                # The owner cancelled the wait. Nothing was learned, and nothing
+                # already verified was disproved - a cancel is not a 503.
+                return None
+            self.identity_probe_state = IDENTITY_FAILED
+            self.clear_live_provenance()
+            return None
         except Exception:  # noqa: BLE001 - see the docstring: fail closed, never raise
             self.identity_probe_state = IDENTITY_FAILED
             self.clear_live_provenance()
+            return None
+        if self._identity_epoch() != start_epoch:
+            # Something newer was installed while this request was out. Adopting
+            # this answer would restore the statement it replaced.
+            self.identity_probe_state = IDENTITY_SUPERSEDED
             return None
         if identity is None:
             # The endpoint answered "no identity": an older server, or a
@@ -604,6 +633,19 @@ class DocumentRunController:
         self.record_live_dictionary_identity(identity)
         self.identity_probe_state = IDENTITY_FRESH
         return identity
+
+    def _identity_epoch(self) -> int | None:
+        """The host's statement counter, or None for a host that has none.
+
+        The two producers of the identity (this press and the window's
+        background refresh) share it through the host. A stand-in without one -
+        the controller's own tests, a headless run - keeps the older behaviour of
+        no ordering check rather than gaining a fake one.
+        """
+        getter = getattr(self.host, "dictionary_identity_epoch", None)
+        if not callable(getter):
+            return None
+        return getter()
 
     def clear_live_provenance(self) -> None:
         """Forget both live statements about the served dictionary.
@@ -2191,9 +2233,9 @@ class DocumentRunController:
         request per press is what makes that change visible at the moment it
         matters.
 
-        A server already known not to list ``dictionary-identity-v1`` is the one
-        case that spends nothing: it has no answer to give, and the older
-        `/v1/meta` + `/v1/reviews` path stays in charge.
+        The capability list is read again by that request for the same reason: a
+        service can be upgraded or rolled back in place, and what it listed
+        earlier is not an answer about the service that is running now.
         """
         if single_segment:
             return False
@@ -2202,16 +2244,34 @@ class DocumentRunController:
             return False
         if not self._client_configured():
             return False
-        if self.resumable() is not None:
-            return False
         if not (blank(self.payload["target"]) or not self.translation_withdrawn):
             return False
-        if (
-            self.capabilities is not None
-            and semantic.CAPABILITY_DICTIONARY_IDENTITY not in self.capabilities
-        ):
-            return False
-        return True
+        # A press continues a paused run only while that run still fits this
+        # document; when a re-pairing has made it a fresh run after all, the
+        # reuse decision is back and so is the question it asks.
+        resumed, _pair, _wanted = self._resume_for_press()
+        return resumed is None
+
+    def _resume_for_press(self) -> tuple[Translation | None, Any, str | None]:
+        """The paused run this press would continue, its pair, and the status that pair needs.
+
+        ``resumable()`` answers "is the document still the one that run left". A
+        press needs one thing more: the segment it was translating is still
+        there, in the state it needs. Re-pairing the document, or finishing that
+        segment elsewhere, makes the press a fresh run instead - and a fresh run
+        asks which dictionary is served before it reuses anything.
+        """
+        cursor = self.resumable()
+        if cursor is None:
+            return None, None, None
+        if cursor.segment is None:
+            return cursor, None, None
+        wanted = STATUS_READY if cursor.retranslate else STATUS_UNTRANSLATED
+        pair = next((p for p in self.current_pairs()
+                     if p.status == wanted and p.source.core_start == cursor.segment), None)
+        if pair is None:
+            return None, None, None
+        return cursor, pair, wanted
 
     def _launch_translation_after_identity(self, single_segment: bool) -> None:
         """Fetch the identity, then run the same decision ``start_translation`` makes.
@@ -2288,14 +2348,7 @@ class DocumentRunController:
     def _start_translation(self, *, single_segment: bool = False) -> None:
         payload = self.payload
         source, target, direction = payload["source"], payload["target"], payload["direction"]
-        cursor = self.resumable()
-        pair = None
-        if cursor is not None and cursor.segment is not None:
-            wanted = STATUS_READY if cursor.retranslate else STATUS_UNTRANSLATED
-            pair = next((p for p in self.current_pairs()
-                         if p.status == wanted and p.source.core_start == cursor.segment), None)
-            if pair is None:
-                cursor = None
+        cursor, pair, _wanted = self._resume_for_press()
 
         partial_tail = None
         batch_spans: list[tuple[int, int]] = []

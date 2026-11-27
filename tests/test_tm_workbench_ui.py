@@ -2924,3 +2924,124 @@ def test_a_review_contradicting_both_revision_and_metadata_clears_the_identity(q
         assert view._terms_db_revision() is None
     finally:
         view.close()
+
+
+def test_every_identity_reset_moves_the_statement_epoch(qapp, memory) -> None:
+    """One counter, moved by every path that changes the statement.
+
+    The two producers (the window's background refresh and a press's probe)
+    compare this value to decide whether their answer is still the newest. A path
+    that clears the identity without moving it would let an older in-flight answer
+    put a superseded revision back.
+    """
+    identity = DictionaryIdentityResult(
+        revision=REVISION, schema_version="1", source_commit="a" * 40,
+        source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        epoch = view.dictionary_identity_epoch()
+        for reset in (
+            lambda: view.set_service_dictionary(None),
+            lambda: view.clear_live_provenance(),
+            lambda: view.set_service_meta(None),
+            lambda: view.set_service_meta(MetaResult.from_json(_meta_payload(
+                schema_version="2", source_commit="b" * 40, term_count=43, source_game_version="3.8.0"))),
+            lambda: view._record_live_review_dictionary(
+                {"schema_version": "2", "source_commit": "b" * 40, "term_count": 43,
+                 "revision": OTHER_REVISION}),
+            view.reset_for_credential_change,
+            view.reset_for_endpoint_change,
+        ):
+            view.set_service_dictionary(identity)
+            before = view.dictionary_identity_epoch()
+            reset()
+            assert view._service_dictionary is None, reset
+            assert view.dictionary_identity_epoch() > before, ("a reset left the epoch where it was", reset)
+            epoch = view.dictionary_identity_epoch()
+        assert epoch > 0
+    finally:
+        view.close()
+
+
+def test_a_background_answer_cannot_resurrect_what_a_failed_press_cleared(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """A press that could not verify the dictionary clears it.
+
+    The window still has an older answer in flight; it was asked about the state
+    before that clear, so it must not be delivered - otherwise the identity the
+    failed press just refused comes straight back.
+    """
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        state = {"holding": False, "fail_press": False}
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["holding"]:
+                    started.set()
+                    await release.wait()
+                    return httpx.Response(200, json=_dictionary_payload())
+                if state["fail_press"]:
+                    return httpx.Response(503, json={"error": {"code": "llm_unavailable"}, "request_id": "req-d"})
+                return httpx.Response(200, json=_dictionary_payload())
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+            view = window.manuscript_view
+            assert view._service_dictionary is not None, "fixture failed: no identity installed"
+
+            # A second background refresh, whose answer will be held.
+            state["holding"] = True
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            background = window._dictionary_task
+            state["holding"] = False
+
+            # The press's own probe cannot read the dictionary.
+            state["fail_press"] = True
+            assert await view._controller.refresh_live_dictionary_identity() is None
+            assert view._service_dictionary is None, "fixture failed: the failed probe kept the identity"
+
+            # The older background answer arrives now.
+            release.set()
+            if background is not None:
+                await asyncio.gather(background, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            assert view._service_dictionary is None, "a superseded background answer restored the identity"
+            assert view._terms_db_revision() is None
+        finally:
+            release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
