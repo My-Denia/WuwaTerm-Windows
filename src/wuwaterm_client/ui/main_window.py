@@ -698,6 +698,10 @@ class MainWindow(QMainWindow):
         try:
             capabilities = await client.get_capabilities()
             if CAPABILITY_DICTIONARY_IDENTITY in capabilities:
+                # Re-reserve the ordinal at the moment the dictionary request
+                # itself is issued so any answer installed while capabilities
+                # were in flight does not falsely mark this request stale.
+                seq = self.manuscript_view.begin_dictionary_identity_request()
                 identity = await client.get_dictionary()
         except Exception:  # noqa: BLE001 - the probe is optional: a failure means "nothing verified"
             failed = True

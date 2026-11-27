@@ -5125,13 +5125,17 @@ class ManuscriptView(QWidget):
 
         ``seq`` is the ordinal of the request that failed. An answer from an
         older request than one already applied never clears anything (returns
-        False). Otherwise the clear happens even when nothing is cached yet -
-        that is the cold start - because its real effect is retiring the pending
-        answers that were asked before this failure.
+        False). Otherwise both caches are cleared: a sequenced failure advances
+        ``_applied_dictionary_seq`` to at least ``seq`` without retiring newer
+        in-flight requests, while an unsequenced clear (``seq is None``)
+        unconditionally retires every pending request.
         """
         if seq is not None and seq < self._applied_dictionary_seq:
             return False
-        self._retire_dictionary_requests()
+        if seq is None:
+            self._retire_dictionary_requests()
+        else:
+            self._applied_dictionary_seq = max(self._applied_dictionary_seq, seq)
         self._service_dictionary = None
         self._live_review_dictionary = None
         self._refresh_tm_panel()

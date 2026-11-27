@@ -3327,3 +3327,204 @@ def test_cold_start_foreground_503_rejects_late_background_identity(
             window.close()
 
     asyncio.run(scenario())
+
+
+def test_earlier_background_503_does_not_retire_in_flight_newer_foreground(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Earlier background (seq=1) hits 503 while newer foreground (seq=2) is in flight:
+    the 503 advances applied_seq to 1 only (must not retire seq=2), so foreground B
+    still installs and reuses TM with 0 LLM calls."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        bg_started = asyncio.Event()
+        bg_release = asyncio.Event()
+        fg_started = asyncio.Event()
+        fg_release = asyncio.Event()
+        state = {"mode": "startup"}
+        translate_calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["mode"] == "bg":
+                    bg_started.set()
+                    await bg_release.wait()
+                    return httpx.Response(503, json={"error": {"code": "llm_unavailable"}, "request_id": "req-bg"})
+                if state["mode"] == "fg":
+                    fg_started.set()
+                    await fg_release.wait()
+                    return httpx.Response(200, json=_dictionary_payload(OTHER_REVISION))
+                return httpx.Response(200, json=_dictionary_payload(REVISION))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                translate_calls.append(body["text"])
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=OTHER_REVISION, game_version="3.7.0")
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            # 1. Earlier background starts and holds before hitting 503.
+            state["mode"] = "bg"
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(bg_started.wait(), timeout=2.0)
+            background = window._dictionary_task
+
+            # 2. Newer foreground starts while background is still in flight.
+            state["mode"] = "fg"
+            view._controller.start_translation()
+            await asyncio.wait_for(fg_started.wait(), timeout=2.0)
+
+            # 3. Earlier background fails with 503 first; must not retire newer foreground.
+            bg_release.set()
+            if background is not None:
+                await asyncio.wait_for(background, timeout=2.0)
+            assert view._service_dictionary is None
+
+            # 4. Newer foreground returns B and reuses B's TM with 0 model calls.
+            fg_release.set()
+            await _settle_translation(view)
+
+            assert view._controller.identity_probe_state == IDENTITY_FRESH
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+            assert view._terms_db_revision() == OTHER_REVISION
+            assert view._payload["target"] == "甲句。\n\n乙句。"
+            assert translate_calls == [], "in-flight newer foreground was retired by earlier background 503"
+        finally:
+            bg_release.set()
+            fg_release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_foreground_waiting_on_capabilities_gets_fresh_seq_for_dictionary_and_wins_over_background(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Foreground waits on /v1/capabilities while background completes /v1/dictionary with A.
+    Foreground then reserves a fresh seq right before /v1/dictionary, receives B, overwrites A,
+    and does not reuse A's cached translation."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        fg_caps_started = asyncio.Event()
+        fg_caps_release = asyncio.Event()
+        state = {"mode": "startup"}
+        translate_calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                if state["mode"] == "fg":
+                    fg_caps_started.set()
+                    await fg_caps_release.wait()
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["mode"] == "bg":
+                    return httpx.Response(200, json=_dictionary_payload(REVISION))
+                if state["mode"] == "fg":
+                    return httpx.Response(200, json=_dictionary_payload(OTHER_REVISION))
+                return httpx.Response(200, json=_dictionary_payload(REVISION))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                translate_calls.append(body["text"])
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        memory.add("Second line.", "旧乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION, game_version="3.7.0")
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            # 1. Foreground starts and pauses inside /v1/capabilities.
+            state["mode"] = "fg"
+            view._controller.start_translation()
+            await asyncio.wait_for(fg_caps_started.wait(), timeout=2.0)
+
+            # 2. While foreground waits on /v1/capabilities, background finishes /v1/dictionary with A.
+            state["mode"] = "bg"
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == REVISION
+
+            # 3. Foreground resumes, fetches /v1/dictionary with a fresh seq, installs B over A.
+            state["mode"] = "fg"
+            fg_caps_release.set()
+            await _settle_translation(view)
+
+            assert view._controller.identity_probe_state == IDENTITY_FRESH
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+            assert view._terms_db_revision() == OTHER_REVISION
+            assert view._payload["target"] == "甲句。\n\n[MT:Second line.]"
+            assert translate_calls == ["Second line."]
+        finally:
+            fg_caps_release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())

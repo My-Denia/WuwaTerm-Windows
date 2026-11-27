@@ -595,10 +595,9 @@ class DocumentRunController:
             return None
         client = self.api_client
         getter = getattr(client, "get_dictionary", None)
-        # Reserve a monotonic request ordinal before awaiting the network.
-        # Two producers (this press and the window's background refresh) are
-        # ordered by when their requests started, so an older request finishing
-        # last cannot overwrite a newer request's decision.
+        # Reserve an ordinal for the capabilities check (used if it fails or
+        # reports the endpoint unsupported). Once the capability is confirmed,
+        # reserve a fresh ordinal immediately before issuing get_dictionary().
         seq = self._begin_identity_request()
         try:
             # Capabilities are part of this press's basis, not a session-wide
@@ -620,6 +619,7 @@ class DocumentRunController:
                     return None
                 self.identity_probe_state = IDENTITY_UNSUPPORTED
                 return None
+            seq = self._begin_identity_request()
             identity = await getter()
         except ClientError as exc:
             if exc.code == ERROR_CANCELLED:

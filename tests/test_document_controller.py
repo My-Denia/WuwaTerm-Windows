@@ -298,8 +298,11 @@ class StubHost:
     def clear_live_provenance(self, *, seq: int | None = None) -> bool:
         if seq is not None and seq < self.applied_dictionary_seq:
             return False
-        self.dictionary_request_seq += 1
-        self.applied_dictionary_seq = self.dictionary_request_seq
+        if seq is None:
+            self.dictionary_request_seq += 1
+            self.applied_dictionary_seq = self.dictionary_request_seq
+        else:
+            self.applied_dictionary_seq = max(self.applied_dictionary_seq, seq)
         self.cleared_provenance += 1
         return True
 
