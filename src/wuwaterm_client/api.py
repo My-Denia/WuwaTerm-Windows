@@ -36,6 +36,7 @@ from .errors import (
 from . import structure
 from .manuscript import REVIEW_FEATURE_AMBIGUOUS_MENTION, ReviewReport, valid_report
 from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
+from .translation_memory import normalize_provenance_value
 
 TokenProvider = Callable[..., "str | None"]
 
@@ -122,6 +123,13 @@ def _as_optional_str(value: Any, field: str) -> "str | None":
     return _as_str(value, field)
 
 
+def _normalize_optional_meta_version(value: Any, field: str) -> "str | None":
+    text = _as_optional_str(value, field)
+    if text is None:
+        return None
+    return normalize_provenance_value(text)
+
+
 # -- Response models (direct pass-through of the wire schema) --------------
 
 
@@ -191,6 +199,7 @@ class MetaResult:
     term_count: int
     llm_configured: bool
     request_id: str
+    source_game_version: str | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "MetaResult":
@@ -206,6 +215,9 @@ class MetaResult:
             term_count=_as_int(data["term_count"], "term_count"),
             llm_configured=_as_bool(data["llm_configured"], "llm_configured"),
             request_id=_as_str(data["request_id"], "request_id"),
+            source_game_version=_normalize_optional_meta_version(
+                data.get("source_game_version"), "source_game_version"
+            ),
         )
 
 

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 
 from wuwaterm_client import strings
 from wuwaterm_client import translation_memory as tm
-from wuwaterm_client.api import ApiClient
+from wuwaterm_client.api import ApiClient, MetaResult
 from wuwaterm_client.config import ClientConfig
 from wuwaterm_client.manuscript import empty_workfile
 from wuwaterm_client.semantic_session import SegmentResult
@@ -99,7 +99,7 @@ def test_the_panel_lists_the_confirmed_pair_for_the_segment_at_the_caret(qapp, m
                terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
@@ -149,12 +149,9 @@ def test_an_entry_confirmed_under_another_dictionary_says_the_revision_moved(qap
         # Nothing known yet: no revision to compare against.
         view._refresh_tm_panel()
         assert strings.TM_STALE_TERMS not in view.tm_panel.hit_texts()[0]
-        # The open document's report names REVISION; the entry says another.
-        view._report = {"dictionary": {"revision": REVISION}}
-        view._refresh_tm_panel()
-        card = view.tm_panel.hit_texts()[0]
-        assert strings.TM_STALE_TERMS in card
-        assert strings.TM_MATCH_RECHECK.format(reasons=strings.TM_STALE_TERMS) in card
+        # The live review dictionary names REVISION; the entry says another.
+        view._record_live_review_dictionary({"revision": REVISION})
+        assert strings.TM_STALE_TERMS in view.tm_panel.hit_texts()[0]
     finally:
         view.close()
 
@@ -165,7 +162,7 @@ def test_adopting_a_candidate_is_one_edit_that_ctrl_z_takes_back(qapp, memory) -
                terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
@@ -279,7 +276,7 @@ def test_a_segment_with_only_a_translation_is_not_read_as_a_broken_memory(qapp, 
     memory.add("First line.", "首句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(1)
         view._refresh_tm_panel()
@@ -319,7 +316,7 @@ def test_consecutive_untranslated_segments_are_filled_in_document_order(qapp, me
                terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         assert view.tm_panel.summary.fillable == 2
@@ -354,7 +351,7 @@ def test_filling_keeps_every_reviewed_segment_span_on_its_own_text(qapp, memory)
                origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         pairs = view._current_pairs()
         assert [pair.status for pair in pairs] == [
@@ -475,7 +472,7 @@ def test_the_reuse_check_classifies_the_segments_it_can_read(qapp, memory) -> No
     memory.add("Gamma line.", "丙句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._report = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         classes = view._classify_reuse(["Alpha line.", "字" * (limit + 1), "Gamma line."])
         # The unreadable middle segment is skipped; the others are still read,
         # with no context on the side the skip took away.
@@ -541,7 +538,7 @@ def test_a_memory_that_cannot_be_opened_leaves_the_workbench_running(qapp, monke
 # -- which dictionary revision the panel compares against -------------------------
 
 
-def test_the_revision_comes_from_the_report_and_from_a_long_mode_basis(qapp, memory) -> None:
+def test_the_revision_comes_from_live_review_only_never_from_historical_report_or_basis(qapp, memory) -> None:
     source, target, alignments = two_segments()
     memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
                terms_db_revision=REVISION)
@@ -550,7 +547,7 @@ def test_the_revision_comes_from_the_report_and_from_a_long_mode_basis(qapp, mem
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
-        # Nothing has named a revision yet, so nothing can be out of date.
+        # Nothing has named a live revision yet, so nothing can be out of date.
         assert view._terms_db_revision() is None
         assert strings.TM_STALE_TERMS not in view.tm_panel.hit_texts()[0]
         report = {
@@ -558,21 +555,20 @@ def test_the_revision_comes_from_the_report_and_from_a_long_mode_basis(qapp, mem
             "rule_version": "review-v2", "matcher_revision": "c" * 64,
             "dictionary": {"schema_version": "1", "source_commit": "d" * 40, "term_count": 1,
                            "revision": OTHER_REVISION},
-            "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["review.term_pair"]},
+            "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
             "findings": [], "truncated": False,
         }
-        # A document report names the revision, and the panel follows at once:
-        # no caret stop is needed to see that the entry is out of date.
-        view._show_term_report(report, state="current")
-        assert view._terms_db_revision() == OTHER_REVISION
-        assert strings.TM_STALE_TERMS in view.tm_panel.hit_texts()[0]
-        # A long manuscript keeps the basis per record instead of one report.
-        view._report = None
+        # Historical/loaded _report or _term_basis alone must NEVER grant a live revision.
+        view._show_term_report(report, state="saved")
         view._term_basis = {"rule_version": "review-v2", "matcher_revision": "c" * 64,
                             "dictionary": {"schema_version": "1", "source_commit": "d" * 40,
                                            "term_count": 1, "revision": OTHER_REVISION}}
+        assert view._terms_db_revision() is None
+        assert view.tm_panel.matches[0].freshness == tm.TM_FRESHNESS_UNKNOWN
+
+        # A live /v1/reviews dictionary updates provenance and refreshes the panel at once.
+        view._record_live_review_dictionary(report["dictionary"])
         assert view._terms_db_revision() == OTHER_REVISION
-        view._refresh_tm_panel()
         assert strings.TM_STALE_TERMS in view.tm_panel.hit_texts()[0]
     finally:
         view.close()
@@ -623,7 +619,7 @@ def test_the_reuse_check_counts_fresh_stale_and_unmatched_segments(qapp, memory)
                terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         summary = view.tm_panel.summary
@@ -652,7 +648,7 @@ def test_the_reuse_check_writes_nothing_while_it_counts(qapp, memory) -> None:
                terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         before = (len(memory), view._payload["target"], view.document_dirty)
         view._check_memory_reuse()
@@ -679,7 +675,7 @@ def test_homograph_encore_with_different_context_is_reference_only_never_batch_f
     ])
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION, "game_version": "3.7.0"}}
+        view._record_live_review_dictionary({"revision": REVISION, "game_version": "3.7.0"})
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         summary = view.tm_panel.summary
@@ -720,7 +716,7 @@ def test_provenance_unknown_shows_badge_and_never_enters_trusted_fill(qapp, memo
     memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed")
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": "c" * 40}}
+        view._record_live_review_dictionary({"revision": REVISION, "source_commit": "c" * 40})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(1)
         view._refresh_tm_panel()
@@ -751,16 +747,12 @@ def test_reconfirming_with_source_commit_only_preserves_existing_game_version_an
     )
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        # Server report has source_commit but no explicit game_version -> _game_version() must be None.
-        view._report = {
-            "request_id": "r1",
-            "findings": [],
-            "dictionary": {"revision": OTHER_REVISION, "source_commit": "d" * 40},
-        }
+        # Live review dictionary has source_commit but no explicit game_version -> _game_version() must be None.
         view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": "c" * 40}}
+        view._record_live_review_dictionary({"revision": OTHER_REVISION, "source_commit": "d" * 40})
         install(view, source, target, alignments=alignments)
         assert view._game_version() is None
-        # Report takes precedence over stale _term_basis in both view and controller.
+        # Live review dictionary takes precedence over stale _term_basis in both view and controller.
         assert view._terms_db_revision() == OTHER_REVISION
         assert view._controller._tm_provenance() == (OTHER_REVISION, None)
 
@@ -784,7 +776,7 @@ def test_overlong_neighbour_never_grants_context_exact_in_panel_or_reuse_check(q
     memory.add(short, "首句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
@@ -845,7 +837,7 @@ def test_fill_from_memory_triggers_layer_one_structure_check_and_restarts_inflig
         )
         view = ManuscriptView(client, translation_memory=memory)
         try:
-            view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": source_commit}}
+            view._record_live_review_dictionary({"revision": REVISION, "source_commit": source_commit})
             install(view, source, target, alignments=alignments)
             # Start an in-flight Layer 1 check before filling; _fill_from_memory must restart it.
             assert view._controller.start_structure_check() is True
@@ -889,7 +881,7 @@ def test_confirming_segment_beside_overlong_neighbour_stores_no_context(qapp, me
     )
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        view._term_basis = {"dictionary": {"revision": REVISION}}
+        view._record_live_review_dictionary({"revision": REVISION})
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(1)
         active = view._active_segment_context()
@@ -960,7 +952,7 @@ def test_undoing_fill_during_inflight_layer_one_does_not_report_zero_checked(qap
         )
         view = ManuscriptView(client, translation_memory=memory)
         try:
-            view._term_basis = {"dictionary": {"revision": REVISION}}
+            view._record_live_review_dictionary({"revision": REVISION})
             install(view, source, target, alignments=alignments)
             view._check_memory_reuse()
             view._fill_from_memory()
@@ -1028,7 +1020,7 @@ def test_editing_during_inflight_layer_one_clears_running_status_when_stale_resp
         )
         view = ManuscriptView(client, translation_memory=memory)
         try:
-            view._term_basis = {"dictionary": {"revision": REVISION}}
+            view._record_live_review_dictionary({"revision": REVISION})
             install(view, source, target, alignments=alignments)
             view._check_memory_reuse()
             view._fill_from_memory()
@@ -1090,7 +1082,7 @@ def test_undoing_fill_during_inflight_layer_one_503_keeps_undo_status(qapp, memo
         )
         view = ManuscriptView(client, translation_memory=memory)
         try:
-            view._term_basis = {"dictionary": {"revision": REVISION}}
+            view._record_live_review_dictionary({"revision": REVISION})
             install(view, source, target, alignments=alignments)
             view._check_memory_reuse()
             view._fill_from_memory()
@@ -1111,5 +1103,970 @@ def test_undoing_fill_during_inflight_layer_one_503_keeps_undo_status(qapp, memo
         finally:
             await client.aclose()
             view.close()
+
+    asyncio.run(scenario())
+
+
+# -- live service provenance vs historical workfiles (MY-491 §5.1) --------------
+
+
+def _meta_payload(
+    *,
+    schema_version: str = "1",
+    source_commit: str = "a" * 40,
+    term_count: int = 42,
+    source_game_version: str | None = "3.7.0",
+    request_id: str = "req-meta",
+) -> dict:
+    payload = {
+        "service_version": "0.4.0",
+        "api_version": "v1",
+        "schema_version": schema_version,
+        "source_profile": "official",
+        "source_commit": source_commit,
+        "term_count": term_count,
+        "llm_configured": True,
+        "request_id": request_id,
+    }
+    if source_game_version is not None:
+        payload["source_game_version"] = source_game_version
+    return payload
+
+
+def _review_response(
+    source: str,
+    target: str,
+    *,
+    schema_version: str = "1",
+    source_commit: str = "a" * 40,
+    term_count: int = 42,
+    revision: str = REVISION,
+    request_id: str = "req-review",
+) -> dict:
+    return {
+        "request_id": request_id,
+        "source_revision": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "target_revision": hashlib.sha256(target.encode("utf-8")).hexdigest(),
+        "rule_version": "review-v2",
+        "matcher_revision": "a" * 64,
+        "dictionary": {
+            "schema_version": schema_version,
+            "source_commit": source_commit,
+            "term_count": term_count,
+            "revision": revision,
+        },
+        "coverage": {"evaluated": 0, "not_evaluated": 0, "rules": ["review.term_pair", "review.sentence_meaning"]},
+        "findings": [],
+        "truncated": False,
+    }
+
+
+def _historical_workfile_payload(source: str, target: str, alignments: list[dict], *, old_revision: str) -> dict:
+    doc = empty_workfile()
+    doc.update(source=source, target=target, direction="en", alignments=alignments)
+    old_report = _review_response(source, target, source_commit="0" * 40, term_count=10, revision=old_revision)
+    doc["history"] = [
+        {
+            "source": source,
+            "target": target,
+            "direction": "en",
+            "alignments": alignments,
+            "report": old_report,
+        }
+    ]
+    return doc
+
+
+def test_historical_workfile_revision_never_counts_as_live_service_provenance(qapp, tmp_path, memory) -> None:
+    """Scenario (b): opening a historical .wuwaterm with old report.dictionary.revision
+    must NOT treat that old revision as the live server's dictionary revision."""
+    from wuwaterm_client.manuscript import save_workfile
+
+    source = "First line. Second line."
+    target = "甲句。"
+    alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+    memory.add(
+        "Second line.", "乙句。", "en", prev_source="First line.",
+        origin="human_confirmed", terms_db_revision=OTHER_REVISION, game_version="3.6.0",
+    )
+
+    workfile_path = tmp_path / "historical.wuwaterm"
+    save_workfile(workfile_path, _historical_workfile_payload(source, target, alignments, old_revision=OTHER_REVISION))
+
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        assert view.open_path(workfile_path) is True
+        # Even if a historical report is held/inspected on the view, live revision stays None.
+        view._report = view._payload["history"][-1]["report"]
+        assert view._terms_db_revision() is None
+        assert view._controller._tm_provenance() == (None, None)
+
+        view.segment_list.setCurrentRow(1)
+        view._refresh_tm_panel()
+        assert len(view.tm_panel.matches) == 1
+        match = view.tm_panel.matches[0]
+        assert match.freshness == tm.TM_FRESHNESS_UNKNOWN
+        assert match.freshness != tm.TM_FRESHNESS_VERIFIED
+
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.fillable == 0
+        assert view._tm_fill_plan == []
+
+        # Confirming segment 0 does NOT stamp the historical file's OTHER_REVISION onto the new TM row.
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        view.tm_panel.confirm_button.click()
+        new_entry = next(e for e in memory.entries() if e.source_text == "First line.")
+        assert new_entry.terms_db_revision is None
+    finally:
+        view.close()
+
+
+def test_live_meta_game_version_change_marks_old_entries_known_stale_before_review(qapp, tmp_path, memory) -> None:
+    """Scenario (c): live /v1/meta reporting source_game_version='3.7.0' makes old '3.6.0'
+    entries known_stale (game_version_changed) immediately, even before any live /v1/reviews."""
+    from wuwaterm_client.api import MetaResult
+    from wuwaterm_client.manuscript import save_workfile
+
+    source = "First line. Second line."
+    target = "甲句。"
+    alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+    memory.add(
+        "Second line.", "乙句。", "en", prev_source="First line.",
+        origin="human_confirmed", terms_db_revision=OTHER_REVISION, game_version="3.6.0",
+    )
+    workfile_path = tmp_path / "historical_360.wuwaterm"
+    save_workfile(workfile_path, _historical_workfile_payload(source, target, alignments, old_revision=OTHER_REVISION))
+
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        assert view.open_path(workfile_path) is True
+        view.set_service_meta(
+            MetaResult.from_json(_meta_payload(source_commit="b" * 40, term_count=55, source_game_version="3.7.0"))
+        )
+        assert view._controller._tm_provenance() == (None, "3.7.0")
+
+        view.segment_list.setCurrentRow(1)
+        view._refresh_tm_panel()
+        match = view.tm_panel.matches[0]
+        assert match.freshness == tm.TM_FRESHNESS_STALE
+        assert tm.TM_STALE_GAME_VERSION in match.stale_reasons
+        assert strings.TM_STALE_GAME in view.tm_panel.hit_texts()[0]
+
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view.tm_panel.summary.fillable == 0
+    finally:
+        view.close()
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        {"schema_version": "2"},
+        {"source_commit": "f" * 40},
+        {"term_count": 999},
+    ],
+)
+def test_live_meta_dictionary_fingerprint_change_invalidates_live_review_dictionary(
+    qapp, memory, changed_field
+) -> None:
+    """Scenario (d): when /v1/meta reports a change in (schema_version, source_commit, term_count),
+    any previously recorded _live_review_dictionary is invalidated and old entries stop being verified_fresh."""
+    from wuwaterm_client.api import MetaResult
+
+    source, target, alignments = two_segments()
+    memory.add(
+        "First line.", "甲句。", "en", next_source="Second line.",
+        origin="human_confirmed", terms_db_revision=REVISION, game_version="3.7.0",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        initial_meta = _meta_payload(schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0")
+        view.set_service_meta(MetaResult.from_json(initial_meta))
+        view._record_live_review_dictionary({
+            "schema_version": "1",
+            "source_commit": "a" * 40,
+            "term_count": 42,
+            "revision": REVISION,
+        })
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        assert view.tm_panel.matches[0].freshness == tm.TM_FRESHNESS_VERIFIED
+
+        updated_meta = {**initial_meta, **changed_field}
+        view.set_service_meta(MetaResult.from_json(updated_meta))
+        assert view._live_review_dictionary is None
+        assert view._terms_db_revision() is None
+        assert view.tm_panel.matches[0].freshness == tm.TM_FRESHNESS_UNKNOWN
+    finally:
+        view.close()
+
+
+def test_startup_silent_meta_and_live_review_end_to_end_tm_confirm_and_reuse(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Scenario (e): MainWindow starting on ManuscriptView silently fetches /v1/meta; after a live
+    /v1/reviews with matching fingerprint, confirming writes both terms_db_revision and game_version
+    and enables verified_fresh batch fill and incremental translation skip."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module, status_view as status_view_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(status_view_module, "read_token", lambda: "wtd1.test")
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+
+        commit = "e" * 40
+        asked: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            asked.append(request.url.path)
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload(
+                    schema_version="1", source_commit=commit, term_count=42, source_game_version="3.7.0",
+                ))
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if request.url.path == "/v1/reviews":
+                return httpx.Response(200, json=_review_response(
+                    body["source"], body["target"],
+                    schema_version="1", source_commit=commit, term_count=42, revision=REVISION,
+                ))
+            if request.url.path == "/v1/translations":
+                return httpx.Response(200, json={
+                    "kind": "llm",
+                    "text": f"[MT:{body['text']}]",
+                    "direction": body.get("to") or "en",
+                    "dictionary_miss": False,
+                    "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient(
+            "https://api.example.invalid",
+            token_provider=lambda: "wtd1.test",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            # Startup stays on ManuscriptView and silently triggers GET /v1/meta.
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+
+            assert "/v1/meta" in asked
+            assert window._meta is not None
+            assert window._meta.source_game_version == "3.7.0"
+            assert window.manuscript_view._controller._tm_provenance() == (None, "3.7.0")
+
+            # Run live document /v1/reviews in this session.
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view._start_review()
+            assert view._task is not None
+            await asyncio.wait_for(view._task, timeout=2.0)
+            await asyncio.sleep(0)
+
+            assert view._controller._tm_provenance() == (REVISION, "3.7.0")
+            view.segment_list.setCurrentRow(0)
+            view._refresh_tm_panel()
+            view.tm_panel.confirm_button.click()
+
+            (entry,) = memory.entries()
+            assert entry.terms_db_revision == REVISION
+            assert entry.game_version == "3.7.0"
+
+            # Same dictionary + same game version -> verified_fresh and reusable in incremental translation.
+            source2 = "First line. Second line."
+            target2 = ""
+            align2 = alignments_for(source2, target2, [("First line.", ""), ("Second line.", "")])
+            install(view, source2, target2, alignments=align2)
+            view.segment_list.setCurrentRow(0)
+            view._refresh_tm_panel()
+            assert view.tm_panel.matches[0].freshness == tm.TM_FRESHNESS_VERIFIED
+
+            view._check_memory_reuse()
+            assert view.tm_panel.summary.fresh == 1
+            assert view.tm_panel.summary.fillable == 1
+
+            # Incremental translation skips segment 0 via TM and only sends segment 1 to /v1/translations.
+            translate_calls_before = asked.count("/v1/translations")
+            view._controller.start_translation()
+            if view._controller.translate_task is not None:
+                await asyncio.wait_for(view._controller.translate_task, timeout=2.0)
+            assert asked.count("/v1/translations") == translate_calls_before + 1
+            assert "首句。" in view._payload["target"] or "甲句。" in view._payload["target"]
+            assert "[MT:Second line.]" in view._payload["target"]
+
+            # Also verify long-manuscript segment-mode check_term records _live_review_dictionary.
+            long_seg0 = "Long segment zero. " + ("x" * 1000)
+            long_seg1 = "Long segment one. " + ("y" * 1000)
+            long_source = f"{long_seg0}\n\n{long_seg1}"
+            long_target = "甲长段。\n\n乙长段。"
+            long_align = alignments_for(long_source, long_target, [(long_seg0, "甲长段。"), (long_seg1, "乙长段。")])
+            view.set_service_meta(None)
+            assert view._terms_db_revision() is None
+            view.set_service_meta(
+                MetaResult.from_json(_meta_payload(
+                    schema_version="1", source_commit=commit, term_count=42, source_game_version="3.7.0",
+                ))
+            )
+            install(view, long_source, long_target, alignments=long_align)
+            err = await view._controller.check_term(0, view._controller.semantic_generation)
+            assert err is None
+            assert view._controller._tm_provenance() == (REVISION, "3.7.0")
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_endpoint_change_clears_live_provenance_and_blocks_late_old_meta_reply(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Scenario (f): switching endpoint clears _meta / _live_review_dictionary at once,
+    drops a slow in-flight /v1/meta from the old endpoint via generation guard, and clearing
+    the endpoint or credential leaves live provenance empty."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module, status_view as status_view_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(status_view_module, "read_token", lambda: "wtd1.test")
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+        monkeypatch.setattr(ClientConfig, "save", lambda self: None)
+
+        old_meta_started = asyncio.Event()
+        release_old_meta = asyncio.Event()
+        calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host
+            calls.append(f"{host}{request.url.path}")
+            if request.url.path == "/v1/meta":
+                if host == "old.example.invalid":
+                    if calls.count("old.example.invalid/v1/meta") >= 2:
+                        old_meta_started.set()
+                        await release_old_meta.wait()
+                    return httpx.Response(200, json=_meta_payload(
+                        source_commit="1" * 40, term_count=10, source_game_version="3.6.0", request_id="meta-old",
+                    ))
+                return httpx.Response(200, json=_meta_payload(
+                    source_commit="2" * 40, term_count=20, source_game_version="3.8.0", request_id="meta-new",
+                ))
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        client = ApiClient(
+            "https://old.example.invalid",
+            token_provider=lambda: "wtd1.test",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        window = MainWindow(ClientConfig(base_url="https://old.example.invalid"))
+        try:
+            # Wait for initial startup meta.
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window.manuscript_view._game_version() == "3.6.0"
+
+            # Record live review provenance on old endpoint.
+            window.manuscript_view._record_live_review_dictionary({
+                "schema_version": "1",
+                "source_commit": "1" * 40,
+                "term_count": 10,
+                "revision": REVISION,
+            })
+            assert window.manuscript_view._terms_db_revision() == REVISION
+
+            # Start a slow manual meta refresh on old endpoint, then switch to new endpoint mid-flight.
+            window.status_view._on_refresh_clicked()
+            old_task = window.status_view._task
+            await asyncio.wait_for(old_meta_started.wait(), timeout=2.0)
+
+            # Switch to a new endpoint mid-flight -> immediately clears all live provenance.
+            new_meta_started = asyncio.Event()
+            release_new_meta = asyncio.Event()
+
+            async def handler_with_new_gate(request: httpx.Request) -> httpx.Response:
+                host = request.url.host
+                calls.append(f"{host}{request.url.path}")
+                if request.url.path == "/v1/meta":
+                    if host == "old.example.invalid":
+                        old_meta_started.set()
+                        await release_old_meta.wait()
+                        return httpx.Response(200, json=_meta_payload(
+                            source_commit="1" * 40, term_count=10, source_game_version="3.6.0", request_id="meta-old",
+                        ))
+                    new_meta_started.set()
+                    await release_new_meta.wait()
+                    return httpx.Response(200, json=_meta_payload(
+                        source_commit="2" * 40, term_count=20, source_game_version="3.8.0", request_id="meta-new",
+                    ))
+                raise AssertionError(f"unexpected request: {request.url}")
+
+            client._client._transport = httpx.MockTransport(handler_with_new_gate)
+
+            window._apply_settings(ClientConfig(base_url="https://new.example.invalid"))
+            assert window._meta is None
+            assert window.manuscript_view._service_meta is None
+            assert window.manuscript_view._live_review_dictionary is None
+            assert window.manuscript_view._controller._tm_provenance() == (None, None)
+
+            # Release the slow old-endpoint response; generation guard must drop it before new endpoint answers.
+            release_old_meta.set()
+            if old_task is not None:
+                await asyncio.gather(old_task, return_exceptions=True)
+            assert window._meta is None
+            assert window.manuscript_view._service_meta is None
+            assert window.manuscript_view._controller._tm_provenance() == (None, None)
+
+            # Now allow the new endpoint's silent /v1/meta to complete.
+            await asyncio.wait_for(new_meta_started.wait(), timeout=2.0)
+            release_new_meta.set()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window._meta is not None
+            assert window._meta.source_game_version == "3.8.0"
+            assert window.manuscript_view._controller._tm_provenance() == (None, "3.8.0")
+
+            # Removing the credential via Settings also clears live provenance immediately.
+            from PySide6.QtWidgets import QDialog
+
+            token_present = True
+            monkeypatch.setattr(main_window_module, "has_token", lambda: token_present)
+
+            class _CredentialClearedDialog:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def exec(self):
+                    nonlocal token_present
+                    token_present = False
+                    return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(main_window_module, "SettingsDialog", _CredentialClearedDialog)
+            window._on_settings_clicked()
+            assert window._meta is None
+            assert window.manuscript_view._service_meta is None
+            assert window.manuscript_view._controller._tm_provenance() == (None, None)
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_late_old_review_after_newer_meta_and_503_refetch_preserves_meta_and_blocks_reuse(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Finding 1: 3.7.0 /v1/meta arrives before a late old-dictionary /v1/reviews,
+    and the triggered silent refetch fails with 503. Must retain 3.7.0 _service_meta,
+    refuse the stale review dictionary, keep TM known_stale, and never batch-fill."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module, status_view as status_view_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(status_view_module, "read_token", lambda: "wtd1.test")
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+
+        memory.add(
+            "Second line.", "乙句。", "en", prev_source="First line.",
+            origin="human_confirmed", terms_db_revision=OTHER_REVISION, game_version="3.6.0",
+        )
+        meta_calls = 0
+        review_started = asyncio.Event()
+        release_review = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal meta_calls
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/meta":
+                meta_calls += 1
+                if meta_calls == 1:
+                    return httpx.Response(200, json=_meta_payload(
+                        source_commit="b" * 40, term_count=55, source_game_version="3.7.0", request_id="meta-370",
+                    ))
+                return httpx.Response(503, json={"error": {"code": "service_unavailable", "message": "down"}})
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if request.url.path == "/v1/reviews":
+                review_started.set()
+                await release_review.wait()
+                return httpx.Response(200, json=_review_response(
+                    body["source"], body["target"],
+                    source_commit="0" * 40, term_count=10, revision=OTHER_REVISION, request_id="rev-old",
+                ))
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient(
+            "https://api.example.invalid",
+            token_provider=lambda: "wtd1.test",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window.manuscript_view._game_version() == "3.7.0"
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view._start_review()
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+
+            release_review.set()
+            if view._task is not None:
+                await asyncio.wait_for(view._task, timeout=2.0)
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+
+            # Refetch failed with 503, yet 3.7.0 is preserved and old dictionary is rejected.
+            assert meta_calls >= 2
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+            assert view._service_meta is not None and view._service_meta.source_game_version == "3.7.0"
+            assert view._live_review_dictionary is None
+            assert view._controller._tm_provenance() == (None, "3.7.0")
+
+            view.segment_list.setCurrentRow(1)
+            view._refresh_tm_panel()
+            assert view.tm_panel.matches[0].freshness == tm.TM_FRESHNESS_STALE
+            view._check_memory_reuse()
+            assert view.tm_panel.summary.fresh == 0
+            assert view.tm_panel.summary.fillable == 0
+            assert view._tm_fill_plan == []
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_same_origin_token_replacement_advances_review_generations_and_blocks_inflight_writeback(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Finding 2: replacing a stored token on the same endpoint clears live provenance,
+    advances both review generations so in-flight document/segment reviews cannot write back,
+    and refreshes /v1/meta under the new token."""
+    from PySide6.QtWidgets import QDialog
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module, status_view as status_view_module
+
+    async def scenario() -> None:
+        current_token = "tok-A"
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: bool(current_token))
+        monkeypatch.setattr(main_window_module, "read_token", lambda: current_token)
+        monkeypatch.setattr(status_view_module, "read_token", lambda: current_token)
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+
+        meta_tokens: list[str] = []
+        review_started = asyncio.Event()
+        release_review = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            auth = request.headers.get("Authorization", "")
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/meta":
+                meta_tokens.append(auth)
+                gv = "3.6.0" if auth.endswith("tok-A") else "3.7.0"
+                return httpx.Response(200, json=_meta_payload(
+                    source_commit="a" * 40, term_count=42, source_game_version=gv,
+                ))
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if request.url.path == "/v1/reviews":
+                review_started.set()
+                await release_review.wait()
+                return httpx.Response(200, json=_review_response(
+                    body["source"], body["target"],
+                    source_commit="a" * 40, term_count=42, revision=OTHER_REVISION,
+                ))
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient(
+            "https://api.example.invalid",
+            token_provider=lambda: current_token,
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window.manuscript_view._game_version() == "3.6.0"
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            # Start both an in-flight document review AND a segment-mode check_term under tok-A.
+            view._start_review()
+            old_review_task = view._task
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+
+            long_seg0 = "Segment zero. " + ("x" * 1050)
+            long_seg1 = "Segment one. " + ("z" * 1050)
+            long_tgt0 = "甲长段。" + ("y" * 1050)
+            long_tgt1 = "乙长段。" + ("w" * 1050)
+            long_view_payload = empty_workfile()
+            long_view_payload.update(
+                source=f"{long_seg0}\n\n{long_seg1}",
+                target=f"{long_tgt0}\n\n{long_tgt1}",
+                direction="en",
+            )
+            view._controller.payload = long_view_payload
+            assert view._controller.records() is not None
+            review_started.clear()
+            seg_task = asyncio.ensure_future(
+                view._controller.check_term(0, view._controller.semantic_generation)
+            )
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+
+            doc_gen_before = view._controller.generation
+            seg_gen_before = view._controller.semantic_generation
+            meta_gen_before = window.status_view._generation
+
+            # Replace tok-A -> tok-B via SettingsDialog (same endpoint, has_token stays True).
+            class _ReplaceTokenDialog:
+                def __init__(self, *args, **kwargs):
+                    self.credential_modified = False
+
+                def exec(self):
+                    nonlocal current_token
+                    current_token = "tok-B"
+                    self.credential_modified = True
+                    return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(main_window_module, "SettingsDialog", _ReplaceTokenDialog)
+            window._on_settings_clicked()
+
+            assert window._meta is None
+            assert view._service_meta is None
+            assert view._live_review_dictionary is None
+            assert view._controller.generation > doc_gen_before
+            assert view._controller.semantic_generation > seg_gen_before
+            assert window.status_view._generation > meta_gen_before
+
+            # Complete both pre-change reviews and wait for the replacement silent meta.
+            release_review.set()
+            await asyncio.gather(
+                *(t for t in (old_review_task, seg_task) if t is not None),
+                return_exceptions=True,
+            )
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+
+            assert view._live_review_dictionary is None
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+            assert meta_tokens[-1] == "Bearer tok-B"
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_status_view_manual_refresh_never_sticks_loading_when_silent_refresh_requested(qapp) -> None:
+    """Finding 3: a manual refresh in flight must preserve visible completion/error
+    feedback even if a silent refresh is requested concurrently."""
+    from wuwaterm_client.ui.status_view import StatusView
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        fail_next = False
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            started.set()
+            await release.wait()
+            if fail_next:
+                return httpx.Response(503, json={
+                    "error": {"code": "service_unavailable", "message": "down"},
+                    "request_id": "req-503",
+                })
+            return httpx.Response(200, json=_meta_payload(source_game_version="3.7.0"))
+
+        client = ApiClient(
+            "https://api.example.invalid",
+            token_provider=lambda: "wtd1.test",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = StatusView(client)
+        try:
+            # Case 1: manual refresh succeeds after concurrent silent request.
+            view._on_refresh_clicked()
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            assert view.status_label.text() == strings.STATUS_LOADING
+            view.refresh_meta(silent=True)
+            release.set()
+            if view._task is not None:
+                await asyncio.wait_for(view._task, timeout=2.0)
+            assert view.status_label.text() == strings.STATUS_BAR_DONE
+
+            # Case 2: silent refresh keeps refresh_button enabled, promoted by click(), then fails with 503.
+            started.clear()
+            release.clear()
+            fail_next = True
+            view.refresh_meta(silent=True)
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+            assert view.refresh_button.isEnabled() is True
+            view.refresh_button.click()
+            assert view.refresh_button.isEnabled() is False
+            assert view.status_label.text() == strings.STATUS_LOADING
+            release.set()
+            if view._task is not None:
+                await asyncio.wait_for(view._task, timeout=2.0)
+            assert view.status_label.text() != strings.STATUS_LOADING
+            assert view._banner.is_showing() is True
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_game_version_with_nul_or_surrogate_never_breaks_healthy_tm(qapp, memory) -> None:
+    """Finding 4: NUL / lone surrogates / overlong game_version values normalize to None
+    before reaching TranslationMemory, so a healthy TM is never reported as broken."""
+    source, target, alignments = two_segments()
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._record_live_review_dictionary({"revision": REVISION})
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(0)
+
+        for bad_version in ("3.7.0\x00", "3.7.\ud800", "v" * 129):
+            view.set_service_meta(MetaResult(
+                service_version="0.4.0",
+                api_version="v1",
+                schema_version="1",
+                source_profile="official",
+                source_commit="a" * 40,
+                term_count=42,
+                llm_configured=True,
+                request_id="req-bad-gv",
+                source_game_version=bad_version,
+            ))
+            assert view._game_version() is None
+            view._refresh_tm_panel()
+            assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.tm_panel.notice_label.text()
+            view._check_memory_reuse()
+            assert view.tm_panel.summary is not None
+            view.tm_panel.confirm_button.click()
+            assert strings.TM_PANEL_CONFIRM_FAILED.split("{")[0] not in view.status_label.text()
+    finally:
+        view.close()
+
+
+def test_settings_dialog_credential_change_is_origin_scoped_and_immediate(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Changing/deleting a token in SettingsDialog emits credentialChanged(origin):
+    unrelated origins on Cancel must NOT interrupt active reviews/provenance, while
+    changing the active origin invalidates provenance & cancels reviews immediately."""
+    from PySide6.QtWidgets import QDialog, QMessageBox
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import (
+        main_window as main_window_module,
+        settings_dialog as settings_dialog_module,
+        status_view as status_view_module,
+    )
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        tokens: dict[str, str] = {"https://a.example": "tok-a"}
+        next_token = "tok-b"
+
+        def _fake_has_token(origin=None):
+            return bool(origin and origin in tokens)
+
+        def _fake_read_token(origin=None):
+            return tokens.get(origin) if origin else None
+
+        def _fake_store_token(token, origin=None):
+            assert origin is not None
+            tokens[origin] = token
+
+        def _fake_delete_token(origin=None):
+            assert origin is not None
+            tokens.pop(origin, None)
+
+        monkeypatch.setattr(main_window_module, "has_token", _fake_has_token)
+        monkeypatch.setattr(main_window_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(status_view_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(status_view_module, "active_backend_name", lambda: "MemoryKeyring")
+        monkeypatch.setattr(settings_dialog_module, "read_token", _fake_read_token)
+        monkeypatch.setattr(settings_dialog_module, "store_token", _fake_store_token)
+        monkeypatch.setattr(settings_dialog_module, "delete_token", _fake_delete_token)
+        monkeypatch.setattr(settings_dialog_module, "active_backend_name", lambda: "MemoryKeyring")
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        class _StubTokenDialog:
+            def __init__(self, parent=None):
+                pass
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+            def token(self):
+                return next_token
+
+            def show_store_error(self, _msg):
+                raise AssertionError("unexpected store error")
+
+        monkeypatch.setattr(settings_dialog_module, "TokenDialog", _StubTokenDialog)
+        monkeypatch.setattr(
+            settings_dialog_module.QMessageBox,
+            "exec",
+            lambda _self: QMessageBox.StandardButton.Yes,
+        )
+
+        review_started = asyncio.Event()
+        release_review = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            auth = request.headers.get("authorization", "")
+            body = json.loads(request.content.decode("utf-8")) if request.content else {}
+            if request.url.path == "/v1/meta":
+                gv = "3.7.0" if auth.endswith("tok-a") else "3.8.0"
+                return httpx.Response(200, json=_meta_payload(source_game_version=gv))
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if request.url.path == "/v1/reviews":
+                review_started.set()
+                await release_review.wait()
+                return httpx.Response(200, json=_review_response(
+                    body["source"], body["target"],
+                    source_commit="a" * 40, term_count=42, revision=REVISION,
+                ))
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient(
+            "https://a.example",
+            token_provider=lambda: tokens.get("https://a.example"),
+            _test_transport=httpx.MockTransport(handler),
+        )
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://a.example"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            live_dict = {
+                "revision": REVISION,
+                "source_commit": window._meta.source_commit,
+                "schema_version": window._meta.schema_version,
+                "term_count": window._meta.term_count,
+                "profile": window._meta.source_profile,
+            }
+            view._record_live_review_dictionary(live_dict)
+
+            # Start an in-flight review on active origin https://a.example.
+            view._start_review()
+            task_a = view._task
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+            gen_before = view._controller.generation
+
+            # 1. Edit & delete credential for another origin https://b.example, then Cancel.
+            def _other_origin_exec(dlg: settings_dialog_module.SettingsDialog) -> int:
+                nonlocal next_token
+                dlg.base_url_edit.setText("https://b.example")
+                next_token = "tok-b"
+                dlg._on_enter_token_clicked()
+                dlg._on_forget_token_clicked()
+                return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(settings_dialog_module.SettingsDialog, "exec", _other_origin_exec)
+            window._on_settings_clicked()
+
+            assert window.api_client.current_origin == "https://a.example"
+            assert window._meta is not None and window._meta.source_game_version == "3.7.0"
+            assert view._service_meta is not None
+            assert view._live_review_dictionary == live_dict
+            assert view._controller.generation == gen_before
+
+            release_review.set()
+            if task_a is not None:
+                await asyncio.wait_for(task_a, timeout=2.0)
+            assert view._controller.generation == gen_before
+
+            # 2. Change token for active origin https://a.example -> cancels BEFORE dialog closes!
+            review_started.clear()
+            release_review.clear()
+            view._start_review()
+            task_b = view._task
+            await asyncio.wait_for(review_started.wait(), timeout=2.0)
+            gen_before_2 = view._controller.generation
+            seen_inside_exec: dict[str, object] = {}
+
+            def _same_origin_exec(dlg: settings_dialog_module.SettingsDialog) -> int:
+                nonlocal next_token
+                next_token = "tok-a2"
+                dlg._on_enter_token_clicked()
+                seen_inside_exec["meta_is_none"] = window._meta is None
+                seen_inside_exec["service_meta_is_none"] = view._service_meta is None
+                seen_inside_exec["live_dict_is_none"] = view._live_review_dictionary is None
+                seen_inside_exec["gen_bumped"] = view._controller.generation > gen_before_2
+                return QDialog.DialogCode.Rejected
+
+            monkeypatch.setattr(settings_dialog_module.SettingsDialog, "exec", _same_origin_exec)
+            window._on_settings_clicked()
+
+            assert seen_inside_exec == {
+                "meta_is_none": True,
+                "service_meta_is_none": True,
+                "live_dict_is_none": True,
+                "gen_bumped": True,
+            }
+            assert tokens.get("https://a.example") == "tok-a2"
+
+            release_review.set()
+            if task_b is not None:
+                await asyncio.gather(task_b, return_exceptions=True)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            assert window._meta is not None and window._meta.source_game_version == "3.8.0"
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
 
     asyncio.run(scenario())

@@ -1218,6 +1218,7 @@ def test_incremental_translation_skips_trusted_context_matches_and_runs_layer1(t
         host.controller = controller
         controller.payload = draft
         controller.term_basis = dict(BASIS)
+        controller.record_live_review_dictionary(BASIS["dictionary"])
 
         controller.start_translation()
         await settle(controller)
@@ -1276,6 +1277,7 @@ def test_incremental_translation_skips_trusted_context_matches_and_runs_layer1(t
         host2.controller = c2
         c2.payload = draft2
         c2.term_basis = dict(BASIS)
+        c2.record_live_review_dictionary(BASIS["dictionary"])
 
         c2.start_translation()
         await settle(c2)
@@ -1330,6 +1332,7 @@ def test_incremental_translation_skips_trusted_context_matches_and_runs_layer1(t
         host4.controller = c4
         c4.payload = draft4
         c4.term_basis = dict(BASIS)
+        c4.record_live_review_dictionary(BASIS["dictionary"])
 
         c4.start_translation()
         await settle(c4)
@@ -1359,6 +1362,7 @@ def test_incremental_translation_skips_trusted_context_matches_and_runs_layer1(t
         host4b.controller = c4b
         c4b.payload = draft4b
         c4b.term_basis = dict(BASIS)
+        c4b.record_live_review_dictionary(BASIS["dictionary"])
         c4b.start_translation()
         await settle(c4b)
         assert [c["text"] for c in client4b.translation_calls] == [encore]
@@ -1407,6 +1411,7 @@ def test_incremental_prefill_preserves_middle_segment_review_and_reports_honest_
         host.controller = controller
         controller.payload = draft
         controller.term_basis = dict(BASIS)
+        controller.record_live_review_dictionary(BASIS["dictionary"])
 
         pairs_before = controller.current_pairs()
         results = []
@@ -1447,6 +1452,7 @@ def test_incremental_prefill_preserves_middle_segment_review_and_reports_honest_
         host2.controller = c2
         c2.payload = draft2
         c2.term_basis = dict(BASIS)
+        c2.record_live_review_dictionary(BASIS["dictionary"])
         c2.start_translation()
         await settle(c2)
 
@@ -1488,6 +1494,7 @@ def test_incremental_prefill_preserves_middle_segment_review_and_reports_honest_
         c3.payload = draft3
         c3.trusted_snapshots.append(copy.deepcopy(draft3["history"][0]))
         c3.term_basis = dict(BASIS)  # older basis must NOT shadow new_report
+        c3.record_live_review_dictionary(new_report["dictionary"])
         c3.start_translation()
         await settle(c3)
 
@@ -1520,6 +1527,7 @@ def test_baseline_requests_with_blank_target_and_explicit_null_alignments(tmp_pa
         host.controller = controller
         controller.payload = draft
         controller.term_basis = dict(BASIS)
+        controller.record_live_review_dictionary(BASIS["dictionary"])
 
         controller.start_translation()
         await settle(controller)
@@ -1534,5 +1542,66 @@ def test_baseline_requests_with_blank_target_and_explicit_null_alignments(tmp_pa
         assert summary["saved_ratio"] == 0.0
         assert len(client.translation_calls) == 2
         assert "节省" not in host.statuses[-1]
+
+    asyncio.run(scenario())
+
+
+def test_headless_controller_tm_provenance_tracks_latest_live_review_across_modes(tmp_path) -> None:
+    """Headless DocumentRunController must return the most recent live review
+    dictionary (whether document-mode or segment-mode) and clear on reset."""
+    rev_a = "a" * 64
+    rev_b = "b" * 64
+    seg0_src = "乙。" + "文" * 1050
+    seg1_src = "丙。" + "文" * 1050
+    seg0_tgt = "B." + "x" * 1050
+    seg1_tgt = "C." + "y" * 1050
+    report_a = term_report("甲。", "A.", basis={**BASIS, "dictionary": {**BASIS["dictionary"], "revision": rev_a}})
+    report_b = term_report(
+        seg0_src, seg0_tgt,
+        basis={**BASIS, "dictionary": {**BASIS["dictionary"], "revision": rev_b}},
+    )
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=())
+        host = StubHost()
+        draft = empty_workfile()
+        draft.update(source="甲。", target="A.", direction="en")
+        controller = dc.DocumentRunController(client, host)
+        host.controller = controller
+        controller.payload = draft
+
+        # 1. Document-mode review produces rev_a.
+        client.term = lambda _call: copy.deepcopy(report_a)
+        controller.generation += 1
+        assert await controller.run_document_review(controller.generation, "甲。", "A.", "en", None) is True
+        assert controller._tm_provenance() == (rev_a, None)
+
+        # 2. Segment-mode review later produces rev_b -> must override rev_a!
+        long_src = f"{seg0_src}\n\n{seg1_src}"
+        long_tgt = f"{seg0_tgt}\n\n{seg1_tgt}"
+        long_draft = empty_workfile()
+        long_draft.update(source=long_src, target=long_tgt, direction="en")
+        controller.payload = long_draft
+        controller.records()
+        client.term = lambda _call: copy.deepcopy(report_b)
+        controller.semantic_generation += 1
+        assert await controller.check_term(0, controller.semantic_generation) is None
+        assert controller._tm_provenance() == (rev_b, None)
+
+        # 3. Document-mode review again with rev_a overrides rev_b.
+        controller.payload = copy.deepcopy(draft)
+        client.term = lambda _call: copy.deepcopy(report_a)
+        controller.generation += 1
+        assert await controller.run_document_review(controller.generation, "甲。", "A.", "en", None) is True
+        assert controller._tm_provenance() == (rev_a, None)
+
+        # 4. Credential change / term session reset clears live provenance immediately,
+        # without falling back to historical term_basis or trusted_snapshots.
+        assert controller.latest_trusted() is not None
+        controller.invalidate_provenance_for_credential_change()
+        assert controller.live_review_dictionary is None
+        assert controller._tm_provenance() == (None, None)
+        controller.reset_term_session()
+        assert controller._tm_provenance() == (None, None)
 
     asyncio.run(scenario())

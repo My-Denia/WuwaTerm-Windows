@@ -337,6 +337,9 @@ class DocumentRunController:
         # None until a review-v2 response supplies it, so nothing saved counts
         # as current before the first check. Never saved.
         self.term_basis: dict | None = None
+        # Most recent live /v1/reviews dictionary (document or segment mode)
+        # observed in this session; cleared when endpoint/credential resets.
+        self.live_review_dictionary: dict[str, Any] | None = None
         # What the records were last normalized against (identity checks only).
         self.records_seen: tuple | None = None
         self.record_views = sr.RecordViews()
@@ -482,12 +485,28 @@ class DocumentRunController:
         """A new document or service: no term basis yet, so nothing saved is current.
         Layer 1 results and this session's document choices belong to it too."""
         self.term_basis = None
+        self.live_review_dictionary = None
         self.records_seen = None
         self.pairs_key, self.pairs, self.pairs_version = None, [], SEGMENTATION_VERSION
         self.cancel_structure_check()
         self.structure = structure.State()
         self.session_choices = []
         self.trusted_snapshots = []
+
+    def record_live_review_dictionary(self, dictionary: Mapping[str, Any] | None) -> None:
+        """Record the newest live ``/v1/reviews`` dictionary from this session."""
+        if isinstance(dictionary, Mapping):
+            self.live_review_dictionary = copy.deepcopy(dict(dictionary))
+        recorder = getattr(self.host, "record_live_review_dictionary", None)
+        if callable(recorder):
+            recorder(dictionary)
+
+    def invalidate_provenance_for_credential_change(self) -> None:
+        """Clear live review provenance and advance both review generations so
+        in-flight requests issued under an older token cannot write back."""
+        self.live_review_dictionary = None
+        self.cancel_pending()
+        self.stop_semantic("paused" if self.semantic_running() else None)
 
     def reset_known_texts(self, value: dict | None = None) -> None:
         """The texts on-file decisions usually refer to; kept across edits.
@@ -1100,6 +1119,7 @@ class DocumentRunController:
             break
         if generation != self.generation:
             return False
+        self.record_live_review_dictionary(report.get("dictionary") if isinstance(report, Mapping) else None)
         # The resolutions this check sent: only this session's own choices,
         # and [] (not unknown) lets the next check compare with it, as on the Web.
         snapshot = {"source": source, "target": target, "direction": direction,
@@ -1405,6 +1425,7 @@ class DocumentRunController:
                 return exc
             if generation != self.semantic_generation:
                 return "changed"
+            self.record_live_review_dictionary(report.get("dictionary") if isinstance(report, Mapping) else None)
             applied = sr.apply_response(self.payload, request, report, self.term_basis)
             self.term_basis = applied.basis
             self.put_parts(applied.parts)
@@ -1675,26 +1696,14 @@ class DocumentRunController:
         getter = getattr(self.host, "tm_provenance", None)
         if callable(getter):
             return getter()
-        terms: str | None = None
+        if not isinstance(self.live_review_dictionary, dict):
+            return None, None
+        terms = tm.normalize_provenance_value(self.live_review_dictionary.get("revision"))
         game: str | None = None
-        sources: list[dict[str, Any]] = []
-        latest = self.latest_trusted()
-        if isinstance(latest, dict) and isinstance(latest.get("report"), dict):
-            sources.append(latest["report"])
-        if isinstance(self.term_basis, dict):
-            sources.append(self.term_basis)
-        for source in sources:
-            dictionary = source.get("dictionary")
-            if not isinstance(dictionary, dict):
-                continue
-            if terms is None:
-                rev = dictionary.get("revision")
-                if isinstance(rev, str) and rev:
-                    terms = rev
-            if game is None:
-                val = dictionary.get("game_version")
-                if isinstance(val, str) and val.strip() and len(val) <= tm.REVISION_SCALARS[1]:
-                    game = val
+        for key in ("game_version", "source_game_version"):
+            game = tm.normalize_provenance_value(self.live_review_dictionary.get(key))
+            if game is not None:
+                break
         return terms, game
 
     @staticmethod
