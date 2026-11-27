@@ -1689,9 +1689,10 @@ class DocumentRunController:
     def _tm_provenance(self) -> tuple[str | None, str | None]:
         """Current verified (terms_db_revision, game_version) from this session.
 
-        Uses the exact same priority order as the TM panel: latest report first,
-        then ``term_basis``, and never substitutes ``source_commit`` for
-        ``game_version``.
+        Delegates to ``self.host.tm_provenance()`` when available; otherwise
+        reads only ``self.live_review_dictionary`` (``revision`` and
+        ``game_version`` / ``source_game_version``), never falling back to
+        historical workfile ``term_basis`` or ``source_commit``.
         """
         getter = getattr(self.host, "tm_provenance", None)
         if callable(getter):
