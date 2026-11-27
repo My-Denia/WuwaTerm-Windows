@@ -635,6 +635,10 @@ MANUSCRIPT_RETRANSLATE_SEGMENT = "重译此段"
 MANUSCRIPT_TRANSLATE_RESUME = "续译余下段落"
 MANUSCRIPT_TRANSLATING = "正在翻译第 {index}/{total} 段…"
 MANUSCRIPT_TRANSLATE_RETRYING = "正在重试第 {index}/{total} 段…"
+# Before any reuse decision the client may ask which dictionary the service is
+# serving; on a slow link that wait is visible, and cancellable, like any other.
+MANUSCRIPT_TRANSLATE_PROVENANCE = "正在确认服务端词库版本，再决定复用哪些已确认段落…"
+MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED = "已取消这次翻译：还没有发出模型请求。"
 MANUSCRIPT_TRANSLATE_PAUSED = "翻译已暂停，已写入前 {done}/{total} 段，可以继续。"
 MANUSCRIPT_TRANSLATE_QUOTA = "服务暂时限额，翻译已暂停，已写入前 {done}/{total} 段；稍后可以继续。"
 MANUSCRIPT_TRANSLATE_FAILED = "第 {index}/{total} 段翻译失败：{reason} 已写入前 {done} 段，可以重试。"

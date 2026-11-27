@@ -90,7 +90,7 @@ def test_the_timeouts_still_have_defaults(tmp_path) -> None:
     assert config.translate_timeout_seconds > 0
 
 
-@pytest.mark.parametrize("call", ["translate", "lookup_terms", "get_meta"])
+@pytest.mark.parametrize("call", ["translate", "lookup_terms", "get_meta", "get_dictionary"])
 def test_every_request_path_refuses_while_unconfigured(call: str) -> None:
     """Not one entry point, all of them - and before anything is sent.
 
@@ -108,6 +108,7 @@ def test_every_request_path_refuses_while_unconfigured(call: str) -> None:
         "translate": lambda: client.translate("今汐"),
         "lookup_terms": lambda: client.lookup_terms("今汐"),
         "get_meta": client.get_meta,
+        "get_dictionary": client.get_dictionary,
     }
     try:
         assert client.is_configured is False

@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from .. import __version__, recent, strings
 from ..recovery import default_recovery_path
 from ..translation_memory import TmError, TranslationMemory, default_tm_path
-from ..api import ApiClient
+from ..api import CAPABILITY_DICTIONARY_IDENTITY, ApiClient, DictionaryIdentityResult
 from ..config import (
     ClientConfig,
     RecentEntry,
@@ -279,6 +279,11 @@ class MainWindow(QMainWindow):
         self._closed = False
         self._auto_meta_requested = False
         self._credential_changed_for_active_origin = False
+        # The live dictionary identity (``GET /v1/dictionary``) and the refresh
+        # that fetches it. Generation-guarded like every other answer in this
+        # window: a reply for the previous address must never describe this one.
+        self._dictionary_task: asyncio.Task | None = None
+        self._dictionary_generation = 0
         self._shortcut_sheet: ShortcutSheet | None = None
 
         central = QWidget(self)
@@ -616,6 +621,100 @@ class MainWindow(QMainWindow):
         self._meta = meta
         self.manuscript_view.set_service_meta(meta)
         self._refresh_status_bar()
+        if meta is None:
+            # No service described. This is the endpoint leaving (or a credential
+            # that took the service with it), and `set_service_meta(None)` has
+            # already dropped every statement about the old one. Asking here
+            # would probe an address this window was just told to forget - and,
+            # after a switch to an unconfigured address, would have no service to
+            # ask at all.
+            self._cancel_dictionary_identity_refresh()
+            return
+        self._schedule_dictionary_identity_refresh()
+
+    # -- the live dictionary's own identity ---------------------------------
+
+    def _schedule_dictionary_identity_refresh(self) -> None:
+        """Fetch the served dictionary's identity alongside the meta refresh.
+
+        ``GET /v1/dictionary`` (``dictionary-identity-v1``, ADR 0023) is what
+        lets the workbench know the running revision without a term review
+        first, and the revision - not the ``(schema_version, source_commit,
+        term_count)`` tuple - is what changes when an entry does.
+
+        Scheduled from the meta refresh because that is when this window has
+        just learned the service is reachable, and it costs nothing on a server
+        that does not list the capability (one probe). Never awaited: the
+        meta reply is already on screen, and the identity arrives when it
+        arrives.
+        """
+        if self._closed or not self.api_client.is_configured:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Nothing can be scheduled without a running loop; the next meta
+            # refresh (the one that starts one) schedules it instead.
+            return
+        if self._dictionary_task is not None and not self._dictionary_task.done():
+            # A newer meta is a newer question. The pending answer describes the
+            # dictionary state this refresh has just replaced, so it is dropped
+            # rather than allowed to land after the identity it would overwrite
+            # was cleared.
+            self._cancel_dictionary_identity_refresh()
+        self._dictionary_generation += 1
+        self._dictionary_task = asyncio.ensure_future(
+            self._refresh_dictionary_identity(self._dictionary_generation)
+        )
+
+    def _cancel_dictionary_identity_refresh(self) -> None:
+        """Drop the pending identity request and any reply it would deliver."""
+        self._dictionary_generation += 1
+        task, self._dictionary_task = self._dictionary_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _refresh_dictionary_identity(self, generation: int) -> None:
+        """One identity probe, delivered only if it still describes this window.
+
+        Two answers are not the same thing and are not treated as one:
+
+        * the server does not serve the endpoint (no capability, or a 404) - the
+          identity is cleared, and the older `/v1/meta` + `/v1/reviews`
+          statements stay in charge, as ADR 0023 requires;
+        * the request failed (503, a timeout, a broken body) - the identity *and*
+          this session's review dictionary are cleared, because neither is a
+          substitute for the answer that did not arrive; a stale one would let a
+          memory entry confirmed under another dictionary count as fresh.
+        """
+        client = self.api_client
+        origin = client.current_origin
+        # Reserve a monotonic request ordinal before awaiting the network so a
+        # newer request (e.g. a foreground press) is never overwritten by an
+        # older request arriving late.
+        seq = self.manuscript_view.begin_dictionary_identity_request()
+        identity: "DictionaryIdentityResult | None" = None
+        failed = False
+        try:
+            capabilities = await client.get_capabilities()
+            if CAPABILITY_DICTIONARY_IDENTITY in capabilities:
+                # Re-reserve the ordinal at the moment the dictionary request
+                # itself is issued so any answer installed while capabilities
+                # were in flight does not falsely mark this request stale.
+                seq = self.manuscript_view.begin_dictionary_identity_request()
+                identity = await client.get_dictionary()
+        except Exception:  # noqa: BLE001 - the probe is optional: a failure means "nothing verified"
+            failed = True
+        if generation != self._dictionary_generation or self._closed:
+            return
+        if client.current_origin != origin:
+            # The address changed while the request was in flight; the reply
+            # describes the previous service.
+            return
+        if failed:
+            self.manuscript_view.clear_live_provenance(seq=seq)
+            return
+        self.manuscript_view.apply_dictionary_identity(identity, seq=seq)
 
     def _on_service_meta_refresh_requested(self) -> None:
         # Non-destructive: retain known _meta / _service_meta until a fresh
@@ -626,6 +725,7 @@ class MainWindow(QMainWindow):
     def _on_credential_changed(self, *, has_credential: bool) -> None:
         self._auto_meta_requested = False
         self._meta = None
+        self._cancel_dictionary_identity_refresh()
         self.status_view.clear_stale_meta()
         self.manuscript_view.reset_for_credential_change()
         self._refresh_status_bar()
@@ -925,6 +1025,9 @@ class MainWindow(QMainWindow):
         are fire-and-forget, exactly as the Cancel button's are.
         """
         self._auto_meta_requested = False
+        # The identity names the OLD service's dictionary; even a reply already
+        # in flight belongs to that one.
+        self._cancel_dictionary_identity_refresh()
         for view in (self.translate_view, self.terms_view, self.status_view, self.manuscript_view):
             view.reset_for_endpoint_change()
         self._meta = None
@@ -937,6 +1040,7 @@ class MainWindow(QMainWindow):
         self._closed = True
         self._remember_position()
         self.status_view.cancel_refresh()
+        self._cancel_dictionary_identity_refresh()
         self.manuscript_view.cancel_background_work(clear_recovery_draft=True)
         super().closeEvent(event)
 

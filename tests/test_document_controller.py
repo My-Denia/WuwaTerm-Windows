@@ -20,6 +20,7 @@ from pathlib import Path
 import subprocess
 import sys
 import typing
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,7 +32,7 @@ from wuwaterm_client import semantic_session as sessions
 from wuwaterm_client import translation_memory as tm
 from wuwaterm_client.manuscript import ReviewReport, empty_workfile
 from wuwaterm_client.segmentation import SEGMENT_LIMIT, segment_text
-from wuwaterm_client.errors import ClientError
+from wuwaterm_client.errors import ERROR_CANCELLED, ClientError
 
 TERM = "椿"
 CANDIDATE = {"candidate_id": hashlib.sha256(b"candidate").hexdigest(), "zh": TERM, "en": "Camellya",
@@ -127,6 +128,7 @@ class FakeClient:
     def __init__(self, *, capabilities=("semantic-review-v1",)) -> None:
         self.capabilities = frozenset(capabilities)
         self.configured = True
+        self.dictionary = None
         self.term = lambda call: term_report(call["source"], call["target"])
         self.semantic = lambda call: semantic_report(call["source"], call["target"])
         self.translation = lambda call: TranslationResult(f"[{call['text']}]")
@@ -145,6 +147,7 @@ class FakeClient:
                                                                 "source_lines": 1, "target_lines": 1}}
                                                     for i, seg in enumerate(body["segments"])]}
         self.capability_calls = 0
+        self.dictionary_calls = 0
 
     async def _before(self, name: str) -> None:
         self.counts[name] = self.counts.get(name, 0) + 1
@@ -160,6 +163,11 @@ class FakeClient:
     async def get_capabilities(self):
         self.capability_calls += 1
         return self.capabilities
+
+    async def get_dictionary(self):
+        self.dictionary_calls += 1
+        await self._before("get_dictionary")
+        return self.dictionary
 
     async def review_pair(self, source, target, direction, *, alignments=None, resolutions=None,
                           resolution_context=None, features=()) -> dict:
@@ -204,6 +212,15 @@ class StubHost:
         self.precedents = True
         self.segment = None
         self.refuse_write = False
+        # The live dictionary identity the controller recorded, in order.
+        self.service_dictionaries: list = []
+        # How many times the controller asked this host to forget both live
+        # statements (an identity answer it could not read).
+        self.cleared_provenance = 0
+        # Request ordinals the two identity producers share (see
+        # ManuscriptView.begin_dictionary_identity_request).
+        self.dictionary_request_seq = 0
+        self.applied_dictionary_seq = 0
         # What the editor would say its view state is; opaque to the controller.
         self.view = {"side": "target", "source": {}, "target": {}}
         self.editor_states = 0
@@ -260,6 +277,34 @@ class StubHost:
 
     def trust_review_snapshot(self, snapshot: dict) -> None:
         self.snapshots.append(snapshot)
+
+    def begin_dictionary_identity_request(self) -> int:
+        self.dictionary_request_seq += 1
+        return self.dictionary_request_seq
+
+    def apply_dictionary_identity(self, identity, *, seq: int | None = None) -> bool:
+        if seq is not None and seq < self.applied_dictionary_seq:
+            return False
+        self.applied_dictionary_seq = max(
+            self.applied_dictionary_seq,
+            self.dictionary_request_seq if seq is None else seq,
+        )
+        self.service_dictionaries.append(identity)
+        return True
+
+    def set_service_dictionary(self, identity) -> None:
+        self.apply_dictionary_identity(identity, seq=self.begin_dictionary_identity_request())
+
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
+        if seq is not None and seq < self.applied_dictionary_seq:
+            return False
+        if seq is None:
+            self.dictionary_request_seq += 1
+            self.applied_dictionary_seq = self.dictionary_request_seq
+        else:
+            self.applied_dictionary_seq = max(self.applied_dictionary_seq, seq)
+        self.cleared_provenance += 1
+        return True
 
     def precedents_selected(self) -> bool:
         return self.precedents
@@ -663,10 +708,16 @@ def test_a_translation_refreshes_the_segment_rows_it_makes_stale() -> None:
 # -- the typed client boundary ----------------------------------------------
 
 def test_the_client_protocol_names_exactly_the_calls_the_runs_make() -> None:
-    """A run asks for these five things and nothing else, so the protocol must
-    not grow into a second client: a wider one would not be ``ApiClient``."""
+    """A run asks for these six things and nothing else, so the protocol must
+    not grow into a second client: a wider one would not be ``ApiClient``.
+
+    ``get_dictionary`` is ``GET /v1/dictionary`` (``dictionary-identity-v1``),
+    which the reuse decision needs before any review has run in this session.
+    """
     declared = {name for name in dir(dc.WorkbenchApiClient) if not name.startswith("_")}
-    assert declared == {"get_capabilities", "review_pair", "semantic_review", "structure_check", "translate"}
+    assert declared == {
+        "get_capabilities", "get_dictionary", "review_pair", "semantic_review", "structure_check", "translate",
+    }
 
 
 def test_the_workbench_accepts_a_client_and_a_host_that_conform() -> None:
@@ -688,6 +739,7 @@ def test_the_client_calls_name_the_wire_shapes_they_answer_with() -> None:
     assert hints["return"] is ReviewReport
     assert typing.get_type_hints(dc.WorkbenchApiClient.semantic_review)["return"] is semantic.SemanticReviewReport
     assert typing.get_type_hints(dc.WorkbenchApiClient.translate)["return"] is dc.TranslationResponse
+    assert typing.get_type_hints(dc.WorkbenchApiClient.get_dictionary)["return"] == dc.DictionaryIdentity | None
     # The same shapes annotate the commits, so the boundary is typed end to end.
     assert typing.get_type_hints(dc.DocumentRunController.store_semantic)["report"] is semantic.SemanticReviewReport
     assert typing.get_type_hints(dc.WorkbenchHost.show_term_report)["report"] is ReviewReport
@@ -1603,5 +1655,825 @@ def test_headless_controller_tm_provenance_tracks_latest_live_review_across_mode
         assert controller._tm_provenance() == (None, None)
         controller.reset_term_session()
         assert controller._tm_provenance() == (None, None)
+
+    asyncio.run(scenario())
+
+
+# -- the served dictionary's identity (`dictionary-identity-v1`, ADR 0023) ----
+
+def seeded_memory(tmp_path, revision: str, count: int = 2, game_version: str | None = None):
+    """A memory whose entries were confirmed under ``revision``.
+
+    Each paragraph is longer than the 1800-scalar merge cap so the pairing keeps
+    the segments the caller wrote, and the neighbours are recorded exactly as
+    the document has them - which is what makes the entries context-exact.
+    """
+    from wuwaterm_client import translation_memory as tm
+
+    memory = tm.TranslationMemory(tmp_path / "tm.sqlite3", clock=lambda: "2026-11-27T00:00:00Z")
+    sources = [f"第{i}段原文内容。" + "文" * 960 for i in range(count)]
+    targets = [f"Segment {i} target." + "x" * 960 for i in range(count)]
+    for i in range(count):
+        memory.add(
+            sources[i],
+            targets[i],
+            "en",
+            prev_source=sources[i - 1] if i > 0 else None,
+            next_source=sources[i + 1] if i + 1 < count else None,
+            origin=tm.TM_ORIGIN_HUMAN,
+            terms_db_revision=revision,
+            game_version=game_version,
+        )
+    return memory, sources, targets
+
+
+def blank_draft(sources: list[str]) -> dict:
+    draft = empty_workfile()
+    draft.update(source="\n\n".join(sources), target="", direction="en")
+    return draft
+
+
+def fake_identity(revision: str, game_version: str | None = "3.7.0"):
+    return SimpleNamespace(revision=revision, source_game_version=game_version)
+
+
+def test_a_translation_reuses_confirmed_segments_from_the_served_dictionary_identity(tmp_path) -> None:
+    """The point of `GET /v1/dictionary`: a fresh session can skip what it
+    already confirmed without running a term review first. Before the identity
+    endpoint the revision only existed after a `POST /v1/reviews`, so a reopened
+    document paid for every segment again."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 1, "the identity was not asked for"
+        assert client.review_calls == [], "a review was spent to learn the revision"
+        assert client.translation_calls == [], "fresh confirmed segments were translated again"
+        assert controller.payload["target"] == "\n\n".join(targets)
+        assert controller._tm_provenance() == (rev, "3.7.0")
+        assert host.service_dictionaries[-1] is client.dictionary
+        assert controller.last_tm_translation_summary["reused_segments"] == len(sources)
+
+    asyncio.run(scenario())
+
+
+def test_every_reusable_press_asks_and_a_changed_revision_stops_the_reuse(tmp_path) -> None:
+    """One probe per press, because the dictionary can change under the session.
+
+    A cached revision would make the second press reuse entries confirmed under
+    a dictionary the service has replaced - with the same game version and the
+    same `(schema_version, source_commit, term_count)` tuple, so nothing else
+    would show it.
+    """
+    before = hashlib.sha256(b"served before the edit").hexdigest()
+    after = hashlib.sha256(b"served after the edit").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, before, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(before)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+        assert client.dictionary_calls == 1
+        assert client.translation_calls == [], "the fresh entries were not reused"
+        assert controller.payload["target"] == "\n\n".join(targets)
+        first_summary = controller.last_tm_translation_summary
+        assert first_summary["reused_segments"] == len(sources)
+
+        # The service now serves another dictionary - same tuple, same version.
+        client.dictionary = fake_identity(after)
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 2, "the second press reused the cached revision"
+        assert [call["text"] for call in client.translation_calls] == sources
+        assert controller.last_tm_translation_summary is first_summary, (
+            "the second run reported a reuse summary although it reused nothing"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_an_identity_that_cannot_be_read_skips_nothing_and_does_not_fail_the_run(tmp_path) -> None:
+    """Fail-closed. A failed probe leaves the revision unknown, and unknown
+    provenance is never auto-applied: the run spends the model calls it would
+    have spent before the endpoint existed, rather than trusting entries it
+    cannot verify."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        client.fail["get_dictionary"] = [ClientError("offline")]
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 1
+        assert [call["text"] for call in client.translation_calls] == sources
+        assert controller.payload["target"] == "\n\n".join(f"[{source}]" for source in sources)
+        assert controller._tm_provenance() == (None, None)
+        assert controller.identity_probe_state == dc.IDENTITY_FAILED
+        assert host.service_dictionaries == [], "a failed probe recorded an identity"
+        assert host.cleared_provenance == 1, "the unreadable answer was not reported as unknown"
+        assert not any(target in controller.payload["target"] for target in targets)
+        assert controller.last_tm_translation_summary is None
+
+    asyncio.run(scenario())
+
+
+def test_a_server_without_the_capability_is_never_asked_for_a_dictionary(tmp_path) -> None:
+    """An older Core: the capability is not listed, so the request is not sent
+    at all. Otherwise every translation on that server would pay for a 404."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=())
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 0
+        assert [call["text"] for call in client.translation_calls] == sources
+
+    asyncio.run(scenario())
+
+
+def test_an_unconfigured_client_spends_no_probe_at_all() -> None:
+    """The zero-request invariant (issues #68 / #80) holds on this path too: a
+    client with no address asks for neither capabilities nor a dictionary, and
+    does not pretend the revision is known."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.configured = False
+        client.dictionary = fake_identity(rev)
+        controller = dc.DocumentRunController(client, StubHost())
+
+        assert await controller.refresh_live_dictionary_identity() is None
+
+        assert client.capability_calls == 0 and client.dictionary_calls == 0
+        assert controller._tm_provenance() == (None, None)
+
+    asyncio.run(scenario())
+
+
+def test_stopping_during_the_identity_request_does_not_start_the_run(tmp_path) -> None:
+    """The probe is a request like any other: Cancel during it owns the
+    decision, and the run it was preparing must not appear afterwards."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+        controller.stop_translation()
+        gate.set()
+        await settle(controller)
+
+        assert controller.translate_task is None
+        assert client.translation_calls == []
+        assert host.service_dictionaries == [] or all(item is None for item in host.service_dictionaries)
+
+    asyncio.run(scenario())
+
+
+def test_a_changed_identity_revision_sends_every_segment_to_the_model(tmp_path) -> None:
+    """The tuple cannot see this: the dictionary the entries were confirmed
+    under and the one being served now have the same schema version, source
+    commit and term count, and still differ in content. Only the revision
+    tells them apart, and that difference is what makes the entries stale."""
+    confirmed_under = hashlib.sha256(b"dictionary before the edit").hexdigest()
+    served_now = hashlib.sha256(b"dictionary after the edit").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, confirmed_under)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(served_now)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert [call["text"] for call in client.translation_calls] == sources
+        assert controller.last_tm_translation_summary is None
+        assert controller._tm_provenance() == (served_now, "3.7.0")
+
+    asyncio.run(scenario())
+
+
+def test_a_credential_change_forgets_the_dictionary_identity(tmp_path) -> None:
+    """Provenance belongs to the service and the credential that answered; a
+    new token has verified nothing."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host)
+        host.controller = controller
+
+        await controller.refresh_live_dictionary_identity()
+        assert controller._tm_provenance() == (rev, "3.7.0")
+
+        controller.invalidate_provenance_for_credential_change()
+        assert controller.live_dictionary_identity is None
+        assert controller._tm_provenance() == (None, None)
+
+    asyncio.run(scenario())
+
+
+def test_a_second_press_while_the_identity_is_in_flight_does_not_start_a_second_run(tmp_path) -> None:
+    """Two presses are one run. Without the guard both probes finish and each
+    re-enters `start_translation`, and the second press's ``stop_translation``
+    cancels the run the first one had just started."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+        first = controller.translate_task
+        controller.start_translation()
+        assert controller.translate_task is first, "a second probe was started"
+
+        gate.set()
+        await settle(controller)
+
+        assert client.dictionary_calls == 1
+        assert [call["text"] for call in client.translation_calls] == [], "the run was not the reusing one"
+        assert controller.last_tm_translation_summary["reused_segments"] == len(sources)
+
+    asyncio.run(scenario())
+
+
+def test_a_client_stand_in_written_before_the_endpoint_still_translates(tmp_path) -> None:
+    """A stand-in that predates `get_dictionary` must not turn a translation
+    into an AttributeError: the probe is optional, and its absence is the same
+    answer as a server without the capability."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    class LegacyClient(FakeClient):
+        get_dictionary = None  # type: ignore[assignment] - the old surface
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = LegacyClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 0
+        assert [call["text"] for call in client.translation_calls] == sources
+        assert controller._tm_provenance() == (None, None)
+
+    asyncio.run(scenario())
+
+
+def test_the_identity_wait_is_rendered_and_cancellable(tmp_path) -> None:
+    """The press is not silent while the dictionary is asked for.
+
+    The probe is a network round trip: the controls have to say the workbench is
+    busy (which is what shows Cancel) and the status line has to say why, or a
+    slow service looks like a press that did nothing.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        assert controller.translate_state == dc.TRANSLATION_PROBING
+        assert controller.translating() is True, "Cancel would stay hidden"
+        assert "update_controls" in host.calls, "the controls were never re-rendered"
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE
+
+        gate.set()
+        await settle(controller)
+
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert [call["text"] for call in client.translation_calls] == []
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_while_the_identity_is_pending_ends_the_press_quietly(tmp_path) -> None:
+    """The Cancel button reaches `cancel_review`, not `stop_translation`.
+
+    Before, a probe with no run made that path call `translation_stopped(None)`,
+    which read `run.source` and raised. Nothing ran, so there is no cursor, no
+    write and no crash - and the run must not start once the answer arrives.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        controller.cancel_review()
+
+        assert controller.translate_task is None
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert "update_controls" in host.calls
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED
+
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert client.translation_calls == [], "the cancelled press started a run"
+        assert controller.payload["target"] == ""
+
+    asyncio.run(scenario())
+
+
+def test_a_credential_change_drops_a_pending_identity_request(tmp_path) -> None:
+    """The answer was requested with the previous credential.
+
+    If it is allowed to land it restores the provenance this reset just cleared
+    and starts the run under the new credential - the stale-provenance write
+    MY-491 #64 removed, arriving through the endpoint that replaced it.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+        generation = controller.translate_generation
+
+        controller.invalidate_provenance_for_credential_change()
+
+        assert controller.translate_generation > generation, "the pending answer was not invalidated"
+        assert controller.provenance_task is None
+        assert controller.translate_task is None
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert controller.live_dictionary_identity is None
+        assert controller._tm_provenance() == (None, None)
+        assert host.service_dictionaries == [], "an old credential's answer restored provenance"
+        assert client.translation_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_an_edit_during_the_identity_wait_ends_the_press_instead_of_adopting_it(tmp_path) -> None:
+    """A run is bound to the text it started from.
+
+    The probe puts a network round trip between the press and the run, and the
+    editors stay usable during it. An edit - or a direction change - made in that
+    window belongs to the owner's next press, not to the one already waiting, so
+    the waiting press ends the way a changed run ends: nothing written, and a
+    line saying so.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        value = controller.draft_snapshot()
+        value["source"] = "\n\n".join(sources) + "\n\n新增的一段。" + "文" * 960
+        controller.apply_edit(value)
+        gate.set()
+        await settle(controller)
+
+        assert client.translation_calls == [], "the edited text was translated without a press"
+        assert controller.payload["target"] == ""
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_CHANGED
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_identity_request_never_falls_back_to_the_review_basis(tmp_path) -> None:
+    """A 503 is not an old server.
+
+    The session may hold a review dictionary from earlier - the same statement
+    the fallback is allowed to use when the endpoint is *absent*. When the
+    request fails, that value is the one that might describe a dictionary the
+    service replaced, so it is cleared with the identity and the run reuses
+    nothing.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.fail["get_dictionary"] = [ClientError("llm_unavailable", status_code=503)]
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.record_live_review_dictionary({"schema_version": "test-schema", "source_commit": "test-commit",
+                                                  "term_count": 1, "revision": rev})
+        assert controller._tm_provenance() == (rev, None)
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_FAILED
+        assert [call["text"] for call in client.translation_calls] == sources, "the review basis was reused"
+        assert controller._tm_provenance() == (None, None)
+        assert host.cleared_provenance == 1
+
+    asyncio.run(scenario())
+
+
+def test_an_alignment_change_during_the_identity_wait_ends_the_press(tmp_path) -> None:
+    """Re-pairing the document changes what the reuse decision is made on.
+
+    An alignment edit does not change the two texts, so a basis of text alone
+    would let this press reuse across a pairing the owner replaced while the
+    request was out.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        draft = blank_draft(sources)
+        draft["alignments"] = [
+            {"source": {"start": 0, "end": 10, "text": "第一段"}, "target": None},
+        ]
+        controller.payload = draft
+        before = controller.draft_snapshot()
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        value = controller.draft_snapshot()
+        value["alignments"] = None
+        controller.apply_edit(value, alignment_reset=True)
+        gate.set()
+        await settle(controller)
+
+        assert client.translation_calls == [], "the press adopted a re-paired document"
+        assert controller.payload["target"] == before["target"]
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_CHANGED
+
+    asyncio.run(scenario())
+
+
+def test_a_404_after_a_cached_identity_forgets_it(tmp_path) -> None:
+    """An identity the server no longer confirms is not an identity.
+
+    A same-origin fallback can stand in front of a Core that has no
+    `/v1/dictionary`: a session that read one earlier and gets a 404 now must
+    stop reusing the revision it cached.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev, None)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+        assert controller._tm_provenance() == (rev, None)
+        assert controller.payload["target"] == "\n\n".join(targets)
+        assert host.service_dictionaries[-1] is client.dictionary
+
+        # The endpoint is gone now (a fallback in front of an older Core).
+        client.dictionary = None
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_UNSUPPORTED
+        assert controller.live_dictionary_identity is None, "a cached identity survived a 404"
+        assert host.service_dictionaries[-1] is None, "the view kept a cached identity"
+        assert controller._tm_provenance() == (None, None)
+        assert [call["text"] for call in client.translation_calls] == sources, (
+            "the cached identity was still reused after the server stopped confirming it"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_a_404_keeps_the_review_basis_as_the_fallback(tmp_path) -> None:
+    """Only the identity goes: the review basis is the fallback ADR 0023 keeps."""
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, targets = seeded_memory(tmp_path, rev)
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = None  # the server has no /v1/dictionary
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.record_live_review_dictionary({"schema_version": "test-schema", "source_commit": "test-commit",
+                                                  "term_count": 1, "revision": rev})
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_UNSUPPORTED
+        assert controller._tm_provenance() == (rev, None)
+        assert client.translation_calls == [], "the review basis was not used as the fallback"
+        assert controller.payload["target"] == "\n\n".join(targets)
+
+    asyncio.run(scenario())
+
+
+def test_a_slow_probe_does_not_overwrite_a_newer_identity(tmp_path) -> None:
+    """The press and the window both write the statement; the newer answer wins.
+
+    The window's background refresh can answer while this press is still waiting.
+    That answer is newer than the one the press is holding, so the press must not
+    put its own - now superseded - revision back when it lands.
+    """
+    rev_a = hashlib.sha256(b"a").hexdigest()
+    rev_b = hashlib.sha256(b"b").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev_a, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev_a)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        # What the window's background refresh does when its answer arrives first.
+        newer = fake_identity(rev_b)
+        host.set_service_dictionary(newer)
+
+        gate.set()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_SUPERSEDED
+        assert host.service_dictionaries[-1] is newer, "the older answer overwrote the newer one"
+        assert controller.live_dictionary_identity is None, "the superseded answer was adopted"
+        assert [call["text"] for call in client.translation_calls] == sources, "entries of the old revision were reused"
+
+    asyncio.run(scenario())
+
+
+def test_a_cancelled_probe_is_not_a_service_failure(tmp_path) -> None:
+    """Cancel is not a 503.
+
+    A cancel says "the owner stopped waiting"; it disproves nothing that was
+    already verified, so the identity this session read stays.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host)
+        host.controller = controller
+
+        await controller.refresh_live_dictionary_identity()
+        assert controller._tm_provenance() == (rev, "3.7.0")
+
+        client.fail["get_dictionary"] = [ClientError(ERROR_CANCELLED)]
+        assert await controller.refresh_live_dictionary_identity() is None
+
+        assert controller.identity_probe_state is None, "a cancel was classified as a probe outcome"
+        assert controller._tm_provenance() == (rev, "3.7.0"), "a cancel cleared verified provenance"
+        assert host.cleared_provenance == 0
+
+    asyncio.run(scenario())
+
+
+def test_a_capability_downgrade_forgets_the_identity_it_confirmed(tmp_path) -> None:
+    """A service can be rolled back in place.
+
+    The identity was read when the endpoint was advertised; once it is not, the
+    server cannot confirm it any more, so it goes - and the revision it stated is
+    not reused.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+        assert client.translation_calls == [], "the first press did not reuse"
+
+        client.capabilities = frozenset()
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+
+        assert controller.identity_probe_state == dc.IDENTITY_UNSUPPORTED
+        assert controller.live_dictionary_identity is None, "the downgraded server kept the identity"
+        assert host.service_dictionaries[-1] is None
+        assert controller._tm_provenance() == (None, None)
+        assert [call["text"] for call in client.translation_calls] == sources, (
+            "the revision the server stopped confirming was reused"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_a_capability_upgrade_stops_using_the_older_review_revision(tmp_path) -> None:
+    """A service can also be upgraded in place.
+
+    While it lists no ``dictionary-identity-v1`` the review basis is the fallback
+    and legitimately drives reuse. The moment the endpoint appears, that basis is
+    no longer the authority and must not keep deciding the reuse.
+    """
+    rev_a = hashlib.sha256(b"review basis").hexdigest()
+    rev_b = hashlib.sha256(b"served now").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev_a)
+        client = FakeClient(capabilities=())
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.record_live_review_dictionary({"schema_version": "test-schema", "source_commit": "test-commit",
+                                                  "term_count": 1, "revision": rev_a})
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+        assert client.translation_calls == [], "the review fallback did not reuse"
+        assert client.dictionary_calls == 0
+
+        # The same service now advertises the endpoint, and serves another dictionary.
+        client.capabilities = frozenset((dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev_b, None)
+        controller.payload = blank_draft(sources)
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 1, "the upgraded server was still judged by a cached capability list"
+        assert controller.identity_probe_state == dc.IDENTITY_FRESH
+        assert controller._tm_provenance() == (rev_b, None)
+        assert [call["text"] for call in client.translation_calls] == sources, (
+            "the older review revision still decided the reuse"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_a_paused_run_that_no_longer_fits_asks_for_the_identity(tmp_path) -> None:
+    """A resume that cannot resume is a fresh press.
+
+    `resumable()` says the document is unchanged; re-pairing changes what the
+    press would do without changing a character. When the paused segment is no
+    longer there, the press is a new run - and a new run asks which dictionary is
+    served before it reuses.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, _sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+
+        source = "Line zero.\n\nLine one."
+        pair_source = "Line one."
+        draft = empty_workfile()
+        draft.update(source=source, target="第零句。", direction="en",
+                     alignments=[{"source": {"start": 0, "end": 10, "text": "Line zero."},
+                                  "target": {"start": 0, "end": 4, "text": "第零句。"}},
+                                 {"source": {"start": 12, "end": 21, "text": pair_source}, "target": None}])
+        controller.payload = draft
+        controller.translate_run = dc.Translation(
+            generation=0, source=source, direction="en", target="第零句。",
+            segment=12, count=1, done=0,
+        )
+        controller.translate_state = "paused"
+        assert controller._resume_for_press()[0] is not None, "fixture failed: not a resumable press"
+
+        # Re-pair the same text: the paused segment is not a segment any more.
+        value = controller.draft_snapshot()
+        value["alignments"] = None
+        controller.apply_edit(value, alignment_reset=True)
+        assert controller.resumable() is not None, "fixture failed: the text is no longer the run's"
+        assert controller._resume_for_press()[0] is None, "fixture failed: the press still resumes"
+
+        controller.start_translation()
+        await settle(controller)
+
+        assert client.dictionary_calls == 1, "the identity was not asked for before a fresh run"
 
     asyncio.run(scenario())

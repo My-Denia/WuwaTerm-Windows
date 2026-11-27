@@ -98,8 +98,21 @@ REPEATED_FAILURES = 2
 # A stopped translation run, by the state it left: both offer a next press, and
 # both are dropped once the text is no longer what the run left.
 TRANSLATION_RESUMABLE = ("paused", "failed")
-# The translation run's phases: idle, and the four the view renders apart.
+# The translation run's phases: idle, the wait for the served dictionary's
+# identity before any reuse decision, and the four the view renders apart.
 TRANSLATION_IDLE = "idle"
+TRANSLATION_PROBING = "probing"
+# What a dictionary-identity probe established, for the run that asked it. The
+# three answers are different decisions, not different messages: a fresh answer
+# is used, an unsupported endpoint falls back to `/v1/meta` + `/v1/reviews`, and
+# a failed request may not fall back to anything.
+IDENTITY_FRESH = "fresh"
+IDENTITY_UNSUPPORTED = "unsupported"
+IDENTITY_FAILED = "failed"
+# The statement moved while this request was out (a newer background refresh, a
+# meta that invalidated it, or a failed probe that cleared it). This answer is
+# older than what is installed now, so it is not adopted.
+IDENTITY_SUPERSEDED = "superseded"
 
 # The draft primitives (``copy_payload``, ``normalize_semantic``, ``PART_KEYS``)
 # live in ``document_edits``: the runs and the commands commit through them,
@@ -163,6 +176,20 @@ class TranslationResponse(Protocol):
     text: str
 
 
+class DictionaryIdentity(Protocol):
+    """One ``GET /v1/dictionary`` answer, as far as a run reads it.
+
+    ``api.DictionaryIdentityResult`` satisfies it, and that class - not this
+    one - validates the body. The two fields below are the ones provenance
+    needs: the revision the memory compares entries against, and the game
+    version the entry was confirmed under. Declared here for the same reason as
+    ``TranslationResponse``: the controller takes no HTTP dependency.
+    """
+
+    revision: str
+    source_game_version: str | None
+
+
 @runtime_checkable
 class WorkbenchApiClient(Protocol):
     """The client calls this workbench makes, and nothing else.
@@ -176,6 +203,10 @@ class WorkbenchApiClient(Protocol):
 
     async def get_capabilities(self) -> frozenset[str]:
         """The optional capabilities the server lists (empty when it lists none)."""
+
+    async def get_dictionary(self) -> "DictionaryIdentity | None":
+        """The served dictionary's authoritative identity (``dictionary-identity-v1``),
+        or None when the server does not serve ``GET /v1/dictionary``."""
 
     async def structure_check(self, body: dict[str, Any]) -> dict[str, Any]:
         """One Layer 1 batch (``structure-check-v1``), checked for exactly these segments."""
@@ -340,6 +371,13 @@ class DocumentRunController:
         # Most recent live /v1/reviews dictionary (document or segment mode)
         # observed in this session; cleared when endpoint/credential resets.
         self.live_review_dictionary: dict[str, Any] | None = None
+        # Most recent live GET /v1/dictionary identity observed in this session
+        # (``dictionary-identity-v1``): the authoritative revision, which needs
+        # no review call to exist. Cleared with the same resets.
+        self.live_dictionary_identity: DictionaryIdentity | None = None
+        # What the last probe established: IDENTITY_FRESH, IDENTITY_UNSUPPORTED,
+        # IDENTITY_FAILED, or None when nothing was asked.
+        self.identity_probe_state: str | None = None
         # What the records were last normalized against (identity checks only).
         self.records_seen: tuple | None = None
         self.record_views = sr.RecordViews()
@@ -366,6 +404,9 @@ class DocumentRunController:
         # Translation of the target side.
         self.translate_generation = 0
         self.translate_task: asyncio.Task | None = None
+        # The dictionary-identity request a 翻译 press is waiting on, while it
+        # is the only thing in flight (``translate_task`` points at it then).
+        self.provenance_task: asyncio.Task | None = None
         # idle | waiting | retrying | paused | failed. In paused and failed the
         # run record is the resume cursor; it is kept only while the source,
         # direction and target are exactly what the run left.
@@ -501,10 +542,173 @@ class DocumentRunController:
         if callable(recorder):
             recorder(dictionary)
 
-    def invalidate_provenance_for_credential_change(self) -> None:
-        """Clear live review provenance and advance both review generations so
-        in-flight requests issued under an older token cannot write back."""
+    def record_live_dictionary_identity(self, identity: DictionaryIdentity | None) -> None:
+        """Record the live ``GET /v1/dictionary`` identity, and hand it to the host.
+
+        Two holders on purpose. The host (the workbench view) is the one that
+        answers ``tm_provenance()``, so it is where a confirmed entry's
+        provenance comes from; this attribute is the same fact for a host that
+        has no such view, and it is what the next run reads when the view is
+        gone (the controller-only runs in the tests).
+        """
+        self.live_dictionary_identity = identity
+        setter = getattr(self.host, "set_service_dictionary", None)
+        if callable(setter):
+            setter(identity)
+
+    def _apply_dictionary_identity(
+        self, identity: DictionaryIdentity | None, *, seq: int | None = None
+    ) -> bool:
+        """Install an identity answer on the host unless a newer request won."""
+        applier = getattr(self.host, "apply_dictionary_identity", None)
+        if callable(applier):
+            if applier(identity, seq=seq) is False:
+                return False
+            self.live_dictionary_identity = identity
+            return True
+        self.record_live_dictionary_identity(identity)
+        return True
+
+    async def refresh_live_dictionary_identity(self) -> DictionaryIdentity | None:
+        """Ask the service for its authoritative dictionary identity, once.
+
+        Only when it can answer: an unconfigured client sends nothing, and a
+        server that does not list ``dictionary-identity-v1`` (or that predates
+        the endpoint, answering 404) leaves the older `/v1/meta` + `/v1/reviews`
+        path in charge, which ADR 0023 requires.
+
+        Never raises, and records what it learned in ``identity_probe_state``
+        because the three answers are three different decisions:
+
+        * ``IDENTITY_FRESH`` - the answer is read and recorded; the run reuses
+          against the revision it states.
+        * ``IDENTITY_UNSUPPORTED`` - the endpoint is not there. The fallback is
+          allowed; that is a server old enough to have no identity.
+        * ``IDENTITY_FAILED`` - it was asked and could not answer (503, a
+          timeout, a broken body). Nothing this session already believed about
+          the served dictionary may stand in for it, so both live statements are
+          cleared and this run reuses nothing. An older review basis is exactly
+          the value that might describe a dictionary the service replaced.
+        """
+        self.identity_probe_state = None
+        if not self._client_configured():
+            return None
+        client = self.api_client
+        getter = getattr(client, "get_dictionary", None)
+        # Reserve an ordinal for the capabilities check (used if it fails or
+        # reports the endpoint unsupported). Once the capability is confirmed,
+        # reserve a fresh ordinal immediately before issuing get_dictionary().
+        seq = self._begin_identity_request()
+        try:
+            # Capabilities are part of this press's basis, not a session-wide
+            # constant: a service can be upgraded or rolled back in place, and a
+            # cached "no dictionary-identity-v1" would then keep the older review
+            # revision in charge for the rest of the session.
+            self.capabilities = await client.get_capabilities()
+            if semantic.CAPABILITY_DICTIONARY_IDENTITY not in self.capabilities:
+                # A server that has stopped advertising the endpoint cannot
+                # confirm the identity this session read earlier, so it goes.
+                if not self._apply_dictionary_identity(None, seq=seq):
+                    self.identity_probe_state = IDENTITY_SUPERSEDED
+                    return None
+                self.identity_probe_state = IDENTITY_UNSUPPORTED
+                return None
+            if not callable(getter):
+                if not self._apply_dictionary_identity(None, seq=seq):
+                    self.identity_probe_state = IDENTITY_SUPERSEDED
+                    return None
+                self.identity_probe_state = IDENTITY_UNSUPPORTED
+                return None
+            seq = self._begin_identity_request()
+            identity = await getter()
+        except ClientError as exc:
+            if exc.code == ERROR_CANCELLED:
+                # The owner cancelled the wait. Nothing was learned, and nothing
+                # already verified was disproved - a cancel is not a 503.
+                return None
+            if not self.clear_live_provenance(seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
+            self.identity_probe_state = IDENTITY_FAILED
+            return None
+        except Exception:  # noqa: BLE001 - see the docstring: fail closed, never raise
+            if not self.clear_live_provenance(seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
+            self.identity_probe_state = IDENTITY_FAILED
+            return None
+        if identity is None:
+            # The endpoint answered "no identity": an older server, or a
+            # same-origin fallback standing in front of one. Any identity this
+            # session cached earlier is not confirmable now, so it goes with the
+            # answer. The review basis stays - that is the fallback ADR 0023
+            # keeps for a server without the endpoint.
+            if not self._apply_dictionary_identity(None, seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
+            self.identity_probe_state = IDENTITY_UNSUPPORTED
+            return None
+        if not self._apply_dictionary_identity(identity, seq=seq):
+            # A newer request already decided the identity while this request
+            # was out. Adopting this answer would restore an older statement.
+            self.identity_probe_state = IDENTITY_SUPERSEDED
+            return None
+        self.identity_probe_state = IDENTITY_FRESH
+        return identity
+
+    def _begin_identity_request(self) -> int | None:
+        """Reserve the host's next request ordinal, or None for a host without one.
+
+        The two producers of the identity (this press and the window's
+        background refresh) share it through the host. A stand-in without one -
+        the controller's own tests, a headless run - keeps the older behaviour of
+        no ordering check rather than gaining a fake one.
+        """
+        beginner = getattr(self.host, "begin_dictionary_identity_request", None)
+        if not callable(beginner):
+            return None
+        return beginner()
+
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
+        """Forget both live statements about the served dictionary.
+
+        Called when the identity request could not be read: the run that asked
+        cannot decide on a revision it could not verify, and the review basis is
+        not a substitute for the answer that did not arrive - it may describe a
+        dictionary the service has since replaced.
+        """
+        clearer = getattr(self.host, "clear_live_provenance", None)
+        if callable(clearer):
+            applied = clearer() if seq is None else clearer(seq=seq)
+            if applied is False:
+                return False
+            self.live_review_dictionary = None
+            self.live_dictionary_identity = None
+            return True
         self.live_review_dictionary = None
+        self.live_dictionary_identity = None
+        identity_setter = getattr(self.host, "set_service_dictionary", None)
+        if callable(identity_setter):
+            identity_setter(None)
+        return True
+
+    def invalidate_provenance_for_credential_change(self) -> None:
+        """Clear live review and dictionary provenance and advance both review
+        generations so in-flight requests issued under an older token cannot
+        write back."""
+        self.live_review_dictionary = None
+        self.live_dictionary_identity = None
+        # A 翻译 press waiting on the identity request was issued under the old
+        # credential. Dropped before its answer lands: otherwise the reply
+        # restores the provenance just cleared and starts the run anyway.
+        probe, self.provenance_task = self.provenance_task, None
+        if probe is not None and not probe.done():
+            self.translate_generation += 1
+            if self.translate_task is probe:
+                self.translate_task = None
+            self.translate_run = None
+            self.translate_state = TRANSLATION_IDLE
+            probe.cancel()
         self.cancel_pending()
         self.stop_semantic("paused" if self.semantic_running() else None)
 
@@ -1598,6 +1802,7 @@ class DocumentRunController:
         """Hard stop: nothing is written and nothing is offered afterwards."""
         self.translate_generation += 1
         task, self.translate_task = self.translate_task, None
+        self.provenance_task = None
         self.translate_run, self.translate_state = None, TRANSLATION_IDLE
         if task is not None and not task.done():
             task.cancel()
@@ -1690,13 +1895,21 @@ class DocumentRunController:
         """Current verified (terms_db_revision, game_version) from this session.
 
         Delegates to ``self.host.tm_provenance()`` when available; otherwise
-        reads only ``self.live_review_dictionary`` (``revision`` and
-        ``game_version`` / ``source_game_version``), never falling back to
-        historical workfile ``term_basis`` or ``source_commit``.
+        reads the live ``GET /v1/dictionary`` identity (``revision`` and
+        ``source_game_version``) and then ``self.live_review_dictionary``
+        (``revision`` and ``game_version`` / ``source_game_version``), never
+        falling back to historical workfile ``term_basis`` or ``source_commit``.
+        The identity comes first because it is the served dictionary itself,
+        while a review dictionary is the snapshot one review ran against.
         """
         getter = getattr(self.host, "tm_provenance", None)
         if callable(getter):
             return getter()
+        identity = self.live_dictionary_identity
+        if identity is not None:
+            terms = tm.normalize_provenance_value(getattr(identity, "revision", None))
+            game = tm.normalize_provenance_value(getattr(identity, "source_game_version", None))
+            return terms, game
         if not isinstance(self.live_review_dictionary, dict):
             return None, None
         terms = tm.normalize_provenance_value(self.live_review_dictionary.get("revision"))
@@ -2022,17 +2235,147 @@ class DocumentRunController:
 
     def start_translation(self, *, single_segment: bool = False) -> None:
         """Translate a blank target, resume remaining untranslated paragraphs,
-        or translate/re-translate one segment without overwriting finished work."""
+        or translate/re-translate one segment without overwriting finished work.
+
+        A run that could reuse confirmed segments needs the dictionary the
+        service is *serving* right now. When this session has not learned it
+        from a review, the authoritative ``GET /v1/dictionary`` answer is
+        fetched once before the reuse decision, so a fresh session can skip
+        trusted segments without a term review first. Fail-closed: if that
+        answer is absent or unusable the revision stays unknown and nothing is
+        skipped.
+        """
+        if self._needs_dictionary_identity(single_segment=single_segment):
+            self._launch_translation_after_identity(single_segment)
+            return
+        self._start_translation(single_segment=single_segment)
+
+    def _needs_dictionary_identity(self, *, single_segment: bool) -> bool:
+        """Whether this press must ask which dictionary is served before reusing.
+
+        Every press that could reuse asks, not only the first of a session. The
+        dictionary can be replaced under a running workbench without any field
+        of `/v1/meta` or `/v1/reviews` moving, and a cached revision would then
+        let entries confirmed under the previous dictionary count as fresh. One
+        request per press is what makes that change visible at the moment it
+        matters.
+
+        The capability list is read again by that request for the same reason: a
+        service can be upgraded or rolled back in place, and what it listed
+        earlier is not an answer about the service that is running now.
+        """
+        if single_segment:
+            return False
+        memory = self.translation_memory
+        if memory is None or not memory.usable:
+            return False
+        if not self._client_configured():
+            return False
+        if not (blank(self.payload["target"]) or not self.translation_withdrawn):
+            return False
+        # A press continues a paused run only while that run still fits this
+        # document; when a re-pairing has made it a fresh run after all, the
+        # reuse decision is back and so is the question it asks.
+        resumed, _pair, _wanted = self._resume_for_press()
+        return resumed is None
+
+    def _resume_for_press(self) -> tuple[Translation | None, Any, str | None]:
+        """The paused run this press would continue, its pair, and the status that pair needs.
+
+        ``resumable()`` answers "is the document still the one that run left". A
+        press needs one thing more: the segment it was translating is still
+        there, in the state it needs. Re-pairing the document, or finishing that
+        segment elsewhere, makes the press a fresh run instead - and a fresh run
+        asks which dictionary is served before it reuses anything.
+        """
+        cursor = self.resumable()
+        if cursor is None:
+            return None, None, None
+        if cursor.segment is None:
+            return cursor, None, None
+        wanted = STATUS_READY if cursor.retranslate else STATUS_UNTRANSLATED
+        pair = next((p for p in self.current_pairs()
+                     if p.status == wanted and p.source.core_start == cursor.segment), None)
+        if pair is None:
+            return None, None, None
+        return cursor, pair, wanted
+
+    def _launch_translation_after_identity(self, single_segment: bool) -> None:
+        """Fetch the identity, then run the same decision ``start_translation`` makes.
+
+        The probe occupies ``translate_task`` while it is the only thing the
+        translation path is doing, so Cancel, endpoint changes and the
+        workbench's own settle checks see a run in progress. It hands the slot
+        over before re-entering: that call may stop the previous run, and a
+        ``stop_translation`` from inside this task would cancel this task.
+
+        A second press while the probe is still running is ignored. The press
+        already waiting will start the run when the answer lands, and two
+        presses must not become two runs (the prefill's ``stop_translation``
+        would cancel whichever arrived second).
+        """
+        current = self.translate_task
+        if current is not None and current is self.provenance_task and not current.done():
+            return
+        payload = self.payload
+        # What this press was pressed on. A run is bound to the text it started
+        # from (``translation_basis_unchanged``); a press held up by the identity
+        # request has to hold the same line, or an edit - or an alignment change,
+        # which resets the pairing the reuse decision is made on - is translated
+        # without anybody pressing 翻译 for it.
+        basis = (
+            payload["source"],
+            payload["target"],
+            payload["direction"],
+            copy.deepcopy(payload["alignments"]),
+        )
+        probe = asyncio.ensure_future(self._start_translation_after_identity(single_segment, basis))
+        self.provenance_task = probe
+        self.translate_task = probe
+        # The wait is a network round trip, so it is shown and cancellable like
+        # any other: without this the workbench would render a press that
+        # apparently did nothing, with no Cancel, until the answer arrived.
+        self.translate_state = TRANSLATION_PROBING
+        self.host.report_status(strings.MANUSCRIPT_TRANSLATE_PROVENANCE)
+        self._translation_ui()
+
+    async def _start_translation_after_identity(self, single_segment: bool, basis: tuple) -> None:
+        generation = self.translate_generation
+        await self.refresh_live_dictionary_identity()
+        # A stop (Cancel, an endpoint change, a replaced run) during the request
+        # owns the decision now; this press must not resurrect a run under it.
+        if generation != self.translate_generation:
+            return
+        if self.provenance_task is asyncio.current_task():
+            self.provenance_task = None
+        if self.translate_task is asyncio.current_task():
+            self.translate_task = None
+        payload = self.payload
+        if (
+            payload["source"],
+            payload["target"],
+            payload["direction"],
+            payload["alignments"],
+        ) != basis:
+            # The owner edited the document, switched direction, or re-paired it
+            # while the identity was in flight. The press belonged to the earlier
+            # document, so it ends the way a changed run ends: nothing written,
+            # said so.
+            self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+            self._translation_ui()
+            return
+        self._start_translation(single_segment=single_segment)
+        if self.translate_state == TRANSLATION_PROBING:
+            # Nothing was launched (a refusal or a completion line is already on
+            # screen): back to idle, so no Cancel outlives the wait it belonged to.
+            self.translate_state = TRANSLATION_IDLE
+            self._translation_ui()
+
+    def _start_translation(self, *, single_segment: bool = False) -> None:
         payload = self.payload
         source, target, direction = payload["source"], payload["target"], payload["direction"]
-        cursor = self.resumable()
-        pair = None
-        if cursor is not None and cursor.segment is not None:
-            wanted = STATUS_READY if cursor.retranslate else STATUS_UNTRANSLATED
-            pair = next((p for p in self.current_pairs()
-                         if p.status == wanted and p.source.core_start == cursor.segment), None)
-            if pair is None:
-                cursor = None
+        cursor, pair, _wanted = self._resume_for_press()
 
         partial_tail = None
         batch_spans: list[tuple[int, int]] = []
@@ -2476,11 +2819,25 @@ class DocumentRunController:
                                      len(inserted))
         return self.host.apply_target_write(changed, edit, remap=remap)
 
-    def translation_stopped(self, run: Translation, state: str, reason: str = "", *,
+    def translation_stopped(self, run: Translation | None, state: str, reason: str = "", *,
                             quota: bool = False) -> None:
         """The run ended before its last piece: the owner paused it, the
         service asked to wait, or a piece failed. The run stays as the cursor
-        for the next press."""
+        for the next press.
+
+        ``run`` is None when the owner cancelled a press that was still waiting
+        for the served dictionary's identity: no piece ran, so there is no
+        cursor to keep and nothing to report - the document is untouched and
+        the controls come back.
+        """
+        if run is None:
+            self.translate_task = None
+            self.provenance_task = None
+            self.translate_run = None
+            self.translate_state, self.translate_status = TRANSLATION_IDLE, ""
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED)
+            self._translation_ui()
+            return
         self.translate_task = None
         if not self.translation_basis_unchanged(run):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE

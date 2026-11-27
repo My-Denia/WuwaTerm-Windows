@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -35,7 +36,16 @@ from .errors import (
 )
 from . import structure
 from .manuscript import REVIEW_FEATURE_AMBIGUOUS_MENTION, ReviewReport, valid_report
-from .semantic import SemanticReviewReport, encode_request, parse_capabilities, valid_semantic_report
+# ``CAPABILITY_DICTIONARY_IDENTITY`` is re-exported on purpose: `get_dictionary`
+# below is the endpoint that capability turns on, so a caller holding this client
+# reads the name from the same module as the call.
+from .semantic import (
+    CAPABILITY_DICTIONARY_IDENTITY,
+    SemanticReviewReport,
+    encode_request,
+    parse_capabilities,
+    valid_semantic_report,
+)
 from .translation_memory import normalize_provenance_value
 
 TokenProvider = Callable[..., "str | None"]
@@ -130,6 +140,14 @@ def _normalize_optional_meta_version(value: Any, field: str) -> "str | None":
     return normalize_provenance_value(text)
 
 
+# The dictionary revision is the wire's own contract: 64 lowercase hex
+# characters, the deterministic SHA-256 `wuwaterm-review-dictionary-v1` digest.
+# Anything else is not a revision this client can compare a memory entry with,
+# and comparing it would classify every confirmed segment as stale (or, worse,
+# as fresh) on a value nobody computed.
+_REVISION_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
 # -- Response models (direct pass-through of the wire schema) --------------
 
 
@@ -218,6 +236,55 @@ class MetaResult:
             source_game_version=_normalize_optional_meta_version(
                 data.get("source_game_version"), "source_game_version"
             ),
+        )
+
+
+# `GET /v1/dictionary` (Core ADR 0023, `dictionary-identity-v1`). The wire body
+# is closed: `additionalProperties: false` in the published schema, and this
+# service names every field it sends. A body with an extra key is therefore not
+# this endpoint's answer, and reading the fields it happens to share would let
+# an unrelated local service's JSON pass as dictionary provenance.
+_DICTIONARY_IDENTITY_FIELDS = frozenset(
+    {"revision", "schema_version", "source_commit", "source_game_version", "term_count", "request_id"}
+)
+
+
+@dataclass(frozen=True)
+class DictionaryIdentityResult:
+    """The served dictionary's authoritative identity and provenance.
+
+    ``revision`` is the digest the memory compares entries against, and unlike
+    the `(schema_version, source_commit, term_count)` tuple the same value on
+    two servers means the same dictionary *content*: changing one entry
+    changes the revision while that tuple can stay identical (ADR 0023).
+    """
+
+    revision: str
+    schema_version: str | None
+    source_commit: str | None
+    source_game_version: str | None
+    term_count: int
+    request_id: str
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "DictionaryIdentityResult":
+        if not isinstance(data, dict) or data.keys() != _DICTIONARY_IDENTITY_FIELDS:
+            raise ValueError("dictionary identity body has the wrong keys")
+        revision = _as_str(data["revision"], "revision")
+        if _REVISION_HEX64.fullmatch(revision) is None:
+            raise ValueError("revision is not a lowercase hex SHA-256 digest")
+        term_count = _as_int(data["term_count"], "term_count")
+        if term_count < 0:
+            raise ValueError("term_count is negative")
+        return cls(
+            revision=revision,
+            schema_version=_as_optional_str(data["schema_version"], "schema_version"),
+            source_commit=_as_optional_str(data["source_commit"], "source_commit"),
+            source_game_version=_normalize_optional_meta_version(
+                data["source_game_version"], "source_game_version"
+            ),
+            term_count=term_count,
+            request_id=_as_str(data["request_id"], "request_id"),
         )
 
 
@@ -659,6 +726,31 @@ class ApiClient:
     async def get_meta(self) -> MetaResult:
         response = await self._request("GET", "/v1/meta")
         return self._parsed(MetaResult.from_json, self._json(response))
+
+    async def get_dictionary(self) -> DictionaryIdentityResult | None:
+        """The served dictionary's authoritative identity (``GET /v1/dictionary``).
+
+        Needs the ``dictionary-identity-v1`` capability (ADR 0023). A server
+        that predates the endpoint answers 404, which is reported as ``None`` -
+        "this server has no identity to give" - rather than as a failure, so
+        every caller keeps the older `/v1/meta` provenance path instead of
+        reporting the service as broken. Every other failure (401, 429, a
+        malformed body) is raised: an unusable credential is not a server
+        without the endpoint, and pretending otherwise would silently downgrade
+        provenance.
+
+        The request is built by the same ``_request`` as every other call, so
+        the bearer credential, the origin guard and the unconfigured-client
+        refusal all apply unchanged: an unconfigured client still sends
+        nothing.
+        """
+        try:
+            response = await self._request("GET", "/v1/dictionary")
+        except ClientError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        return self._parsed(DictionaryIdentityResult.from_json, self._json(response))
 
     async def get_capabilities(self) -> frozenset[str]:
         """Optional capabilities the server lists. A server without the

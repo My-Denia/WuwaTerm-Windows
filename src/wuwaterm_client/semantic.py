@@ -19,6 +19,13 @@ from typing import Any, TypedDict
 REVIEW_VERSION = "semantic-review-v1"
 CAPABILITY_SEMANTIC_REVIEW = "semantic-review-v1"
 CAPABILITY_TRANSLATION_CONTEXT = "translation-context-v1"
+# `GET /v1/dictionary` (Core ADR 0023, "Authoritative dictionary identity"):
+# the served dictionary's revision, so a client no longer has to infer which
+# dictionary is running from the `(schema_version, source_commit, term_count)`
+# tuple `/v1/meta` and `/v1/reviews` carry. Kept here, with the other capability
+# names, because this module is standard library only: the workbench controller
+# reads it without taking an HTTP dependency.
+CAPABILITY_DICTIONARY_IDENTITY = "dictionary-identity-v1"
 
 CATEGORIES = (
     "omission",
