@@ -2529,3 +2529,292 @@ def test_a_meta_refresh_that_names_another_dictionary_drops_the_identity(qapp, m
         assert view._terms_db_revision() is None
     finally:
         view.close()
+
+
+def test_a_newer_meta_drops_the_identity_answer_that_was_already_in_flight(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Two refreshes, one answer: the older one loses.
+
+    The identity request can still be in flight when a later `/v1/meta` reports
+    another dictionary. Answering that request would install the revision the
+    newer meta just invalidated, so the pending request is replaced by one asked
+    about the new state, and the old answer is dropped even if it arrives.
+    """
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        state = {"meta": "old", "dictionary": "old"}
+        held = asyncio.Event()
+        old_dictionary_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                if state["meta"] == "old":
+                    return httpx.Response(200, json=_meta_payload(
+                        schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0"))
+                return httpx.Response(200, json=_meta_payload(
+                    schema_version="1", source_commit="b" * 40, term_count=43, source_game_version="3.8.0"))
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["dictionary"] == "old":
+                    old_dictionary_started.set()
+                    await held.wait()
+                    return httpx.Response(200, json=_dictionary_payload())
+                return httpx.Response(200, json=_dictionary_payload(
+                    OTHER_REVISION, game_version="3.8.0", source_commit="b" * 40, term_count=43))
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(old_dictionary_started.wait(), timeout=2.0)
+            first_request = window._dictionary_task
+            assert first_request is not None
+
+            # A newer meta: another dictionary. The pending answer belongs to the
+            # state this refresh replaces.
+            state["meta"], state["dictionary"] = "new", "new"
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+
+            # The old answer arrives late; it must not replace the newer one.
+            held.set()
+            await asyncio.gather(first_request, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION, "the superseded revision came back"
+        finally:
+            held.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_same_workbench_notices_a_dictionary_swap_between_two_presses(qapp, memory) -> None:
+    """Two presses, two dictionaries, one workbench.
+
+    The revision, the game version and `(schema_version, source_commit,
+    term_count)` are all unchanged; only the dictionary content moved, which is
+    exactly what `GET /v1/dictionary` is for. The second press has to ask again
+    and refuse to reuse what the first one legitimately reused.
+    """
+    before = REVISION
+    after = hashlib.sha256(b"the dictionary after the edit").hexdigest()
+    asked: list[str] = []
+    served = {"revision": before}
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                return httpx.Response(200, json=_dictionary_payload(served["revision"]))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=before, game_version="3.7.0")
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view._controller.start_translation()
+            await _settle_translation(view)
+            assert view._payload["target"] == "甲句。\n\n乙句。", "the first press did not reuse"
+            assert asked.count("/v1/translations") == 0
+
+            served["revision"] = after
+            install(view, source, target, alignments=alignments)
+            view._controller.start_translation()
+            await _settle_translation(view)
+
+            assert asked.count("/v1/dictionary") == 2, "the second press reused the cached revision"
+            assert asked.count("/v1/translations") == 1, "an entry from the replaced dictionary was reused"
+            assert "乙句。" not in view._payload["target"]
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_dictionary_answer_does_not_reuse_the_cached_review_basis(qapp, memory) -> None:
+    """503, not 404: the endpoint exists and could not answer.
+
+    This session still holds the dictionary a review reported. That value is the
+    fallback for a server *without* the endpoint; here it is the statement that
+    may describe a dictionary the service replaced, so it is cleared with the
+    identity and the press reuses nothing.
+    """
+    rev = REVISION
+    asked: list[str] = []
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                return httpx.Response(503, json={"error": {"code": "llm_unavailable"}, "request_id": "req-d"})
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=rev, game_version="3.7.0")
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view._record_live_review_dictionary({
+                "schema_version": "1", "source_commit": "a" * 40, "term_count": 42, "revision": rev,
+            })
+            assert view._terms_db_revision() == rev
+
+            view._controller.start_translation()
+            await _settle_translation(view)
+
+            assert asked.count("/v1/translations") == 1, "the review basis was reused after a failed probe"
+            assert "乙句。" not in view._payload["target"]
+            assert view._live_review_dictionary is None
+            assert view._terms_db_revision() is None
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_game_version_only_meta_change_drops_the_identity(qapp, memory) -> None:
+    """The dictionary state includes the game version.
+
+    A `/v1/meta` that moved only `source_game_version` still describes another
+    dictionary state, and the identity's own value - not the meta's - is what an
+    entry is compared with. Keeping the identity here would reuse an entry
+    confirmed under 3.7.0 while the service serves 3.8.0.
+    """
+    identity = DictionaryIdentityResult(
+        revision=REVISION, schema_version="1", source_commit="a" * 40,
+        source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        source, target, alignments = two_segments()
+        install(view, source, target, alignments=alignments)
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0",
+        )))
+        view.set_service_dictionary(identity)
+        assert view._game_version() == "3.7.0"
+
+        view.set_service_meta(MetaResult.from_json(_meta_payload(
+            schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.8.0",
+        )))
+
+        assert view._service_dictionary is None, "the identity outlived a game version change"
+        assert view._terms_db_revision() is None
+        assert view._game_version() == "3.8.0"
+    finally:
+        view.close()
+
+
+def test_switching_to_an_endpoint_without_a_credential_asks_it_nothing(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """A new address with no credential is not a service to question.
+
+    The old endpoint's identity is dropped by the switch, and nothing may be sent
+    to the new one until the owner gives it a credential - not even the
+    capability probe that precedes a dictionary request.
+    """
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+
+        asked: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            asked.append(f"{request.url.host}{request.url.path}")
+            if request.url.path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if request.url.path == "/v1/dictionary":
+                return httpx.Response(200, json=_dictionary_payload())
+            raise AssertionError(f"unexpected path: {request.url.path}")
+
+        client = ApiClient("https://a.example", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://a.example"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+            assert window.manuscript_view._service_dictionary is not None
+            asked.clear()
+
+            # The new address has no token of its own.
+            monkeypatch.setattr(main_window_module, "has_token", lambda: False)
+            window._apply_settings(ClientConfig(base_url="https://b.example"))
+            await asyncio.sleep(0)
+
+            assert window._dictionary_task is None, "a probe was started for the new address"
+            assert [entry for entry in asked if entry.startswith("b.example")] == [], asked
+            assert window.manuscript_view._service_dictionary is None
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())

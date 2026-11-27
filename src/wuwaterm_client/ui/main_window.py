@@ -621,6 +621,15 @@ class MainWindow(QMainWindow):
         self._meta = meta
         self.manuscript_view.set_service_meta(meta)
         self._refresh_status_bar()
+        if meta is None:
+            # No service described. This is the endpoint leaving (or a credential
+            # that took the service with it), and `set_service_meta(None)` has
+            # already dropped every statement about the old one. Asking here
+            # would probe an address this window was just told to forget - and,
+            # after a switch to an unconfigured address, would have no service to
+            # ask at all.
+            self._cancel_dictionary_identity_refresh()
+            return
         self._schedule_dictionary_identity_refresh()
 
     # -- the live dictionary's own identity ---------------------------------
@@ -648,7 +657,11 @@ class MainWindow(QMainWindow):
             # refresh (the one that starts one) schedules it instead.
             return
         if self._dictionary_task is not None and not self._dictionary_task.done():
-            return
+            # A newer meta is a newer question. The pending answer describes the
+            # dictionary state this refresh has just replaced, so it is dropped
+            # rather than allowed to land after the identity it would overwrite
+            # was cleared.
+            self._cancel_dictionary_identity_refresh()
         self._dictionary_generation += 1
         self._dictionary_task = asyncio.ensure_future(
             self._refresh_dictionary_identity(self._dictionary_generation)
@@ -664,27 +677,34 @@ class MainWindow(QMainWindow):
     async def _refresh_dictionary_identity(self, generation: int) -> None:
         """One identity probe, delivered only if it still describes this window.
 
-        Every failure - no capability, an older server (404), a rejected
-        credential, a malformed body - arrives here as ``None``, and ``None``
-        clears the identity. That is deliberate: the workbench then reports an
-        unknown revision and reuses nothing, which is the working state it had
-        before this endpoint existed, while a stale identity would let a
-        memory entry confirmed under another dictionary count as fresh.
+        Two answers are not the same thing and are not treated as one:
+
+        * the server does not serve the endpoint (no capability, or a 404) - the
+          identity is cleared, and the older `/v1/meta` + `/v1/reviews`
+          statements stay in charge, as ADR 0023 requires;
+        * the request failed (503, a timeout, a broken body) - the identity *and*
+          this session's review dictionary are cleared, because neither is a
+          substitute for the answer that did not arrive; a stale one would let a
+          memory entry confirmed under another dictionary count as fresh.
         """
         client = self.api_client
         origin = client.current_origin
         identity: "DictionaryIdentityResult | None" = None
+        failed = False
         try:
             capabilities = await client.get_capabilities()
             if CAPABILITY_DICTIONARY_IDENTITY in capabilities:
                 identity = await client.get_dictionary()
-        except Exception:  # noqa: BLE001 - the probe is optional: any failure means "no identity"
-            identity = None
+        except Exception:  # noqa: BLE001 - the probe is optional: a failure means "nothing verified"
+            failed = True
         if generation != self._dictionary_generation or self._closed:
             return
         if client.current_origin != origin:
             # The address changed while the request was in flight; the reply
             # describes the previous service.
+            return
+        if failed:
+            self.manuscript_view.clear_live_provenance()
             return
         self.manuscript_view.set_service_dictionary(identity)
 

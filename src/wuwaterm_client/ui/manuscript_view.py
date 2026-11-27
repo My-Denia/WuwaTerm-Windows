@@ -902,6 +902,9 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def set_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
         self._view.set_service_dictionary(identity)
 
+    def clear_live_provenance(self) -> None:
+        self._view.clear_live_provenance()
+
 
 def _normalized_game_version(value: object) -> str | None:
     return tm.normalize_provenance_value(value)
@@ -929,6 +932,8 @@ def _identity_matches_meta(identity: DictionaryIdentityResult, meta: MetaResult)
         identity.schema_version == meta.schema_version
         and identity.source_commit == meta.source_commit
         and identity.term_count == meta.term_count
+        and _normalized_game_version(identity.source_game_version)
+        == _normalized_game_version(meta.source_game_version)
     )
 
 
@@ -4488,6 +4493,8 @@ class ManuscriptView(QWidget):
         self._service_meta = None
         self._live_review_dictionary = None
         self._service_dictionary = None
+        self._controller.live_dictionary_identity = None
+        self._controller.identity_probe_state = None
         # Another service: its basis is unknown until its first check.
         self._reset_term_session(self._segment_cursor)
         self._refresh_tm_panel()
@@ -5019,6 +5026,21 @@ class ManuscriptView(QWidget):
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
 
+    def clear_live_provenance(self) -> None:
+        """Forget both live statements about the served dictionary.
+
+        The identity and this session's review dictionary each name a
+        dictionary. When a request meant to confirm one of them fails, neither
+        is knowledge any more: a run must fall back to no revision rather than
+        to whichever of the two is older.
+        """
+        if self._service_dictionary is None and self._live_review_dictionary is None:
+            return
+        self._service_dictionary = None
+        self._live_review_dictionary = None
+        self._refresh_tm_panel()
+        self.workbenchStatusChanged.emit()
+
     def _drop_conflicting_review_dictionary(self, revision: str | None) -> bool:
         """Forget a live review dictionary whose revision the identity contradicts.
 
@@ -5125,9 +5147,11 @@ class ManuscriptView(QWidget):
         """
         identity = self._service_dictionary
         if identity is not None:
-            version = _normalized_game_version(identity.source_game_version)
-            if version is not None:
-                return version
+            # The identity describes the dictionary being served, so its game
+            # version is the one confirmed entries are compared with. A null
+            # there is "this dictionary states none", not "fall back to the
+            # older /v1/meta reading", which may belong to another dictionary.
+            return _normalized_game_version(identity.source_game_version)
         if self._service_meta is not None:
             return _normalized_game_version(self._service_meta.source_game_version)
         dictionary = self._live_review_dictionary
