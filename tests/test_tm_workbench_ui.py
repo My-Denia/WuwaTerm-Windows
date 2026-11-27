@@ -18,9 +18,11 @@ boundaries are its own.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 
+import httpx
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
@@ -93,19 +95,23 @@ def two_segments() -> tuple[str, str, list[dict]]:
 
 def test_the_panel_lists_the_confirmed_pair_for_the_segment_at_the_caret(qapp, memory) -> None:
     source, target, alignments = two_segments()
-    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
         panel = view.tm_panel
         assert len(panel.matches) == 1
         card = panel.hit_texts()[0]
-        # Same text, same neighbour: the strongest kind, and no warning.
+        # Same text, same neighbour, matching dictionary revision: trusted reuse, no warning.
         assert strings.TM_MATCH_CONTEXT_EXACT in card
+        assert strings.TM_BADGE_TRUSTED_REUSE in card
         assert "首句。" in card
         assert strings.TM_STALE_TERMS not in card and strings.TM_STALE_NUMERIC not in card
+        assert panel.matches[0].freshness == tm.TM_FRESHNESS_VERIFIED
         assert panel.matches[0].needs_recheck is False
         assert panel.confirm_button.isEnabled()
     finally:
@@ -155,9 +161,11 @@ def test_an_entry_confirmed_under_another_dictionary_says_the_revision_moved(qap
 
 def test_adopting_a_candidate_is_one_edit_that_ctrl_z_takes_back(qapp, memory) -> None:
     source, target, alignments = two_segments()
-    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(0)
         view._refresh_tm_panel()
@@ -268,9 +276,10 @@ def test_a_segment_with_only_a_translation_is_not_read_as_a_broken_memory(qapp, 
     source = "First line."
     target = "甲句。Extra target text."
     alignments = alignments_for(source, target, [("First line.", "甲句。")])
-    memory.add("First line.", "首句。", "en", origin="human_confirmed")
+    memory.add("First line.", "首句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         view.segment_list.setCurrentRow(1)
         view._refresh_tm_panel()
@@ -281,9 +290,11 @@ def test_a_segment_with_only_a_translation_is_not_read_as_a_broken_memory(qapp, 
         assert view.tm_panel.matches == []
         assert view.tm_panel.confirm_button.isEnabled() is False
         view._check_memory_reuse()
-        # It is skipped and counted, not reported as a broken memory file.
+        # It is skipped and counted, not reported as a broken memory file;
+        # the single source segment has no context, so it counts as reference-only.
         assert view.tm_panel.summary.skipped == 1
-        assert view.tm_panel.summary.fresh == 1
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
         assert strings.TM_PANEL_CHECK_SKIPPED.format(n=1, max=tm.SOURCE_SCALARS[1]) in view.status_label.text()
         assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.status_label.text()
         assert view.tm_panel.check_button.isEnabled() is True
@@ -300,12 +311,15 @@ def test_consecutive_untranslated_segments_are_filled_in_document_order(qapp, me
     target = "甲句。"
     alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", ""),
                                                  ("Third line.", "")])
-    memory.add("First line.", "甲句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("First line.", "甲句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     memory.add("Second line.", "zulu.", "en", prev_source="First line.", next_source="Third line.",
-               origin="human_confirmed")
-    memory.add("Third line.", "alpha.", "en", prev_source="Second line.", origin="human_confirmed")
+               origin="human_confirmed", terms_db_revision=REVISION)
+    memory.add("Third line.", "alpha.", "en", prev_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         assert view.tm_panel.summary.fillable == 2
@@ -335,11 +349,12 @@ def test_filling_keeps_every_reviewed_segment_span_on_its_own_text(qapp, memory)
                                                  ("Gamma line.", "丙句。"), ("Delta line.", ""),
                                                  ("Epsilon line.", "戊句。")])
     memory.add("Beta line.", "zulu.", "en", prev_source="Alpha line.", next_source="Gamma line.",
-               origin="human_confirmed")
+               origin="human_confirmed", terms_db_revision=REVISION)
     memory.add("Delta line.", "alpha.", "en", prev_source="Gamma line.", next_source="Epsilon line.",
-               origin="human_confirmed")
+               origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         pairs = view._current_pairs()
         assert [pair.status for pair in pairs] == [
@@ -456,10 +471,11 @@ def test_a_segment_longer_than_the_memory_holds_is_not_a_broken_file(qapp, memor
 
 def test_the_reuse_check_classifies_the_segments_it_can_read(qapp, memory) -> None:
     limit = tm.SOURCE_SCALARS[1]
-    memory.add("Alpha line.", "甲句。", "en", origin="human_confirmed")
-    memory.add("Gamma line.", "丙句。", "en", origin="human_confirmed")
+    memory.add("Alpha line.", "甲句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
+    memory.add("Gamma line.", "丙句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._report = {"dictionary": {"revision": REVISION}}
         classes = view._classify_reuse(["Alpha line.", "字" * (limit + 1), "Gamma line."])
         # The unreadable middle segment is skipped; the others are still read,
         # with no context on the side the skip took away.
@@ -599,26 +615,30 @@ def test_the_reuse_check_counts_fresh_stale_and_unmatched_segments(qapp, memory)
     target = "甲句。"
     alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", ""),
                                                  ("Third line, +2.", "")])
-    memory.add("First line.", "甲句。", "en", next_source="Second line.", origin="human_confirmed")
-    memory.add("Second line.", "乙句。", "en", prev_source="First line.", next_source="Third line.",
-               origin="human_confirmed")
-    memory.add("Third line, +5.", "丙句，+5。", "en", prev_source="Second line.", origin="human_confirmed")
+    memory.add("First line.", "甲句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
+    memory.add("Second line.", "乙句。", "en", prev_source="First line.", next_source="Third line, +2.",
+               origin="human_confirmed", terms_db_revision=REVISION)
+    memory.add("Third line, +5.", "丙句，+5。", "en", prev_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         view._check_memory_reuse()
         summary = view.tm_panel.summary
         assert summary is not None
-        # The first two match with their neighbours; the third only references.
+        # The first two match with their neighbours and verified revision; the third only references.
         assert (summary.fresh, summary.stale, summary.unmatched) == (2, 1, 0)
         assert summary.fillable == 1
         assert view.status_label.text() == strings.TM_PANEL_CHECK_SUMMARY.format(fresh=2, stale=1, unmatched=0)
         assert view.tm_panel.fill_button.text() == strings.TM_PANEL_CHECK_FILL.format(n=1)
 
-        # Filling writes the one empty target, as one edit that undo takes back.
+        # Filling writes the one empty target, as one edit that undo takes back,
+        # and reports offline Layer 1 check guidance when unconfigured.
         view._fill_from_memory()
         assert view._payload["target"] == "甲句。乙句。"
-        assert view.status_label.text() == strings.TM_PANEL_CHECK_FILLED.format(n=1)
+        assert view.status_label.text() == strings.TM_PANEL_CHECK_FILLED_OFFLINE.format(n=1)
         view.target_edit.setFocus()
         QTest.keyClick(view.target_edit, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
         assert view._payload["target"] == target
@@ -628,9 +648,11 @@ def test_the_reuse_check_counts_fresh_stale_and_unmatched_segments(qapp, memory)
 
 def test_the_reuse_check_writes_nothing_while_it_counts(qapp, memory) -> None:
     source, target, alignments = two_segments()
-    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed")
+    memory.add("First line.", "首句。", "en", next_source="Second line.", origin="human_confirmed",
+               terms_db_revision=REVISION)
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
         install(view, source, target, alignments=alignments)
         before = (len(memory), view._payload["target"], view.document_dirty)
         view._check_memory_reuse()
@@ -641,3 +663,453 @@ def test_the_reuse_check_writes_nothing_while_it_counts(qapp, memory) -> None:
         assert (len(memory), view._payload["target"], view.document_dirty) == before
     finally:
         view.close()
+
+
+def test_homograph_encore_with_different_context_is_reference_only_never_batch_filled(qapp, memory) -> None:
+    # Confirmed in character story context.
+    memory.add("Encore!", "安可！", "en", prev_source="剧情对话：", next_source="她露出了微笑。",
+               origin="human_confirmed", terms_db_revision=REVISION, game_version="3.7.0")
+    # Current manuscript is a performance review with different neighbours.
+    source = "演出评论开场。Encore! 观众鼓掌。"
+    target = "Show intro."
+    alignments = alignments_for(source, target, [
+        ("演出评论开场。", "Show intro."),
+        ("Encore!", ""),
+        ("观众鼓掌。", ""),
+    ])
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._term_basis = {"dictionary": {"revision": REVISION, "game_version": "3.7.0"}}
+        install(view, source, target, alignments=alignments)
+        view._check_memory_reuse()
+        summary = view.tm_panel.summary
+        assert summary is not None
+        assert (summary.fresh, summary.stale, summary.unmatched) == (0, 1, 2)
+        assert summary.fillable == 0
+        assert view._tm_fill_plan == []
+        assert view.tm_panel.fill_button.isVisible() is False
+
+        # Manual adoption in the panel remains available as reference.
+        view.segment_list.setCurrentRow(1)
+        view._refresh_tm_panel()
+        assert len(view.tm_panel.matches) == 1
+        assert view.tm_panel.matches[0].match_kind == tm.TM_MATCH_EXACT
+        card = view.tm_panel.hit_texts()[0]
+        assert strings.TM_MATCH_EXACT in card
+        assert strings.TM_BADGE_REFERENCE_ONLY in card
+        assert "安可！" in card
+        view.tm_panel.apply_at(0)
+        assert "安可！" in view._payload["target"]
+
+        # Moving Encore! to the end of the manuscript (prev matches, next disappeared) also stays reference-only.
+        end_source = "剧情对话：Encore!"
+        end_target = "Story line:"
+        end_alignments = alignments_for(end_source, end_target, [("剧情对话：", "Story line:"), ("Encore!", "")])
+        install(view, end_source, end_target, alignments=end_alignments)
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view._tm_fill_plan == []
+    finally:
+        view.close()
+
+
+def test_provenance_unknown_shows_badge_and_never_enters_trusted_fill(qapp, memory) -> None:
+    source, target, alignments = two_segments()
+    # Stored without terms_db_revision -> provenance_unknown even if context matches.
+    memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": "c" * 40}}
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(1)
+        view._refresh_tm_panel()
+        match = view.tm_panel.matches[0]
+        assert match.freshness == tm.TM_FRESHNESS_UNKNOWN
+        assert match.needs_recheck is True
+        assert tm.TM_STALE_PROVENANCE_UNKNOWN in match.stale_reasons
+        card = view.tm_panel.hit_texts()[0]
+        assert strings.TM_STALE_PROVENANCE_UNKNOWN in card
+        assert strings.TM_MATCH_RECHECK.format(reasons=strings.TM_STALE_PROVENANCE_UNKNOWN) in card
+
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view.tm_panel.summary.fillable == 0
+        assert view._tm_fill_plan == []
+    finally:
+        view.close()
+
+
+def test_reconfirming_with_source_commit_only_preserves_existing_game_version_and_report_overrides_basis(
+    qapp, memory
+) -> None:
+    source, target, alignments = two_segments()
+    memory.add(
+        "First line.", "甲句。", "en", next_source="Second line.",
+        origin="human_confirmed", terms_db_revision=REVISION, game_version="3.7.0",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        # Server report has source_commit but no explicit game_version -> _game_version() must be None.
+        view._report = {
+            "request_id": "r1",
+            "findings": [],
+            "dictionary": {"revision": OTHER_REVISION, "source_commit": "d" * 40},
+        }
+        view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": "c" * 40}}
+        install(view, source, target, alignments=alignments)
+        assert view._game_version() is None
+        # Report takes precedence over stale _term_basis in both view and controller.
+        assert view._terms_db_revision() == OTHER_REVISION
+        assert view._controller._tm_provenance() == (OTHER_REVISION, None)
+
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        view.tm_panel.confirm_button.click()
+        (entry,) = memory.entries()
+        assert entry.terms_db_revision == OTHER_REVISION
+        assert entry.game_version == "3.7.0"
+    finally:
+        view.close()
+
+
+def test_overlong_neighbour_never_grants_context_exact_in_panel_or_reuse_check(qapp, memory) -> None:
+    limit = tm.SOURCE_SCALARS[1]
+    short = "First line."
+    long_tail = "字" * (limit + 1)
+    source = f"{short}\n\n{long_tail}"
+    target = ""
+    alignments = alignments_for(source, target, [(short, ""), (long_tail, "")])
+    memory.add(short, "首句。", "en", origin="human_confirmed", terms_db_revision=REVISION)
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        assert view.tm_panel.matches[0].match_kind == tm.TM_MATCH_EXACT
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fresh == 0
+        assert view.tm_panel.summary.stale == 1
+        assert view._tm_fill_plan == []
+    finally:
+        view.close()
+
+
+def test_fill_from_memory_triggers_layer_one_structure_check_and_restarts_inflight_check(qapp, memory) -> None:
+    async def scenario() -> None:
+        source_commit = "d" * 40
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        requests: list[tuple[str, dict | None]] = []
+        hold_first_l1 = asyncio.Event()
+        l1_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal l1_calls
+            body = json.loads(request.content) if request.content else None
+            requests.append((request.url.path, body))
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_calls += 1
+                if l1_calls == 1:
+                    # Simulate a stale in-flight L1 check before fill; the client cancels it via generation.
+                    pass
+                return httpx.Response(200, json={
+                    "request_id": f"l1-{l1_calls}",
+                    "check_version": "structure-check-v1",
+                    "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
+                    "segments": [
+                        {"index": i, "segment_id": seg["segment_id"], "findings": [], "omitted_findings": 0,
+                         "layout": {"source_paragraphs": 1, "target_paragraphs": 1,
+                                    "source_lines": 1, "target_lines": 1}}
+                        for i, seg in enumerate(body["segments"])
+                    ],
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION, "source_commit": source_commit}}
+            install(view, source, target, alignments=alignments)
+            # Start an in-flight Layer 1 check before filling; _fill_from_memory must restart it.
+            assert view._controller.start_structure_check() is True
+            prior_generation = view._controller.structure_generation
+            view._check_memory_reuse()
+            assert view.tm_panel.summary.fillable == 1
+            view._fill_from_memory()
+            assert view._controller.structure_generation > prior_generation
+            assert view._payload["target"] == "甲句。乙句。"
+            assert view.status_label.text() == strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=1)
+            for _ in range(100):
+                task = view._controller.structure_task
+                if task is None or task.done():
+                    break
+                await asyncio.sleep(0.01)
+            assert [path for path, _ in requests if path == "/v1/structure-checks"]
+            # Latest structure check covered the newly filled target and updated the status bar.
+            last_l1_body = [body for path, body in requests if path == "/v1/structure-checks"][-1]
+            assert "乙句。" in last_l1_body["segments"][0]["target"]
+            assert view._controller.structure.phase == "done"
+            assert view.status_label.text() == strings.MANUSCRIPT_L1_CLEAN.format(checked=1)
+            # Undo remains intact and reverts the batch fill cleanly.
+            assert view._controller.can_undo() is True
+            view._undo_replace()
+            assert view._payload["target"] == target
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_confirming_segment_beside_overlong_neighbour_stores_no_context(qapp, memory) -> None:
+    overlong = "Tail " + "x" * 2001
+    source = f"First line. Middle segment. {overlong}"
+    target = "中段。尾段。"
+    alignments = alignments_for(
+        source,
+        target,
+        [("First line.", ""), ("Middle segment.", "中段。"), (overlong, "尾段。")],
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        view._term_basis = {"dictionary": {"revision": REVISION}}
+        install(view, source, target, alignments=alignments)
+        view.segment_list.setCurrentRow(1)
+        active = view._active_segment_context()
+        assert active is not None
+        assert active.prev_source == "First line."
+        assert active.next_unhashable is True
+        view.tm_panel.confirm_button.click()
+
+        assert len(memory) == 1
+        entry = memory.entries()[0]
+        assert entry.prev_source_hash is None
+        assert entry.next_source_hash is None
+
+        # Moving the segment to a boundary must only yield context-free exact, never auto-fill.
+        new_source = "Other head. Middle segment."
+        new_target = "他句。"
+        new_alignments = alignments_for(new_source, new_target, [("Other head.", "他句。"), ("Middle segment.", "")])
+        install(view, new_source, new_target, alignments=new_alignments)
+        view._check_memory_reuse()
+        assert view.tm_panel.summary.fillable == 0
+        assert view.tm_panel.summary.stale == 1
+        view.segment_list.setCurrentRow(1)
+        assert [m.match_kind for m in view.tm_panel.matches] == [tm.TM_MATCH_EXACT]
+        assert view._tm_fill_plan == []
+    finally:
+        view.close()
+
+
+def test_undoing_fill_during_inflight_layer_one_does_not_report_zero_checked(qapp, memory) -> None:
+    async def scenario() -> None:
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        l1_started = asyncio.Event()
+        release_l1 = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_started.set()
+                await release_l1.wait()
+                return httpx.Response(200, json={
+                    "request_id": "l1-held",
+                    "check_version": "structure-check-v1",
+                    "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
+                    "segments": [
+                        {"index": i, "segment_id": seg["segment_id"], "findings": [], "omitted_findings": 0,
+                         "layout": {"source_paragraphs": 1, "target_paragraphs": 1,
+                                    "source_lines": 1, "target_lines": 1}}
+                        for i, seg in enumerate(body["segments"])
+                    ],
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION}}
+            install(view, source, target, alignments=alignments)
+            view._check_memory_reuse()
+            view._fill_from_memory()
+            await asyncio.wait_for(l1_started.wait(), timeout=2.0)
+
+            # User hits Ctrl+Z while the Layer 1 request for the filled target is still in flight.
+            view._undo_replace()
+            assert view._payload["target"] == target
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+
+            task = view._controller.structure_task
+            release_l1.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=2.0)
+
+            assert view._controller.structure.phase == "idle"
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+            assert strings.MANUSCRIPT_L1_CLEAN.format(checked=0) not in view.status_label.text()
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_editing_during_inflight_layer_one_clears_running_status_when_stale_response_returns(qapp, memory) -> None:
+    async def scenario() -> None:
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        l1_started = asyncio.Event()
+        release_l1 = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_started.set()
+                await release_l1.wait()
+                return httpx.Response(200, json={
+                    "request_id": "l1-held",
+                    "check_version": "structure-check-v1",
+                    "checks": ["empty_target", "numbers", "placeholders", "paragraphs"],
+                    "segments": [
+                        {"index": i, "segment_id": seg["segment_id"], "findings": [], "omitted_findings": 0,
+                         "layout": {"source_paragraphs": 1, "target_paragraphs": 1,
+                                    "source_lines": 1, "target_lines": 1}}
+                        for i, seg in enumerate(body["segments"])
+                    ],
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION}}
+            install(view, source, target, alignments=alignments)
+            view._check_memory_reuse()
+            view._fill_from_memory()
+            assert "正在自动运行" in view.status_label.text()
+            await asyncio.wait_for(l1_started.wait(), timeout=2.0)
+
+            # Edit one character while Layer 1 is still in flight; the status bar still shows the progress text.
+            view.target_edit.textCursor().insertText("！")
+            view._refresh_derived()
+            assert "正在自动运行" in view.status_label.text()
+
+            task = view._controller.structure_task
+            release_l1.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=2.0)
+
+            assert view._controller.structure.phase == "idle"
+            assert "正在自动运行" not in view.status_label.text()
+            assert view.status_label.text() == strings.MANUSCRIPT_L1_NOT_RUN
+            assert strings.MANUSCRIPT_L1_NOT_RUN in view.l1_status.text()
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_undoing_fill_during_inflight_layer_one_503_keeps_undo_status(qapp, memory) -> None:
+    async def scenario() -> None:
+        source = "First line. Second line."
+        target = "甲句。"
+        alignments = alignments_for(source, target, [("First line.", "甲句。"), ("Second line.", "")])
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION)
+
+        l1_started = asyncio.Event()
+        release_l1 = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/capabilities":
+                return httpx.Response(200, json={
+                    "api_version": "v1",
+                    "capabilities": ["structure-check-v1"],
+                    "request_id": "caps",
+                })
+            if request.url.path == "/v1/structure-checks":
+                l1_started.set()
+                await release_l1.wait()
+                return httpx.Response(503, json={
+                    "error": {"code": "service_unavailable", "message": "Service unavailable"},
+                    "request_id": "l1-503",
+                })
+            raise AssertionError(request.url.path)
+
+        client = ApiClient(
+            "https://example.invalid",
+            token_provider=lambda: "test-token",
+            _test_transport=httpx.MockTransport(handler),
+        )
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            view._term_basis = {"dictionary": {"revision": REVISION}}
+            install(view, source, target, alignments=alignments)
+            view._check_memory_reuse()
+            view._fill_from_memory()
+            await asyncio.wait_for(l1_started.wait(), timeout=2.0)
+
+            view._undo_replace()
+            assert view._payload["target"] == target
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+
+            task = view._controller.structure_task
+            release_l1.set()
+            if task is not None:
+                await asyncio.wait_for(task, timeout=2.0)
+
+            assert view._controller.structure.phase == "idle"
+            assert view._controller.structure.error is None
+            assert view.status_label.text() == strings.MANUSCRIPT_UNDONE
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())

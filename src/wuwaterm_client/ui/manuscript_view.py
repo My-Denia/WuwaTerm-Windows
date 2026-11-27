@@ -42,8 +42,9 @@ from ..document_controller import (
 )
 from ..document_edits import (
     NOTICE_ALL, NOTICE_PARTIAL, REASON_FAILED, REASON_FULL, REASON_NOT_APPLICABLE, REASON_RECONFIRM,
-    REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome, copy_payload as _copy_payload,
-    normalize_semantic as _normalize_semantic, remap_for_free_edit, remap_for_target_fill, remap_splice,
+    REASON_REJECTED, REASON_STALE, AlignmentRemap, CommandOutcome, EditOutcome,
+    build_target_fill_transaction, copy_payload as _copy_payload, normalize_semantic as _normalize_semantic,
+    remap_for_free_edit, remap_for_target_fill, remap_splice,
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
@@ -833,6 +834,9 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def report_status(self, text: str) -> None:
         self._view.status_label.setText(text)
 
+    def current_status(self) -> str:
+        return self._view.status_label.text()
+
     def report_unstorable_report(self, code: str) -> None:
         self._view._conflict_mode = True
         self._view._refresh_conflicts()
@@ -864,16 +868,30 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         *,
         remap: AlignmentRemap | None = None,
     ) -> bool:
+        return self.apply_target_edits(changed, [edit], remap=remap)
+
+    def apply_target_edits(
+        self,
+        changed: str,
+        edits: list[tuple],
+        *,
+        remap: AlignmentRemap | None = None,
+    ) -> bool:
         view = self._view
         if not view.target_edit.can_display(changed):
             return False
         value = view._draft_snapshot()
         value["target"] = changed
-        if value["alignments"] is not None:
-            value["alignments"] = [] if remap is None else remap.alignments
-        view._apply_edit(value, edits=[edit], remap=remap)
+        if remap is not None:
+            value["alignments"] = remap.alignments
+        elif value["alignments"] is not None:
+            value["alignments"] = []
+        view._apply_edit(value, edits=edits, remap=remap)
         view._save_recovery_snapshot()
         return True
+
+    def tm_provenance(self) -> tuple[str | None, str | None]:
+        return self._view._terms_db_revision(), self._view._game_version()
 
 
 class ManuscriptView(QWidget):
@@ -929,7 +947,11 @@ class ManuscriptView(QWidget):
         # The runs and the document state they commit to. Its host is
         # _WorkbenchHostAdapter below: it renders state and performs the one
         # edit a run cannot do itself.
-        self._controller = DocumentRunController(api_client, _WorkbenchHostAdapter(self))
+        self._controller = DocumentRunController(
+            api_client,
+            _WorkbenchHostAdapter(self),
+            translation_memory=self._translation_memory,
+        )
         self._saved_payload = _copy_payload(self._payload)
         self._path: Path | None = None
         self._report: dict | None = None
@@ -2050,6 +2072,7 @@ class ManuscriptView(QWidget):
             return
         if self._controller.start_structure_check():
             self.status_label.setText(strings.MANUSCRIPT_L1_RUNNING)
+            self._controller.note_structure_progress(strings.MANUSCRIPT_L1_RUNNING)
 
     def _render_structure(self) -> None:
         """The Layer 1 card from the controller's session state. Results follow
@@ -4897,6 +4920,25 @@ class ManuscriptView(QWidget):
                 return revision
         return None
 
+    def _game_version(self) -> str | None:
+        """The explicit ``dictionary.game_version`` from the open document's review, if any.
+
+        Never substitutes ``source_commit`` for ``game_version``, so confirming a
+        segment without an explicit server ``game_version`` preserves any
+        previously recorded ``game_version`` rather than overwriting it with a
+        commit SHA.
+        """
+        for source in (self._report, self._term_basis):
+            if not isinstance(source, dict):
+                continue
+            dictionary = source.get("dictionary")
+            if not isinstance(dictionary, dict):
+                continue
+            value = dictionary.get("game_version")
+            if isinstance(value, str) and value.strip() and len(value) <= tm.REVISION_SCALARS[1]:
+                return value
+        return None
+
     def _active_segment_pair(self):
         """The segment the memory is read for: the selected row, else the caret's."""
         pairs = self._current_pairs()
@@ -4931,18 +4973,28 @@ class ManuscriptView(QWidget):
         def core(text: str, region) -> str:
             return text[region.core_start:region.core_end]
 
-        def neighbour(position: int) -> str | None:
+        def neighbour(position: int) -> tuple[str | None, bool]:
             if not 0 <= position < len(pairs):
-                return None
-            return self._memory_text(core(source, pairs[position].source))
+                return None, False
+            text = core(source, pairs[position].source)
+            if not text.strip():
+                return None, False
+            if len(text) > tm.SOURCE_SCALARS[1]:
+                return None, True
+            return text, False
 
+        prev_text, prev_unhashable = neighbour(index - 1)
+        next_text, next_unhashable = neighbour(index + 1)
         return ActiveSegment(
             source=core(source, pair.source),
             target=core(target, pair.target),
             direction=self._payload["direction"],
-            prev_source=neighbour(index - 1),
-            next_source=neighbour(index + 1),
+            prev_source=prev_text,
+            next_source=next_text,
+            prev_unhashable=prev_unhashable,
+            next_unhashable=next_unhashable,
             terms_db_revision=self._terms_db_revision(),
+            game_version=self._game_version(),
         )
 
     def _refresh_tm_panel(self) -> None:
@@ -5040,15 +5092,18 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.TM_PANEL_CONFIRM_TOO_LONG.format(
                 length=len(active.source), max=tm.SOURCE_SCALARS[1]))
             return
+        prev_source = None if (active.prev_unhashable or active.next_unhashable) else active.prev_source
+        next_source = None if (active.prev_unhashable or active.next_unhashable) else active.next_source
         try:
             entry = self._translation_memory.add(
                 active.source,
                 active.target,
                 active.direction,
-                prev_source=active.prev_source,
-                next_source=active.next_source,
+                prev_source=prev_source,
+                next_source=next_source,
                 origin=tm.TM_ORIGIN_HUMAN,
                 terms_db_revision=active.terms_db_revision,
+                game_version=active.game_version,
             )
         except (tm.TmError, OSError) as error:
             self.status_label.setText(strings.TM_PANEL_CONFIRM_FAILED.format(reason=tm_refusal_text(error)))
@@ -5070,8 +5125,15 @@ class ManuscriptView(QWidget):
         def readable(text: str) -> bool:
             return self._memory_text(text) is not None
 
-        def neighbour(index: int) -> str | None:
-            return self._memory_text(sources[index]) if 0 <= index < len(sources) else None
+        def neighbour(index: int) -> tuple[str | None, bool]:
+            if not 0 <= index < len(sources):
+                return None, False
+            text = sources[index]
+            if not text.strip():
+                return None, False
+            if len(text) > tm.SOURCE_SCALARS[1]:
+                return None, True
+            return text, False
 
         classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
         run: list[int] = []
@@ -5079,10 +5141,23 @@ class ManuscriptView(QWidget):
         def flush() -> None:
             if not run:
                 return
-            items = [{"source": sources[index], "prev_source": neighbour(index - 1),
-                      "next_source": neighbour(index + 1)} for index in run]
+            items = []
+            for index in run:
+                prev_src, prev_unhashable = neighbour(index - 1)
+                next_src, next_unhashable = neighbour(index + 1)
+                items.append({
+                    "source": sources[index],
+                    "prev_source": prev_src,
+                    "next_source": next_src,
+                    "prev_unhashable": prev_unhashable,
+                    "next_unhashable": next_unhashable,
+                })
             found = self._translation_memory.classify_segments_for_tm(
-                items, self._payload["direction"], current_terms_db_revision=self._terms_db_revision())
+                items,
+                self._payload["direction"],
+                current_terms_db_revision=self._terms_db_revision(),
+                current_game_version=self._game_version(),
+            )
             for index, item in zip(run, found):
                 classes[index] = item
             run.clear()
@@ -5098,9 +5173,9 @@ class ManuscriptView(QWidget):
     def _check_memory_reuse(self) -> None:
         """Count what the memory offers for the current pairing. Reads the memory only.
 
-        A segment counts as fresh when the same text (with the same neighbours,
-        or anywhere) was confirmed under this document's dictionary revision;
-        anything else is a reference, which is never filled silently.
+        仅词库来源已核验且双侧上下文一致的匹配才计为可信复用；
+        其余（上下文不同/未知、版本未知或已过期、数值变体或规范化匹配）仅作参考，
+        从不进入批量填充。
         """
         problem = self._memory_problem()
         if problem is not None:
@@ -5121,14 +5196,18 @@ class ManuscriptView(QWidget):
             self.status_label.setText(strings.TM_PANEL_UNUSABLE.format(reason=tm_refusal_text(error)))
             return
         classified = [item for item in classes if item is not None]
-        fresh = sum(1 for item in classified
-                    if item.status in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH))
-        stale = sum(1 for item in classified if item.status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        # Only context-exact + verified-fresh entries qualify for trusted batch reuse;
+        # context-less exact matches (TM_STATUS_EXACT_FRESH) stay reference-only.
+        fresh = sum(1 for item in classified if item.status == tm.TM_STATUS_CONTEXT_EXACT_FRESH)
+        stale = sum(
+            1 for item in classified
+            if item.status in (tm.TM_STATUS_EXACT_FRESH, tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE)
+        )
         unmatched = len(classified) - fresh - stale
         skipped = len(classes) - len(classified)
         self._tm_fill_plan = []
         for item, pair in zip(classes, pairs):
-            if item is None or item.status not in (tm.TM_STATUS_CONTEXT_EXACT_FRESH, tm.TM_STATUS_EXACT_FRESH):
+            if item is None or item.status != tm.TM_STATUS_CONTEXT_EXACT_FRESH:
                 continue
             # Only a segment with no translation at all: filling one that has
             # text would replace somebody's work without them choosing it.
@@ -5158,42 +5237,33 @@ class ManuscriptView(QWidget):
         plan = sorted(self._tm_fill_plan, key=lambda item: (item[0], item[1], item[3], item[4]))
         raw = self._payload["target"]
         source = self._payload["source"]
-        changed = raw
-        for start, end, text, _source_start, _source_end in reversed(plan):
-            changed = changed[:start] + text + changed[end:]
+        changed, edits, combined_remap = build_target_fill_transaction(
+            source,
+            raw,
+            self._payload["alignments"],
+            plan,
+            separate_paragraphs=False,
+        )
         if not self.target_edit.can_display(changed):
             self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
             return
-        # Each fill is its own transaction against the text it lands in, in
-        # order, as a translation run writes one segment at a time; what the
-        # transactions invalidated is reported together, as one edit step.
-        alignments = self._payload["alignments"]
-        current = raw
-        shift = 0
-        invalidated: list[dict] = []
-        emptied: list[dict] = []
-        for start, end, text, source_start, source_end in plan:
-            position = start + shift
-            filled = current[:position] + text + current[end + shift:]
-            remap = remap_for_target_fill(alignments, source, filled, source_start, source_end, position,
-                                          position, position + len(text), len(text))
-            alignments = remap.alignments
-            invalidated.extend(remap.invalidated)
-            emptied.extend(remap.emptied_targets)
-            current = filled
-            shift += len(text) - (end - start)
         value = self._draft_snapshot()
         value["target"] = changed
-        value["alignments"] = alignments
-        # Every edit is read in the text the ones before it left, so the list
-        # runs from the last segment back to the first: a segment's own offset
-        # is still the one the document gave it, and an insertion never moves
-        # an edit that has already been applied.
-        edits = [("target", start, end, len(text)) for start, end, text, _s, _e in reversed(plan)]
-        self._apply_edit(value, edits=edits, remap=AlignmentRemap(alignments, tuple(invalidated), tuple(emptied)))
+        value["alignments"] = combined_remap.alignments
+        self._apply_edit(value, edits=edits, remap=combined_remap)
         self._tm_fill_plan = []
         self.tm_panel.clear_reuse()
-        self.status_label.setText(strings.TM_PANEL_CHECK_FILLED.format(n=len(plan)))
+        l1_started = self._controller.start_structure_check(restart=True) if self._api_client.is_configured else False
+        if l1_started:
+            progress = strings.TM_PANEL_CHECK_FILLED_CHECKING.format(n=len(plan))
+            self.status_label.setText(progress)
+            self._controller.note_structure_progress(progress)
+        elif not self._api_client.is_configured:
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_OFFLINE.format(n=len(plan)))
+        elif self._controller.structure_known_unavailable():
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED_UNAVAILABLE.format(n=len(plan)))
+        else:
+            self.status_label.setText(strings.TM_PANEL_CHECK_FILLED.format(n=len(plan)))
         self._update_controls()
 
     def _promote_from_term_finding(self) -> None:

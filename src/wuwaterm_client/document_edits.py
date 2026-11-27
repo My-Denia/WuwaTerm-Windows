@@ -540,6 +540,60 @@ def remap_for_target_fill(alignments: list | None, source: str, next_target: str
                         fill=fill, ambiguous=matching if len(matching) > 1 else ())
 
 
+def build_target_fill_transaction(
+    source: str,
+    raw_target: str,
+    alignments: list | None,
+    plan: Sequence[tuple[int, int, str, int, int]],
+    *,
+    whitespace: frozenset[str] = frozenset(),
+    separate_paragraphs: bool = False,
+) -> tuple[str, list[tuple[str, int, int, int]], AlignmentRemap]:
+    """Build one undoable batch target-fill transaction with reverse-order per-segment edits.
+
+    Each item in ``plan`` is ``(start, end, text, source_start, source_end)``.
+    Alignments are remapped forward in document order, while ``edits`` are
+    emitted in reverse order so each offset stays in the coordinates of the
+    preceding text and intermediate reviewed segments are never invalidated.
+    """
+    ordered = sorted(plan, key=lambda item: (item[0], item[1], item[3], item[4]))
+    current = raw_target
+    working_alignments = alignments
+    shift = 0
+    invalidated: list[dict[str, Any]] = []
+    emptied: list[dict[str, Any]] = []
+    applied: list[tuple[int, int, int]] = []
+    for start, end, text, source_start, source_end in ordered:
+        position = start + shift
+        if separate_paragraphs:
+            left = "\n\n" if position > 0 and current[position - 1] not in whitespace else ""
+            right = "\n\n" if position < len(current) and current[position] not in whitespace else ""
+        else:
+            left = right = ""
+        inserted = left + text + right
+        filled = current[:position] + inserted + current[end + shift:]
+        fill_start = position + len(left)
+        remap = remap_for_target_fill(
+            working_alignments,
+            source,
+            filled,
+            source_start,
+            source_end,
+            position,
+            fill_start,
+            fill_start + len(text),
+            len(inserted),
+        )
+        working_alignments = remap.alignments
+        invalidated.extend(remap.invalidated)
+        emptied.extend(remap.emptied_targets)
+        current = filled
+        shift += len(inserted) - (end - start)
+        applied.append((start, end, len(inserted)))
+    edits = [("target", start, end, length) for start, end, length in reversed(applied)]
+    return current, edits, AlignmentRemap(working_alignments, tuple(invalidated), tuple(emptied))
+
+
 def apply_edit_transaction(draft: Mapping[str, Any], tx: Mapping[str, Any]) -> tuple[dict[str, Any], AlignmentRemap]:
     """One edit transaction on a draft (``source``, ``target``, ``direction``,
     ``alignments``): the next draft and what the transaction kept, invalidated

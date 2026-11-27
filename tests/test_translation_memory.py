@@ -241,9 +241,20 @@ def test_context_exact_ranks_above_exact(store):
     assert [m.match_kind for m in store.lookup_segment("挑战成功", "en", prev_source="其他")] == [
         "exact", "exact"
     ]
-    # One provided neighbour matching is enough for rank 1.
+    # Both sides must match when recorded with both neighbours: supplying only one side
+    # (or moving the entry to an end boundary) degrades to exact, never context_exact.
     assert matches[0].match_kind == "context_exact"
-    assert store.lookup_segment("挑战成功", "en", next_source="奖励")[0].match_kind == "context_exact"
+    assert [m.match_kind for m in store.lookup_segment("挑战成功", "en", next_source="奖励")] == [
+        "exact", "exact"
+    ]
+    # An entry genuinely recorded at a start boundary (prev=None) still matches context_exact there.
+    store.add("边界句", "Boundary", "en", prev_source=None, next_source="奖励")
+    assert store.lookup_segment("边界句", "en", next_source="奖励")[0].match_kind == "context_exact"
+    assert store.lookup_segment("边界句", "en", prev_source="新增前段", next_source="奖励")[0].match_kind == "exact"
+    # An existing neighbour that could not be hashed (>2000 chars) also degrades to exact.
+    assert store.lookup_segment(
+        "边界句", "en", prev_source=None, next_source="奖励", prev_unhashable=True,
+    )[0].match_kind == "exact"
 
 
 def test_normalized_exact_matches_only_whitespace_and_line_endings(store):
@@ -260,12 +271,21 @@ def test_normalized_exact_matches_only_whitespace_and_line_endings(store):
 def test_numeric_variants_are_references_never_certified(store):
     entry = store.add("攻击力提高 20%，持续 10 秒", "ATK +20% for 10s", "en",
                       terms_db_revision="r14", game_version="3.0")
-    (match,) = store.lookup_segment("攻击力提高 25%，持续 12 秒", "en")
+    (match,) = store.lookup_segment(
+        "攻击力提高 25%，持续 12 秒", "en",
+        current_terms_db_revision="r14", current_game_version="3.0",
+    )
     assert match.match_kind == "numeric_variant"
     assert match.entry.id == entry.id
     assert match.entry.target_text == "ATK +20% for 10s"
     assert match.numeric_changed is True and match.needs_recheck is True
+    assert match.freshness == tm.TM_FRESHNESS_STALE
     assert match.stale_reasons == ("numeric_changed",)
+    # Without current provenance, numeric variant still resolves freshness to stale while retaining provenance_unknown.
+    (unknown_match,) = store.lookup_segment("攻击力提高 25%，持续 12 秒", "en")
+    assert unknown_match.freshness == tm.TM_FRESHNESS_STALE
+    assert set(unknown_match.stale_reasons) == {"numeric_changed", "provenance_unknown"}
+    assert unknown_match.needs_recheck is True
     # Text that differs outside a number is not a numeric variant.
     assert store.lookup_segment("攻击力提高 25%，持续 12 秒！", "en") == []
     # Full-width digits are not the ASCII numeric tokens this rank compares.
@@ -280,6 +300,7 @@ def test_a_context_candidate_is_not_lost_beyond_the_candidate_row_cap(tmp_path):
             source_text="同一句",
             target_text=f"target {index}",
             prev_source_hash=tm.source_hash(f"ctx-{index}"),
+            terms_db_revision="r14",
             use_count=200 if index < 19 else 100,
         )
         for index in range(20)
@@ -287,35 +308,122 @@ def test_a_context_candidate_is_not_lost_beyond_the_candidate_row_cap(tmp_path):
     store.import_tm_json_bytes(_bytes(_file(entries)))
     # The other nineteen candidates are more used, so a cap ordered by use count
     # would drop the context one from the plain source read.
-    (match,) = store.lookup_segment("同一句", "en", prev_source="ctx-19", limit=1)
+    (match,) = store.lookup_segment(
+        "同一句", "en", prev_source="ctx-19", current_terms_db_revision="r14", limit=1,
+    )
     assert match.match_kind == "context_exact"
+    assert match.freshness == tm.TM_FRESHNESS_VERIFIED
     assert match.entry.use_count == 100
     assert match.entry.prev_source_hash == tm.source_hash("ctx-19")
 
     segments = [f"ctx-{index}" for index in range(20)] + ["同一句"]
-    classified = store.classify_segments_for_tm(segments, "en")
+    classified = store.classify_segments_for_tm(segments, "en", current_terms_db_revision="r14")
     assert classified[-1].source == "同一句"
     assert classified[-1].status == "context_exact_fresh"
     assert classified[-1].match is not None
     assert classified[-1].match.entry.use_count == 100
 
 
-def test_stale_flags_name_the_reason_and_only_when_a_current_value_is_known(store):
+def test_stale_flags_name_the_reason_and_distinguish_three_state_freshness(store):
     store.add("挑战成功", "Challenge complete", "en", terms_db_revision="r14", game_version="3.0")
     (fresh,) = store.lookup_segment("挑战成功", "en", current_terms_db_revision="r14",
                                     current_game_version="3.0")
+    assert fresh.freshness == tm.TM_FRESHNESS_VERIFIED
     assert fresh.stale_reasons == () and fresh.needs_recheck is False
+
     (terms,) = store.lookup_segment("挑战成功", "en", current_terms_db_revision="r15")
-    assert terms.stale_reasons == ("terms_revision_changed",) and terms.needs_recheck is True
+    assert terms.freshness == tm.TM_FRESHNESS_STALE
+    assert terms.stale_reasons == ("terms_revision_changed", tm.TM_STALE_PROVENANCE_UNKNOWN)
+    assert terms.needs_recheck is True
+
     (game,) = store.lookup_segment("挑战成功", "en", current_game_version="3.1")
-    assert game.stale_reasons == ("game_version_changed",) and game.needs_recheck is True
-    # No current value means "not known", not "everything is stale".
+    assert game.freshness == tm.TM_FRESHNESS_STALE
+    assert game.stale_reasons == ("game_version_changed", tm.TM_STALE_PROVENANCE_UNKNOWN)
+    assert game.needs_recheck is True
+
+    # Missing current provenance is provenance_unknown, never verified_fresh.
     (unknown,) = store.lookup_segment("挑战成功", "en")
-    assert unknown.stale_reasons == ()
-    # A stored entry that recorded no revision cannot be fresh against a known one.
+    assert unknown.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert unknown.stale_reasons == (tm.TM_STALE_PROVENANCE_UNKNOWN,)
+    assert unknown.needs_recheck is True
+
+    # One-sided game_version (entry has it, current is None; or entry is None, current has it).
+    (missing_current_game,) = store.lookup_segment("挑战成功", "en", current_terms_db_revision="r14")
+    assert missing_current_game.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert missing_current_game.stale_reasons == (tm.TM_STALE_PROVENANCE_UNKNOWN,)
+    assert missing_current_game.needs_recheck is True
+
+    # Stored entry with no revision cannot be verified fresh even when current revision is known.
     store.add("没有记录", "no record", "en")
     (no_record,) = store.lookup_segment("没有记录", "en", current_terms_db_revision="r14")
-    assert no_record.stale_reasons == ("terms_revision_changed",)
+    assert no_record.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert no_record.stale_reasons == (tm.TM_STALE_PROVENANCE_UNKNOWN,)
+    assert no_record.needs_recheck is True
+
+    store.add("只有词库", "terms only", "en", terms_db_revision="r14")
+    (missing_entry_game,) = store.lookup_segment(
+        "只有词库", "en", current_terms_db_revision="r14", current_game_version="3.0",
+    )
+    assert missing_entry_game.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert missing_entry_game.stale_reasons == (tm.TM_STALE_PROVENANCE_UNKNOWN,)
+    assert missing_entry_game.needs_recheck is True
+
+    # Re-confirming without game_version keeps existing game_version intact.
+    reconfirmed = store.add("挑战成功", "Challenge complete", "en", terms_db_revision="r15", game_version=None)
+    assert reconfirmed.game_version == "3.0"
+
+
+def test_classification_three_state_freshness_and_homograph_context_isolation(store):
+    # Homograph Encore! confirmed in story context must not become context_exact_fresh in review context.
+    store.add("角色剧情台词", "Story line", "en", next_source="Encore!", terms_db_revision="r14", game_version="3.0")
+    store.add("Encore!", "安可！", "en", prev_source="角色剧情台词", next_source="她停了下来。",
+              terms_db_revision="r14", game_version="3.0")
+
+    review_pass = store.classify_segments_for_tm(
+        ["演出评论开场。", "Encore!", "观众热烈鼓掌。"],
+        "en",
+        current_terms_db_revision="r14",
+        current_game_version="3.0",
+    )
+    assert review_pass[1].status == tm.TM_STATUS_EXACT_FRESH
+    assert review_pass[1].match is not None
+    assert review_pass[1].match.match_kind == tm.TM_MATCH_EXACT
+    assert review_pass[1].match.freshness == tm.TM_FRESHNESS_VERIFIED
+
+    # Moving Encore! to manuscript end (prev matches, next disappeared -> None) must degrade to exact_fresh.
+    end_boundary_pass = store.classify_segments_for_tm(
+        ["角色剧情台词", "Encore!"],
+        "en",
+        current_terms_db_revision="r14",
+        current_game_version="3.0",
+    )
+    assert end_boundary_pass[1].status == tm.TM_STATUS_EXACT_FRESH
+    assert end_boundary_pass[1].match is not None
+    assert end_boundary_pass[1].match.match_kind == tm.TM_MATCH_EXACT
+
+    # Unhashable neighbour (>2000 chars) also degrades to exact_fresh, never context_exact_fresh.
+    store.add("边界句", "Boundary", "en", next_source="后段", terms_db_revision="r14", game_version="3.0")
+    unhashable_pass = store.classify_segments_for_tm(
+        [{"source": "边界句", "prev_source": None, "next_source": "后段", "prev_unhashable": True}],
+        "en",
+        current_terms_db_revision="r14",
+        current_game_version="3.0",
+    )
+    assert unhashable_pass[0].status == tm.TM_STATUS_EXACT_FRESH
+    assert unhashable_pass[0].match is not None
+    assert unhashable_pass[0].match.match_kind == tm.TM_MATCH_EXACT
+
+    # Missing current_terms_db_revision -> provenance_unknown -> reference status, never context_exact_fresh.
+    unknown_pass = store.classify_segments_for_tm(
+        ["角色剧情台词", "Encore!", "她停了下来。"],
+        "en",
+        current_terms_db_revision=None,
+        current_game_version="3.0",
+    )
+    assert unknown_pass[1].status == tm.TM_STATUS_STALE_OR_NUMERIC_REFERENCE
+    assert unknown_pass[1].match is not None
+    assert unknown_pass[1].match.freshness == tm.TM_FRESHNESS_UNKNOWN
+    assert unknown_pass[1].match.needs_recheck is True
 
 
 def test_ordering_compares_parsed_instants_not_the_string_form(tmp_path):
