@@ -30,7 +30,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 
 from wuwaterm_client import strings
 from wuwaterm_client import translation_memory as tm
-from wuwaterm_client.api import ApiClient, MetaResult
+from wuwaterm_client.api import ApiClient, DictionaryIdentityResult, MetaResult
 from wuwaterm_client.config import ClientConfig
 from wuwaterm_client.manuscript import empty_workfile
 from wuwaterm_client.semantic_session import SegmentResult
@@ -2064,6 +2064,340 @@ def test_settings_dialog_credential_change_is_origin_scoped_and_immediate(
             if window.status_view._task is not None:
                 await asyncio.wait_for(window.status_view._task, timeout=2.0)
             assert window._meta is not None and window._meta.source_game_version == "3.8.0"
+        finally:
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+# -- the served dictionary's identity (ADR 0023, `dictionary-identity-v1`) -----
+
+
+async def _settle_translation(view) -> None:
+    """Wait out a press of 翻译, probe and run, whichever is in flight."""
+    for _ in range(200):
+        task = view._controller.translate_task
+        if task is None:
+            return
+        await asyncio.wait_for(task, timeout=2.0)
+        await asyncio.sleep(0)
+    raise AssertionError("the translation never settled")
+
+
+def _dictionary_payload(revision: str = REVISION, *, game_version: str | None = "3.7.0",
+                        schema_version: str = "1", source_commit: str = "a" * 40,
+                        term_count: int = 42) -> dict:
+    return {
+        "revision": revision,
+        "schema_version": schema_version,
+        "source_commit": source_commit,
+        "source_game_version": game_version,
+        "term_count": term_count,
+        "request_id": "req-dictionary",
+    }
+
+
+def test_the_served_dictionary_identity_is_live_provenance_without_a_review(qapp, memory) -> None:
+    """No term review in this session, and the revision is still known.
+
+    This is the whole reason the endpoint exists: before it, `terms_db_revision`
+    only appeared after a `POST /v1/reviews`, so a document reopened in a fresh
+    session paid for every segment again. The 翻译 press asks for the identity
+    once and reuses the confirmed segment with zero model calls.
+    """
+    asked: list[str] = []
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                return httpx.Response(200, json=_dictionary_payload())
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION, game_version="3.7.0")
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            assert view._terms_db_revision() is None, "nothing has verified a dictionary yet"
+
+            view._controller.start_translation()
+            await _settle_translation(view)
+
+            assert asked.count("/v1/dictionary") == 1, f"the identity was not fetched once: {asked}"
+            assert "/v1/reviews" not in asked, "a review was spent to learn the revision"
+            assert view._terms_db_revision() == REVISION
+            assert view._game_version() == "3.7.0"
+            assert asked.count("/v1/translations") == 0, "the confirmed segment cost a model call"
+            assert view._payload["target"] == "甲句。\n\n乙句。", view._payload["target"]
+            assert view._controller.last_tm_translation_summary["reused_segments"] == 1
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_confirmation_records_the_served_dictionary_identity(qapp, memory) -> None:
+    """The identity reaches the memory, not only the status line: an entry the
+    person confirms in a session that never ran a review is still recorded
+    against the served revision, so a later session can classify it."""
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        source, target, alignments = two_segments()
+        install(view, source, target, alignments=alignments)
+        view.set_service_dictionary(DictionaryIdentityResult(
+            revision=REVISION, schema_version="1", source_commit="a" * 40,
+            source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+        ))
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        view.tm_panel.confirm_button.click()
+
+        (entry,) = memory.entries()
+        assert entry.source_text == "First line."
+        assert entry.terms_db_revision == REVISION
+        assert entry.game_version == "3.7.0"
+    finally:
+        view.close()
+
+
+def test_a_dictionary_edit_with_the_same_meta_tuple_still_makes_entries_stale(qapp, memory) -> None:
+    """The tuple cannot see this change; the revision can.
+
+    `schema_version`, `source_commit` and `term_count` are identical on both
+    sides - exactly the case ADR 0023 says the tuple cannot distinguish - so the
+    entry must not be reused, and the panel has to say why.
+    """
+    asked: list[str] = []
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload(schema_version="1", source_commit="a" * 40,
+                                                              term_count=42, source_game_version="3.7.0"))
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                # Same tuple, different content: an entry changed and nothing else did.
+                return httpx.Response(200, json=_dictionary_payload(OTHER_REVISION))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION, game_version="3.7.0")
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view.set_service_meta(MetaResult.from_json(_meta_payload(
+                schema_version="1", source_commit="a" * 40, term_count=42, source_game_version="3.7.0",
+            )))
+            view.set_service_dictionary(DictionaryIdentityResult(
+                revision=OTHER_REVISION, schema_version="1", source_commit="a" * 40,
+                source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+            ))
+            view.segment_list.setCurrentRow(1)
+            view._refresh_tm_panel()
+
+            assert view._terms_db_revision() == OTHER_REVISION
+            assert [match.freshness for match in view.tm_panel.matches] == [tm.TM_FRESHNESS_STALE], (
+                "an entry confirmed under another dictionary was treated as fresh"
+            )
+
+            view._controller.start_translation()
+            await _settle_translation(view)
+
+            assert asked.count("/v1/translations") == 1, "a stale entry was skipped"
+            assert "乙句。" not in view._payload["target"]
+            assert view._controller.last_tm_translation_summary is None
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_server_without_the_capability_keeps_the_meta_and_review_path(qapp, memory) -> None:
+    """An older Core: the endpoint is never requested, and the revision still
+    arrives through the review this session runs - the path MY-491 #64 built."""
+    asked: list[str] = []
+
+    async def scenario() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": [], "request_id": "caps"})
+            if path == "/v1/dictionary":
+                raise AssertionError("a server without the capability was asked for a dictionary")
+            if path == "/v1/reviews":
+                body = json.loads(request.content)
+                return httpx.Response(200, json=_review_response(body["source"], body["target"]))
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+            view._start_review()
+            assert view._task is not None
+            await asyncio.wait_for(view._task, timeout=2.0)
+
+            assert view._terms_db_revision() == REVISION
+            assert asked.count("/v1/dictionary") == 0
+        finally:
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_live_identity_is_cleared_by_every_reset(qapp, memory) -> None:
+    """A revision names the dictionary one service was serving. After a failure,
+    another address or a new credential it is not knowledge any more - and an
+    unknown revision reuses nothing, which is the safe direction."""
+    identity = DictionaryIdentityResult(
+        revision=REVISION, schema_version="1", source_commit="a" * 40,
+        source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+    )
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        for reset in (
+            lambda: view.set_service_dictionary(None),
+            lambda: view.set_service_meta(None),
+            view.reset_for_credential_change,
+            view.reset_for_endpoint_change,
+        ):
+            view.set_service_dictionary(identity)
+            assert view._terms_db_revision() == REVISION
+            reset()
+            assert view._service_dictionary is None, reset
+            assert view._terms_db_revision() is None, reset
+    finally:
+        view.close()
+
+
+def test_a_review_dictionary_against_another_dictionary_is_dropped(qapp, memory) -> None:
+    """Both endpoints state a revision; when they disagree the served identity
+    is the authority and the review's basis is stale, so it is not adopted and
+    a refresh is requested."""
+    identity = DictionaryIdentityResult(
+        revision=REVISION, schema_version="1", source_commit="a" * 40,
+        source_game_version="3.7.0", term_count=42, request_id="req-dictionary",
+    )
+    review_dictionary = {"schema_version": "1", "source_commit": "a" * 40, "term_count": 42,
+                         "revision": OTHER_REVISION}
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    requested: list[int] = []
+    view.serviceMetaRefreshRequested.connect(lambda: requested.append(1))
+    try:
+        view.set_service_dictionary(identity)
+        view._record_live_review_dictionary(review_dictionary)
+
+        assert view._live_review_dictionary is None, "a stale review basis was adopted"
+        assert requested, "nothing asked for a refresh"
+        assert view._terms_db_revision() == REVISION
+
+        # The other order: a review was recorded first and the identity arrives after.
+        view.set_service_dictionary(None)
+        view._record_live_review_dictionary({"schema_version": "1", "source_commit": "a" * 40,
+                                             "term_count": 42, "revision": OTHER_REVISION})
+        assert view._live_review_dictionary is not None
+        view.set_service_dictionary(identity)
+        assert view._live_review_dictionary is None
+        assert view._terms_db_revision() == REVISION
+    finally:
+        view.close()
+
+
+def test_the_window_fetches_the_identity_with_the_meta_and_clears_it_on_failure(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """The window's meta refresh is where this session learns the service is
+    reachable, so it is where the dictionary is identified too. When that
+    request fails the identity is dropped rather than kept from the last good
+    answer."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        state = {"dictionary_fails": False}
+        asked: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["dictionary_fails"]:
+                    return httpx.Response(503, json={"error": {"code": "llm_unavailable"}, "request_id": "req-d"})
+                return httpx.Response(200, json=_dictionary_payload())
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            assert asked.count("/v1/dictionary") == 1
+            assert view._service_dictionary is not None
+            assert view._terms_db_revision() == REVISION
+            assert view._game_version() == "3.7.0"
+
+            state["dictionary_fails"] = True
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            assert asked.count("/v1/dictionary") == 2
+            assert view._service_dictionary is None, "a failed refresh kept the previous identity"
+            assert view._terms_db_revision() is None
         finally:
             await client.aclose()
             window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)

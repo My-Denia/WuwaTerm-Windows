@@ -1,10 +1,10 @@
 {
   "core": {
     "repository": "My-Denia/WuwaTerm",
-    "commit": "2737530187f1e1c3a6b8758de357c8d32d21dfc7",
+    "commit": "b7abb953b8e997328344064e85c9db28f55f40aa",
     "files": {
       "src/wuwaterm_api/__init__.py": "cf02ace4b8e3038b3e297bf6c7057541f6e67c60ad595fdcf2487240ed0c10c0",
-      "docs/api/openapi.json": "3eff73357f276285e7f98b4d57d5f6732f1674ddc6683a4948b97b75d981f9cb",
+      "docs/api/openapi.json": "e4e3c6b04322e0b1b4e718cd88b5b4e7538c35acc38c4d2b01b4b0658f707672",
       "contracts/segmentation-v1.json": "23886d22236e69ac44c2d824ac95d0c0d24a137596015fa3715b9567a425ab8a",
       "contracts/semantic-review-v1/byte-limit-request.json": "48c0c1b87c0bbac52a0a533b711b633beca40e06e6a8d89c85116565994a6f15",
       "contracts/semantic-review-v1/byte-limit-response.json": "5578dc7d85162e8c44d61f9a9003b89de047cceb3a929ac9f9e83f0a56db5a0b",

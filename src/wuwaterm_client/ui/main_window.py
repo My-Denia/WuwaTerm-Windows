@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from .. import __version__, recent, strings
 from ..recovery import default_recovery_path
 from ..translation_memory import TmError, TranslationMemory, default_tm_path
-from ..api import ApiClient
+from ..api import CAPABILITY_DICTIONARY_IDENTITY, ApiClient, DictionaryIdentityResult
 from ..config import (
     ClientConfig,
     RecentEntry,
@@ -279,6 +279,11 @@ class MainWindow(QMainWindow):
         self._closed = False
         self._auto_meta_requested = False
         self._credential_changed_for_active_origin = False
+        # The live dictionary identity (``GET /v1/dictionary``) and the refresh
+        # that fetches it. Generation-guarded like every other answer in this
+        # window: a reply for the previous address must never describe this one.
+        self._dictionary_task: asyncio.Task | None = None
+        self._dictionary_generation = 0
         self._shortcut_sheet: ShortcutSheet | None = None
 
         central = QWidget(self)
@@ -616,6 +621,72 @@ class MainWindow(QMainWindow):
         self._meta = meta
         self.manuscript_view.set_service_meta(meta)
         self._refresh_status_bar()
+        self._schedule_dictionary_identity_refresh()
+
+    # -- the live dictionary's own identity ---------------------------------
+
+    def _schedule_dictionary_identity_refresh(self) -> None:
+        """Fetch the served dictionary's identity alongside the meta refresh.
+
+        ``GET /v1/dictionary`` (``dictionary-identity-v1``, ADR 0023) is what
+        lets the workbench know the running revision without a term review
+        first, and the revision - not the ``(schema_version, source_commit,
+        term_count)`` tuple - is what changes when an entry does.
+
+        Scheduled from the meta refresh because that is when this window has
+        just learned the service is reachable, and it costs nothing on a server
+        that does not list the capability (one probe). Never awaited: the
+        meta reply is already on screen, and the identity arrives when it
+        arrives.
+        """
+        if self._closed or not self.api_client.is_configured:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Nothing can be scheduled without a running loop; the next meta
+            # refresh (the one that starts one) schedules it instead.
+            return
+        if self._dictionary_task is not None and not self._dictionary_task.done():
+            return
+        self._dictionary_generation += 1
+        self._dictionary_task = asyncio.ensure_future(
+            self._refresh_dictionary_identity(self._dictionary_generation)
+        )
+
+    def _cancel_dictionary_identity_refresh(self) -> None:
+        """Drop the pending identity request and any reply it would deliver."""
+        self._dictionary_generation += 1
+        task, self._dictionary_task = self._dictionary_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _refresh_dictionary_identity(self, generation: int) -> None:
+        """One identity probe, delivered only if it still describes this window.
+
+        Every failure - no capability, an older server (404), a rejected
+        credential, a malformed body - arrives here as ``None``, and ``None``
+        clears the identity. That is deliberate: the workbench then reports an
+        unknown revision and reuses nothing, which is the working state it had
+        before this endpoint existed, while a stale identity would let a
+        memory entry confirmed under another dictionary count as fresh.
+        """
+        client = self.api_client
+        origin = client.current_origin
+        identity: "DictionaryIdentityResult | None" = None
+        try:
+            capabilities = await client.get_capabilities()
+            if CAPABILITY_DICTIONARY_IDENTITY in capabilities:
+                identity = await client.get_dictionary()
+        except Exception:  # noqa: BLE001 - the probe is optional: any failure means "no identity"
+            identity = None
+        if generation != self._dictionary_generation or self._closed:
+            return
+        if client.current_origin != origin:
+            # The address changed while the request was in flight; the reply
+            # describes the previous service.
+            return
+        self.manuscript_view.set_service_dictionary(identity)
 
     def _on_service_meta_refresh_requested(self) -> None:
         # Non-destructive: retain known _meta / _service_meta until a fresh
@@ -626,6 +697,7 @@ class MainWindow(QMainWindow):
     def _on_credential_changed(self, *, has_credential: bool) -> None:
         self._auto_meta_requested = False
         self._meta = None
+        self._cancel_dictionary_identity_refresh()
         self.status_view.clear_stale_meta()
         self.manuscript_view.reset_for_credential_change()
         self._refresh_status_bar()
@@ -925,6 +997,9 @@ class MainWindow(QMainWindow):
         are fire-and-forget, exactly as the Cancel button's are.
         """
         self._auto_meta_requested = False
+        # The identity names the OLD service's dictionary; even a reply already
+        # in flight belongs to that one.
+        self._cancel_dictionary_identity_refresh()
         for view in (self.translate_view, self.terms_view, self.status_view, self.manuscript_view):
             view.reset_for_endpoint_change()
         self._meta = None
@@ -937,6 +1012,7 @@ class MainWindow(QMainWindow):
         self._closed = True
         self._remember_position()
         self.status_view.cancel_refresh()
+        self._cancel_dictionary_identity_refresh()
         self.manuscript_view.cancel_background_work(clear_recovery_draft=True)
         super().closeEvent(event)
 
