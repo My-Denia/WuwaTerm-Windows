@@ -622,8 +622,8 @@ MANUSCRIPT_SEGMENT_HINT = {
     "unpaired_target": "译文多出一段，在原文里没有对应，可能是增译。这是确定性提示，没有调用模型。",
     "hard_cut": "此处为强制切分，边界附近可能误判。",
     "failed": "这一段的请求没有完成，继续审校时会重试。",
-    "saved": "这一段的术语结果是保存时的结果。开始审校时会先与服务核对一次，内容和依据都没变就直接沿用，不再重复审校。",
-    "stale": "这一段的术语结果已过期（审校依据、段落对应或选择有变），下次审校会重新核对。",
+    "saved": "这一段的术语结果来自上次保存。点击「审校」时会先与当前词库核对，内容和词库版本都没变就直接沿用，不再重复审校。",
+    "stale": "这一段的术语结果已过期（词库版本、段落对应或术语选择有变），下次审校会重新核对。",
     "finished_recheck": "这一段已标记完成，结果待重新核对。",
     "not_reviewed": "模型这次的输出无法使用，这一段没有审校；继续审校时会重试。",
     "truncated": "这一段疑点较多，另有 {count} 条没有显示。",
@@ -689,9 +689,9 @@ RECENT_FILE_MISSING = "文件已不存在，无法打开：{name}"
 
 
 # -- Long manuscripts: resumable segment term review (manuscript v3 to v5) --
-MANUSCRIPT_SAVED_REPORT = "已保存的逐段术语结果：{count} 条发现。尚未与当前服务核对，开始审校时会先核对一次。"
+MANUSCRIPT_SAVED_REPORT = "已载入上次保存的术语结果：{count} 条发现。点击「审校」时会先与当前词库核对。"
 MANUSCRIPT_REPORT_RECHECK = "其中 {count} 条所在的段落待重新核对。"
-MANUSCRIPT_SEGMENTS_SAVED = "{count} 段有已保存的术语结果；开始审校时先核对一次，未变的段落不再重复审校。"
+MANUSCRIPT_SEGMENTS_SAVED = "{count} 段保留了上次保存的术语结果；点击「审校」时未改动且词库一致的段落直接沿用。"
 MANUSCRIPT_SEGMENTS_RECHECK = "{count} 段的术语结果需要重新核对。"
 MANUSCRIPT_SEGMENTS_FINISHED = "已标记完成 {count} 段。"
 MANUSCRIPT_FINDING_CHOSEN = "已记录选择"
@@ -701,7 +701,7 @@ MANUSCRIPT_TERM_CHOICE_LABEL = "这一处的术语选择"
 MANUSCRIPT_TERM_CHOICE_RECORD = "记录选择"
 MANUSCRIPT_TERM_CHOICE_RECONFIRM = "重新确认"
 MANUSCRIPT_TERM_CHOICE_REMOVE = "移除选择"
-MANUSCRIPT_TERM_CHOICE_WAIT = "这是已保存的结果。开始审校、与服务核对之后，才能在这里记录选择。"
+MANUSCRIPT_TERM_CHOICE_WAIT = "这是上次保存的结果。点击「审校」并与当前词库核对后，即可在此记录术语选择。"
 MANUSCRIPT_TERM_CHOICE_NONE = "还没有记录选择。记录后，这一段下次审校时会把选择一并交给服务核对。"
 MANUSCRIPT_TERM_CHOICE_CHOSEN = "已记录：{choice}。"
 MANUSCRIPT_TERM_CHOICE_UNCONFIRMED = "待重新确认：{choice}。审校结果已变化，这条选择暂不生效；请重新确认或移除。"
@@ -770,26 +770,26 @@ MANUSCRIPT_NOT_EVALUATED_UNKNOWN = "未评估原因：{reason}"
 # -- Layered review (manuscript v5, structure-check-v1) --------------------
 # Layer 1 is deterministic and never saved; layer 2 is the experimental model
 # review; layer 3 is a reserved place that sends and stores nothing.
-MANUSCRIPT_LAYERS_TITLE = "分层审校"
-MANUSCRIPT_L1_TITLE = "第一层 · 确定性结构核查（不调用模型、不写入稿件）"
+MANUSCRIPT_LAYERS_TITLE = "快速核查"
+MANUSCRIPT_L1_TITLE = "格式与结构核查（按需请求服务、不改稿件）"
 MANUSCRIPT_L1_NOTE = "逐段检查空译文、数字、占位符与标签、段落和换行；某段改动后，这一段的结果随即失效。"
 MANUSCRIPT_L1_NOTE_DETAIL = (
-    "逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
+    "确定性结构核查（按需向服务分批核查当前稿件中符合条件的各段，不调用模型）：逐段检查空译文、数字、占位符与标签、段落和换行。同样的文本每次得到同样的结果。"
     "结果只在本次打开时显示，不写入稿件文件、导出或撤销历史；某段文本改动后，这一段的结果随即失效。"
 )
-MANUSCRIPT_L1_RUN = "运行结构核查（{count} 段）"
+MANUSCRIPT_L1_RUN = "运行格式核查（{count} 段）"
 MANUSCRIPT_L1_RERUN = "重新核查（{count} 段）"
 MANUSCRIPT_L1_RUNNING = "正在核查…"
 MANUSCRIPT_L1_COST = "每批最多 64 段，每批计 1 次审校额度；这次共 {count} 批。"
 MANUSCRIPT_L1_NOT_RUN = "尚未核查。"
-MANUSCRIPT_L1_CLEAN = "已核查 {checked} 段，没有发现结构问题。"
-MANUSCRIPT_L1_SUMMARY = "已核查 {checked} 段：{segments} 段有结构问题，共 {count} 条。"
+MANUSCRIPT_L1_CLEAN = "已核查 {checked} 段，没有发现格式与数字问题。"
+MANUSCRIPT_L1_SUMMARY = "已核查 {checked} 段：{segments} 段有问题，共 {count} 条。"
 MANUSCRIPT_L1_OMITTED = "另有 {count} 条超过每段 16 条的上限，没有列出。"
 MANUSCRIPT_L1_UNCHECKED = "{count} 段尚未核查，或核查后改动过。"
 MANUSCRIPT_L1_SKIPPED = "{count} 段超过单段 2,000 字，无法核查。"
-MANUSCRIPT_L1_FAILED = "结构核查没有完成：{reason}"
+MANUSCRIPT_L1_FAILED = "格式与数字核查没有完成：{reason}"
 MANUSCRIPT_L1_NONE = "没有可核查的段落。"
-MANUSCRIPT_L1_UNAVAILABLE = "此服务暂不支持结构核查。术语审校仍可使用。"
+MANUSCRIPT_L1_UNAVAILABLE = "此服务暂不支持格式与数字核查。术语审校仍可使用。"
 MANUSCRIPT_L1_LAYOUT = "第 {number} 段 · 段落 {sp} → {tp} · 非空行 {sl} → {tl}"
 MANUSCRIPT_L1_ITEM = "第 {number} 段 · {rule}\n{side}：{text}"
 MANUSCRIPT_L1_ITEM_SEGMENT = "第 {number} 段 · {rule}"
@@ -805,19 +805,19 @@ MANUSCRIPT_L1_RULES = {
     "number_missing": "译文缺少数字",
     "number_unexpected": "译文多出数字",
 }
-MANUSCRIPT_L1_LIST = "第一层结构问题"
-MANUSCRIPT_L2_TITLE = "第二层 · 高风险语义（模型，实验性）"
-MANUSCRIPT_L2_NOTE = "默认列出高、中置信度的发现；低置信度的发现折叠在列表末尾。"
-MANUSCRIPT_L2_COVERED = "{count} 条与第一层的结构问题重复，按第一层显示，这里不再重复提醒。"
-MANUSCRIPT_L2_LOW_SHOW = "展开低置信度发现（{count} 条）"
-MANUSCRIPT_L2_LOW_HIDE = "收起低置信度发现（{count} 条）"
+MANUSCRIPT_L1_LIST = "格式与数字问题"
+MANUSCRIPT_L2_TITLE = "语义疑点（模型辅助 · 实验性）"
+MANUSCRIPT_L2_NOTE = "默认列出高、中把握的疑点；低把握的疑点折叠在列表末尾。"
+MANUSCRIPT_L2_COVERED = "{count} 条已在格式与数字核查中列出，这里不再重复提醒。"
+MANUSCRIPT_L2_LOW_SHOW = "展开低把握疑点（{count} 条）"
+MANUSCRIPT_L2_LOW_HIDE = "收起低把握疑点（{count} 条）"
 MANUSCRIPT_L2_HANDLED_SHOW = "显示已处理疑点（{count} 条）"
 MANUSCRIPT_L2_HANDLED_HIDE = "隐藏已处理疑点（{count} 条）"
-MANUSCRIPT_L2_OVERVIEW = "第二层 · 高置信 {high} · 中置信 {medium} · 低置信 {low}（已折叠）"
-MANUSCRIPT_L3_TITLE = "第三层 · 风格建议（预留）"
+MANUSCRIPT_L2_OVERVIEW = "语义疑点 · 高把握 {high} · 中把握 {medium} · 低把握 {low}（已折叠）"
+MANUSCRIPT_L3_TITLE = "风格建议（预留）"
 MANUSCRIPT_L3_TOGGLE = "显示风格建议"
-MANUSCRIPT_L3_OFF = "默认关闭。"
-MANUSCRIPT_L3_ON = "这一层还没有内容：目前不提供风格建议，也不会发出任何额外的模型请求。"
+MANUSCRIPT_L3_OFF = "暂未启用。"
+MANUSCRIPT_L3_ON = "当前版本暂不提供风格建议，开启也不会发出额外模型请求。"
 
 # -- Ambiguous single characters (review-v2 ambiguous-mention-v1) ---------
 MANUSCRIPT_AMBIGUOUS_SHOW = "歧义单字 · {count}（展开）"
@@ -861,8 +861,8 @@ MANUSCRIPT_TERM_GROUP_STATUS = {
 }
 # A saved result was computed under a basis this session has not checked against
 # the live server yet, so no label may read as verified (已核) before that check.
-MANUSCRIPT_TERM_SAVED_NOTE = "已保存，尚未核对当前依据"
-MANUSCRIPT_TERM_GROUP_STATUS_SAVED = "待核对依据"
+MANUSCRIPT_TERM_SAVED_NOTE = "上次保存结果，待与当前词库核对"
+MANUSCRIPT_TERM_GROUP_STATUS_SAVED = "待核对"
 MANUSCRIPT_TERM_GROUP_HEADER = "▸ {surface}（{count} 处） · {status}\n   {distribution}"
 MANUSCRIPT_TERM_GROUP_UNVERIFIED = "另有 {count} 段待复核：{segments}"
 MANUSCRIPT_TERM_OCCURRENCE_ROW = "  #{segment} · {summary}\n  原文：{source_context}\n  译文：{target_context}"
@@ -1159,16 +1159,16 @@ TM_PANEL_CHECK_NO_SOURCE = "所有段落都没有原文（只有译文），无�
 TM_PANEL_CHECK_SKIPPED = "有 {n} 段原文为空或超过 {max} 字，未查询；其余段落照常检查。"
 TM_PANEL_CHECK_FILL = "按可信复用填入 {n} 段空译文（可撤销）"
 TM_PANEL_CHECK_FILLED = "已按可信复用填入 {n} 段空译文；Ctrl+Z 可以撤销。"
-TM_PANEL_CHECK_FILLED_CHECKING = "已按可信复用填入 {n} 段空译文；正在自动运行第一层结构核查。可以撤销。"
-TM_PANEL_CHECK_FILLED_OFFLINE = "已按可信复用填入 {n} 段空译文；当前未连接服务，请连线后运行第一层结构核查。可以撤销。"
-TM_PANEL_CHECK_FILLED_UNAVAILABLE = "已按可信复用填入 {n} 段空译文；当前服务不支持第一层结构核查。可以撤销。"
+TM_PANEL_CHECK_FILLED_CHECKING = "已按可信复用填入 {n} 段空译文；正在自动运行格式与数字核查。可以撤销。"
+TM_PANEL_CHECK_FILLED_OFFLINE = "已按可信复用填入 {n} 段空译文；当前未连接服务，请连线后运行格式与数字核查。可以撤销。"
+TM_PANEL_CHECK_FILLED_UNAVAILABLE = "已按可信复用填入 {n} 段空译文；当前服务不支持格式与数字核查。可以撤销。"
 TM_PANEL_CHECK_NOTHING = "没有可以填入的段落：只填译文为空的段落，且只填上下文一致且版本已核验的可信匹配。"
 MANUSCRIPT_TRANSLATE_TM_PREFILL = "已从记忆可信复用 {reused} 段（跳过模型调用），剩余 {remaining} 段待翻译（预计 {planned} 次模型请求，基线 {baseline} 次；词库 {revision}）。"
 MANUSCRIPT_TRANSLATE_TM_SUMMARY = "增量翻译完成：记忆复用 {reused}/{total} 段，模型翻译 {translated} 段（模型请求 {baseline}→{actual} 次，节省 {pct}% 请求；词库 {revision}）。{l1_note}{tail_note}"
 MANUSCRIPT_TRANSLATE_TM_SUMMARY_NO_SAVING = "增量翻译完成：已从记忆复用 {reused}/{total} 段，其余 {translated} 段分 {actual} 次发送（未减少模型请求数，基线 {baseline} 次；词库 {revision}）。{l1_note}{tail_note}"
 MANUSCRIPT_TRANSLATE_TM_ALL_REUSED = "已从记忆可信复用全部 {reused} 段（{baseline}→0 次模型请求，节省 100% 请求；词库 {revision}）。{l1_note}{tail_note}"
-MANUSCRIPT_TRANSLATE_TM_L1_RUNNING = "正在运行第一层结构核查。"
-MANUSCRIPT_TRANSLATE_TM_L1_OFFLINE = "当前未连接服务，请连线后运行第一层结构核查。"
-MANUSCRIPT_TRANSLATE_TM_L1_UNAVAILABLE = "当前服务不支持第一层结构核查。"
+MANUSCRIPT_TRANSLATE_TM_L1_RUNNING = "正在运行格式与数字核查。"
+MANUSCRIPT_TRANSLATE_TM_L1_OFFLINE = "当前未连接服务，请连线后运行格式与数字核查。"
+MANUSCRIPT_TRANSLATE_TM_L1_UNAVAILABLE = "当前服务不支持格式与数字核查。"
 MANUSCRIPT_TRANSLATE_TM_MISMATCH_NOTE = " 另有 {count} 段因两侧段落或句数不一致需手动切分。"
 MANUSCRIPT_TRANSLATE_TM_PENDING_NOTE = " 另有 {count} 段待处理。"

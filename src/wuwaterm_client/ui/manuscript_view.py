@@ -15,22 +15,19 @@ from __future__ import annotations
 
 import bisect
 import copy
-import os
 import re
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QEvent, QMimeData, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QIcon, QKeySequence, QPalette, QShortcut, QTextCursor
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListView,
-    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionButton, QStylePainter,
-    QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from .. import markdown_report as mdr
 from .. import segment_records as sr
 from .. import semantic, strings
 from .. import structure as l1
@@ -51,17 +48,59 @@ from ..document_edits import (
 )
 from ..manuscript import (
     MAX_SEGMENT_CHOICE_HISTORY, WorkfileError, choice_conflict_groups, empty_workfile, is_ambiguous_mention,
-    load_workfile, parse_workfile, sanitize_duplicate_choices, save_workfile, serialize_workfile,
+    load_workfile, sanitize_duplicate_choices, save_workfile,
 )
 from ..recovery import RecoveryState, clear_recovery, load_recovery, save_recovery
 from ..search_replace import SearchReplaceController
 from ..segmentation import (
     SEGMENT_LIMIT, STATUS_NEEDS_MANUAL_SPLIT, STATUS_READY, STATUS_UNTRANSLATED, WHITESPACE,
 )
+from ..services.provenance_service import (
+    dictionary_matches_meta as _dictionary_matches_meta,
+    identity_matches_meta as _identity_matches_meta,
+    normalized_game_version as _normalized_game_version,
+)
+from ..services.review_coordinator import (
+    build_document_term_groups as _build_doc_term_groups,
+    offset_span as _offset,
+    project_layer2_rows as _project_layer2_rows,
+)
+from ..services.workspace_io import (
+    MAX_IMPORT_BYTES,
+    TEXT_SUFFIXES as _TEXT_SUFFIXES,
+    WorkspaceState,
+    atomic_write_bytes,
+    build_prose_export,
+    build_report_input,
+    has_recovery_content,
+    is_report_file,
+    prepare_recovery_snapshot,
+    read_import_text,
+    render_report_markdown,
+    save_manuscript_file,
+)
 from ..termbase import TermbaseStore
 from . import review_states
 from .components import Banner, ChevronComboBox
+from .editor_widget import (
+    LosslessEditor,
+    _astral_indexes,
+    _display_map,
+    _scalar_boundary,
+    _splice_raw,
+    _utf16_position,
+)
+from .find_bar import FindReplaceBar
 from .icons import icon
+from .review_models import ModelListView, ReviewRow
+from .review_tracks import (
+    LayersCardWidget,
+    SemanticTrackWidget,
+    SegmentsTrackWidget,
+    TermsTrackWidget,
+    _ElidedDocumentLabel,
+    _ElidingButton,
+)
 from .scroll_sync import ScrollSync
 from .termbase_dialog import MyTermsPanel, TermbaseDialog
 from .tm_dialog import TranslationMemoryDialog, refusal_text as tm_refusal_text
@@ -73,719 +112,15 @@ from .tm_panel import ActiveSegment, ReuseSummary, TranslationMemoryPanel, stale
 # them (C2 receipt, round 1). Re-read the receipt when the Core pin moves.
 PRECEDENTS_DEFAULT_ON = True
 TRACK_TERMS, TRACK_SEMANTIC, TRACK_SEGMENTS = 0, 1, 2
-# A dropped text file is read whole into the editor, so it gets the same
-# ceiling as a workfile.
-MAX_IMPORT_BYTES = 1_048_576
-_TEXT_SUFFIXES = (".txt", ".md")
 # The term-view status filters, in the order the combo lists them.
 _TERM_FILTER_KEYS = ("unhandled", "all", "inconsistent", "pending", "not_evaluated", "confirmed")
 _DEFAULT_TERM_FILTER = "unhandled"
 # What a finding of a long manuscript still needs, by its record's state.
 _RECHECK_STATES = ("stale", "pending", "failed", "not_reviewed", "needs_manual_split", "untranslated",
                    "unpaired_target")
-# Pairing verdicts a translation in flight has not settled yet. While the target
-# is still being written its paragraphs are incomplete by construction, so the
-# counts cannot match and every pair reads as unalignable. That is not a finding
-# about the manuscript: reporting it mid-run made the inspector flash
-# "需要手动切分" for the length of every run and take it back at the end.
+# Pairing verdicts a translation in flight has not settled yet.
 _TRANSLATION_PENDING_STATES = (STATUS_NEEDS_MANUAL_SPLIT,)
-
-
-def _offset(span: dict | None, by: int) -> dict | None:
-    return None if span is None else {"start": span["start"] + by, "end": span["end"] + by, "text": span["text"]}
-
-
-def _display_map(raw: str) -> tuple[str, list[int]]:
-    """Qt plain text and the corresponding raw offset at each boundary."""
-    out: list[str] = []
-    bounds = [0]
-    i = 0
-    while i < len(raw):
-        c = raw[i]
-        if c == "\r":
-            i += 2 if i + 1 < len(raw) and raw[i + 1] == "\n" else 1
-            out.append("\n")
-        else:
-            i += 1
-            out.append(" " if c == "\xa0" else "\n" if c in "\u2028\u2029" else c)
-        bounds.append(i)
-    return "".join(out), bounds
-
-
-def _utf16_position(text: str, index: int) -> int:
-    return len(text[:index].encode("utf-16-le")) // 2
-
-
-def _scalar_boundary(text: str, position: int) -> int | None:
-    if position < 0:
-        return None
-    units = 0
-    for index, char in enumerate(text):
-        if units == position:
-            return index
-        units += 2 if ord(char) > 0xFFFF else 1
-        if units > position:
-            return None
-    return len(text) if units == position else None
-
-
-_ASTRAL = re.compile("[\U00010000-\U0010FFFF]")
-# Whitespace, which the status bar's character counts leave out.
 _WHITESPACE_RUN = re.compile(r"\s+")
-
-
-def _astral_indexes(text: str) -> list[int]:
-    """Scalar indexes of the characters UTF-16 stores as two units (a regex
-    scan, so a long manuscript costs C time, not a Python loop)."""
-    return [match.start() for match in _ASTRAL.finditer(text)]
-
-
-def _splice_raw(prefix: str, inserted: str, suffix: str) -> str:
-    """Join ``prefix + inserted + suffix`` without letting an adjacent bare CR
-    and LF collapse into a single CRLF display line break."""
-    if inserted:
-        if prefix.endswith("\r") and inserted.startswith("\n"):
-            inserted = "\n" + inserted
-        if inserted.endswith("\r") and suffix.startswith("\n"):
-            inserted = inserted + "\n"
-    elif prefix.endswith("\r") and suffix.startswith("\n"):
-        inserted = "\n"
-    return prefix + inserted + suffix
-
-
-class LosslessEditor(QPlainTextEdit):
-    """Use document edits to preserve characters Qt cannot display distinctly."""
-
-    rawChanged = Signal()
-    editRejected = Signal()
-    undoRequested = Signal()
-    redoRequested = Signal()
-    compositionChanged = Signal()
-    # Local files dropped (or pasted) on the editor: (paths, side). The view
-    # decides what they mean; the editor only keeps Qt from typing a URL.
-    filesDropped = Signal(object, str)
-    focused = Signal()
-    promoteRequested = Signal()
-
-    side = "source"
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._raw = ""
-        self._shown = ""
-        self._bounds = [0]
-        self._setting = False
-        self._pending: str | None = None
-        self._pending_range: tuple[int, int] | None = None
-        self._ime_active = False
-        self._ime_origin: tuple[int, int] | None = None
-        self._ignore_ime_changes = False
-        self._placeholder_text = self.placeholderText()
-        self._pending_view: dict | None = None
-        self._ime_view: dict | None = None
-        self._rejected_view: dict | None = None
-        self.last_edit_view: dict | None = None
-        # The raw range the last accepted edit replaced: (start, old_end,
-        # new_length) in scalar offsets. It comes from the edit itself, never
-        # from comparing texts, so repeated text cannot make it ambiguous.
-        self.last_edit: tuple[int, int, int] | None = None
-        # Qt's undo buffer contains normalised text, so using it could turn an
-        # original CRLF or non-breaking space into a different character.
-        self.setUndoRedoEnabled(False)
-        self.document().contentsChange.connect(self._content_changed)
-
-    def raw_text(self) -> str:
-        return self._raw
-
-    def setPlaceholderText(self, text: str) -> None:  # noqa: N802
-        self._placeholder_text = text
-        super().setPlaceholderText("" if self._ime_active else text)
-
-    def view_state(self) -> dict:
-        """Transient Qt positions: UTF-16 units, never manuscript offsets."""
-        cursor = self.textCursor()
-        return {"position": cursor.position(), "anchor": cursor.anchor(),
-                "vertical": self.verticalScrollBar().value(), "horizontal": self.horizontalScrollBar().value()}
-
-    def restore_view_state(self, state: dict) -> None:
-        cursor = self.textCursor()
-        end = self.document().characterCount() - 1
-        cursor.setPosition(max(0, min(state["anchor"], end)))
-        cursor.setPosition(max(0, min(state["position"], end)), QTextCursor.MoveMode.KeepAnchor)
-        self.setTextCursor(cursor)
-        self.verticalScrollBar().setValue(state["vertical"])
-        self.horizontalScrollBar().setValue(state["horizontal"])
-
-    def can_display(self, raw: str) -> bool:
-        shown, _ = _display_map(raw)
-        probe = QPlainTextEdit()
-        probe.setPlainText(raw)
-        return probe.toPlainText() == shown
-
-    def set_raw_text(self, raw: str) -> None:
-        shown, bounds = _display_map(raw)
-        self._setting = True
-        try:
-            super().setPlainText(raw)
-            if self.toPlainText() != shown:
-                raise ValueError("text cannot be represented by Qt")
-            self._raw, self._shown, self._bounds = raw, shown, bounds
-        finally:
-            self._setting = False
-
-    def _remember_cursor(self) -> None:
-        cursor = self.textCursor()
-        self._pending_range = (cursor.selectionStart(), cursor.selectionEnd())
-        self._pending_view = self.view_state()
-
-    @staticmethod
-    def local_files(mime) -> list[str]:
-        if mime is None or not mime.hasUrls():
-            return []
-        return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
-
-    def dragEnterEvent(self, event) -> None:  # noqa: N802
-        # File URLs are intercepted even when the drag also carries text:
-        # QMimeData.text() would otherwise hand Qt the URL to type in.
-        if self.local_files(event.mimeData()):
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event) -> None:  # noqa: N802
-        if self.local_files(event.mimeData()):
-            event.acceptProposedAction()
-            return
-        super().dragMoveEvent(event)
-
-    def dropEvent(self, event) -> None:  # noqa: N802
-        files = self.local_files(event.mimeData())
-        if not files:
-            super().dropEvent(event)
-            return
-        # Accept and return at once: whatever the drop leads to may show a
-        # dialog, and a modal inside the drop blocks the Explorer drag source.
-        event.acceptProposedAction()
-        self.filesDropped.emit(files, self.side)
-
-    def focusInEvent(self, event) -> None:  # noqa: N802
-        self.focused.emit()
-        super().focusInEvent(event)
-
-    def raw_cursor_offset(self) -> int:
-        index = _scalar_boundary(self._shown, self.textCursor().position())
-        return self._bounds[index] if index is not None else 0
-
-    # -- positions for scroll sync and navigation (cheap on long texts) ------
-    def _astral(self) -> list[int]:
-        cached = getattr(self, "_astral_cache", None)
-        if cached is None or cached[0] is not self._shown:
-            cached = (self._shown, _astral_indexes(self._shown))
-            self._astral_cache = cached
-        return cached[1]
-
-    def _scalar_index_at(self, position: int) -> int:
-        """The shown-text scalar index at a UTF-16 position (rounded down
-        inside a surrogate pair)."""
-        astral = self._astral()
-        if not astral:
-            return max(0, min(position, len(self._shown)))
-        low, high = 0, len(self._shown)
-        while low < high:
-            middle = (low + high + 1) // 2
-            if middle + bisect.bisect_left(astral, middle) <= position:
-                low = middle
-            else:
-                high = middle - 1
-        return low
-
-    def _position_of(self, index: int) -> int:
-        """The UTF-16 position of a shown-text scalar index."""
-        index = max(0, min(index, len(self._shown)))
-        astral = self._astral()
-        return index + (bisect.bisect_left(astral, index) if astral else 0)
-
-    def raw_offset_at_position(self, position: int) -> int:
-        """The raw scalar offset at a Qt (UTF-16) document position."""
-        return self._bounds[self._scalar_index_at(position)]
-
-    def position_of_raw_offset(self, offset: int) -> int:
-        """The Qt (UTF-16) document position of a raw scalar offset; one inside
-        a CRLF goes before it."""
-        offset = max(0, min(offset, len(self._raw)))
-        return self._position_of(max(0, bisect.bisect_right(self._bounds, offset) - 1))
-
-    def raw_offset_at_top(self) -> int | None:
-        """The raw offset of the first visible line."""
-        document = self.document()
-        value = self.verticalScrollBar().value()
-        block = document.findBlockByLineNumber(value)
-        if not block.isValid():
-            return len(self._raw)
-        position = block.position()
-        layout = block.layout()
-        line = value - block.firstLineNumber()
-        if layout is not None and 0 <= line < layout.lineCount():
-            position += layout.lineAt(line).textStart()
-        return self.raw_offset_at_position(position)
-
-    def scroll_to_raw_offset(self, offset: int) -> None:
-        """Scroll so the line holding a raw offset is the first visible one."""
-        document = self.document()
-        position = self.position_of_raw_offset(offset)
-        block = document.findBlock(position)
-        if not block.isValid():
-            return
-        value = block.firstLineNumber()
-        layout = block.layout()
-        if layout is not None and layout.lineCount() > 0:
-            line = layout.lineForTextPosition(position - block.position())
-            if line.isValid():
-                value += line.lineNumber()
-        self.verticalScrollBar().setValue(value)
-
-    def set_raw_cursor_offset(self, offset: int) -> None:
-        """Caret at a raw scalar offset, clamped; one inside a CRLF goes before it."""
-        offset = max(0, min(offset, len(self._raw)))
-        index = max(0, bisect.bisect_right(self._bounds, offset) - 1)
-        cursor = self.textCursor()
-        cursor.setPosition(_utf16_position(self._shown, index))
-        self.setTextCursor(cursor)
-
-    def _finalize_pending(self) -> None:
-        rejected = self._rejected_view
-        self._pending = None
-        self._pending_range = None
-        self._pending_view = None
-        self._rejected_view = None
-        if rejected is not None:
-            if self.toPlainText() != self._shown:
-                self.set_raw_text(self._raw)
-            self.restore_view_state(rejected)
-
-    def insertFromMimeData(self, source) -> None:  # noqa: N802
-        files = self.local_files(source)
-        if files:
-            self.filesDropped.emit(files, self.side)
-            return
-        self._pending = source.text() if source.hasText() else None
-        self._remember_cursor()
-        try:
-            super().insertFromMimeData(source)
-        finally:
-            self._finalize_pending()
-
-    def selected_raw_text(self) -> str:
-        cursor = self.textCursor()
-        if not cursor.hasSelection():
-            return ""
-        start = _scalar_boundary(self._shown, cursor.selectionStart())
-        end = _scalar_boundary(self._shown, cursor.selectionEnd())
-        if start is None or end is None:
-            return cursor.selectedText()
-        return self._raw[self._bounds[start]:self._bounds[end]]
-
-    def createMimeDataFromSelection(self) -> QMimeData:  # noqa: N802
-        cursor = self.textCursor()
-        start = _scalar_boundary(self._shown, cursor.selectionStart())
-        end = _scalar_boundary(self._shown, cursor.selectionEnd())
-        if start is None or end is None:
-            return super().createMimeDataFromSelection()
-        data = QMimeData()
-        data.setText(self._raw[self._bounds[start]:self._bounds[end]])
-        return data
-
-    def contextMenuEvent(self, event) -> None:  # noqa: N802
-        menu = self.createStandardContextMenu()
-        menu.addSeparator()
-        promote = menu.addAction(strings.TERMBASE_PROMOTE_BUTTON)
-        promote.triggered.connect(self.promoteRequested.emit)
-        menu.exec(event.globalPos())
-
-    @staticmethod
-    def typed_with_altgr(event) -> bool:
-        """Whether a Ctrl+Alt key event types a character.
-
-        Windows reports AltGr as Ctrl+Alt, so on many layouts Ctrl+Alt+digit
-        is how a character such as "²" or "@" is typed. When the event carries
-        a printable character other than the key's own, it is text, and the
-        workbench's Ctrl+Alt shortcuts must leave it to the editor.
-        """
-        both = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
-        text = event.text()
-        if (event.modifiers() & both) != both or not text or not text.isprintable() or text.isspace():
-            return False
-        key = event.key()
-        own = chr(key) if 0x20 < key < 0x7F else ""
-        return text.casefold() != own.casefold()
-
-    def event(self, event) -> bool:  # noqa: N802
-        if event.type() == QEvent.Type.ShortcutOverride and self.typed_with_altgr(event):
-            event.accept()
-            return True
-        return super().event(event)
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        if self._ime_active and (event.matches(QKeySequence.StandardKey.Undo) or event.matches(QKeySequence.StandardKey.Redo)):
-            super().keyPressEvent(event)
-            return
-        if (event.key() == Qt.Key.Key_Z and
-                event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
-            self.redoRequested.emit()
-            return
-        if event.matches(QKeySequence.StandardKey.Undo):
-            self.undoRequested.emit()
-            return
-        if event.matches(QKeySequence.StandardKey.Redo):
-            self.redoRequested.emit()
-            return
-        text = event.text()
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            no_cmd_mods = not (
-                event.modifiers()
-                & (
-                    Qt.KeyboardModifier.ControlModifier
-                    | Qt.KeyboardModifier.AltModifier
-                    | Qt.KeyboardModifier.MetaModifier
-                )
-            )
-            if no_cmd_mods or text == "\r":
-                text = "\n"
-        elif text == "\r":
-            text = "\n"
-        self._pending = text or None
-        self._remember_cursor()
-        try:
-            super().keyPressEvent(event)
-        finally:
-            self._finalize_pending()
-
-    def inputMethodQuery(self, query):
-        """Report caret rectangles in this widget's coordinates.
-
-        QPlainTextEdit answers in viewport coordinates, while the input method
-        maps the answer from the editor's own origin. The frame and the
-        stylesheet padding then move the IME candidate window up and left by
-        the viewport offset, onto the line being composed.
-        """
-        value = super().inputMethodQuery(query)
-        if query in (Qt.InputMethodQuery.ImCursorRectangle, Qt.InputMethodQuery.ImAnchorRectangle):
-            offset = self.viewport().pos()
-            if isinstance(value, QRectF):
-                return value.translated(offset.x(), offset.y())
-            if isinstance(value, QRect):
-                return value.translated(offset)
-        return value
-
-    def inputMethodEvent(self, event) -> None:  # noqa: N802
-        committed = bool(event.commitString()) or bool(event.replacementLength())
-        preedit = event.preeditString()
-        # Qt leaves the document empty during preedit and still paints its
-        # placeholder. Let Qt draw the composition alone until it ends.
-        super().setPlaceholderText("" if preedit else self._placeholder_text)
-        if not committed:
-            if preedit and not self._ime_active:
-                self._remember_cursor()
-                self._ime_origin = self._pending_range
-                self._ime_view = self._pending_view
-                self._ime_active = True
-                self.compositionChanged.emit()
-            self._ignore_ime_changes = True
-            try:
-                super().inputMethodEvent(event)
-            finally:
-                self._ignore_ime_changes = False
-                self._pending_range = None
-                self._pending_view = None
-            if not preedit and self._ime_active:
-                # Cancelling a preedit after a selection can leave Qt's
-                # provisional deletion in the document. Restore the raw
-                # draft only after the composition has ended.
-                position = self.textCursor().position()
-                if self.toPlainText() != self._shown:
-                    self.set_raw_text(self._raw)
-                    cursor = self.textCursor()
-                    cursor.setPosition(min(position, self.document().characterCount() - 1))
-                    self.setTextCursor(cursor)
-                self._ime_active, self._ime_origin = False, None
-                self._ime_view = None
-                self.compositionChanged.emit()
-            return
-        self._pending = event.commitString()
-        self._remember_cursor()
-        if self._ime_active and self._ime_origin is not None:
-            self._pending_view = self._ime_view
-            start, end = self._ime_origin
-            if event.replacementStart() or event.replacementLength():
-                relative = self.textCursor().position() + event.replacementStart()
-                relative_end = relative + event.replacementLength()
-                removed = end - start
-                start = relative if relative <= start else relative + removed
-                end = relative_end + removed if relative_end >= self._ime_origin[0] else relative_end
-            self._pending_range = (start, end)
-        elif event.replacementStart() or event.replacementLength():
-            start = self.textCursor().position() + event.replacementStart()
-            self._pending_range = (start, start + event.replacementLength())
-        try:
-            super().inputMethodEvent(event)
-        finally:
-            self._finalize_pending()
-        if preedit:
-            self._remember_cursor()
-            self._ime_origin = self._pending_range
-            self._ime_view = self._pending_view
-            self._pending_range = None
-            self._pending_view = None
-            self._ime_active = True
-        else:
-            self._ime_active, self._ime_origin = False, None
-            self._ime_view = None
-            self.compositionChanged.emit()
-
-    def _content_changed(self, position: int, removed: int, added: int) -> None:
-        if self._setting or self._ignore_ime_changes:
-            return
-        old, new = self._shown, self.toPlainText()
-        if self._pending is not None and self._pending_range is not None:
-            left = _scalar_boundary(old, self._pending_range[0])
-            right = _scalar_boundary(old, self._pending_range[1])
-            inserted_shown, _ = _display_map(self._pending)
-            preliminary = old == new and (
-                position > self._pending_range[1] or position + removed < self._pending_range[0]
-            )
-            if (not preliminary and left is not None and right is not None
-                    and old[:left] + inserted_shown + old[right:] == new):
-                raw_left, raw_right = self._bounds[left], self._bounds[right]
-                raw = _splice_raw(self._raw[:raw_left], self._pending, self._raw[raw_right:])
-                shown, bounds = _display_map(raw)
-                if shown == new:
-                    self.last_edit = (raw_left, raw_right, len(raw) - len(self._raw) + raw_right - raw_left)
-                    self.last_edit_view = self._pending_view
-                    self._raw, self._shown, self._bounds = raw, shown, bounds
-                    self._pending = None
-                    self._pending_range = None
-                    self.rawChanged.emit()
-                    return
-        # Qt reports IME preedit or block-property updates as a contentsChange
-        # before committed text changes; never roll back when shown text is unchanged.
-        if old == new:
-            return
-        start = _scalar_boundary(old, position)
-        end = _scalar_boundary(old, position + removed)
-        new_start = _scalar_boundary(new, position)
-        new_end = _scalar_boundary(new, position + added)
-        valid = (
-            start is not None and end is not None and new_start is not None
-            and new_end is not None and old[:start] == new[:new_start]
-            and old[end:] == new[new_end:]
-        )
-        if valid:
-            removed_part, inserted = old[start:end], new[new_start:new_end]
-            prefix = 0
-            while prefix < min(len(removed_part), len(inserted)) and removed_part[prefix] == inserted[prefix]:
-                prefix += 1
-            suffix = 0
-            while (suffix < len(removed_part) - prefix and suffix < len(inserted) - prefix
-                   and removed_part[-1 - suffix] == inserted[-1 - suffix]):
-                suffix += 1
-            left, right = start + prefix, end - suffix
-            ins_mid = inserted[prefix:len(inserted) - suffix if suffix else None]
-            raw = _splice_raw(self._raw[:self._bounds[left]], ins_mid, self._raw[self._bounds[right]:])
-
-            suffix2 = 0
-            while suffix2 < min(len(removed_part), len(inserted)) and removed_part[-1 - suffix2] == inserted[-1 - suffix2]:
-                suffix2 += 1
-            prefix2 = 0
-            while (prefix2 < len(removed_part) - suffix2 and prefix2 < len(inserted) - suffix2
-                   and removed_part[prefix2] == inserted[prefix2]):
-                prefix2 += 1
-            left2, right2 = start + prefix2, end - suffix2
-            ins_mid2 = inserted[prefix2:len(inserted) - suffix2 if suffix2 else None]
-            raw2 = _splice_raw(self._raw[:self._bounds[left2]], ins_mid2, self._raw[self._bounds[right2]:])
-
-            shown, bounds = _display_map(raw)
-            if raw == raw2 and shown == new:
-                # The whole range Qt reported, not the trimmed difference.
-                old_start, old_end = self._bounds[start], self._bounds[end]
-                self.last_edit = (old_start, old_end, len(raw) - len(self._raw) + old_end - old_start)
-                self.last_edit_view = self._pending_view
-                self._raw, self._shown, self._bounds = raw, shown, bounds
-                self.rawChanged.emit()
-                return
-        # Never guess which of two visually identical characters was edited;
-        # restore pre-edit cursor and scroll state instead of jumping to 0.
-        saved_view = dict(self._pending_view) if self._pending_view is not None else None
-        if saved_view is None:
-            cur = self.textCursor()
-            doc_limit = _utf16_position(old, len(old))
-            cur_pos = cur.position()
-            if cur_pos >= position + added:
-                restored_pos = max(0, min(cur_pos - added + removed, doc_limit))
-            else:
-                restored_pos = max(0, min(position, doc_limit))
-            saved_view = {
-                "position": restored_pos,
-                "anchor": restored_pos,
-                "vertical": self.verticalScrollBar().value(),
-                "horizontal": self.horizontalScrollBar().value(),
-            }
-        self._rejected_view = saved_view
-        raw = self._raw
-        self.set_raw_text(raw)
-        self.restore_view_state(saved_view)
-        self.editRejected.emit()
-
-    def select_raw_span(self, span: dict | None, *, move_cursor: bool = True) -> bool:
-        self.setExtraSelections([])
-        if not isinstance(span, dict):
-            return False
-        start, end, value = span.get("start"), span.get("end"), span.get("text")
-        if (isinstance(start, bool) or not isinstance(start, int) or
-                isinstance(end, bool) or not isinstance(end, int) or
-                not isinstance(value, str) or start < 0 or end <= start or
-                end > len(self._raw) or self._raw[start:end] != value):
-            return False
-        try:
-            left, right = self._bounds.index(start), self._bounds.index(end)
-        except ValueError:
-            return False
-        # Qt scrolls to the caret, not the anchor. Show the end first, then put the
-        # caret on the start: a span that fits the editor is wholly in view, and one
-        # taller than the editor shows its first line instead of its last.
-        cursor = self.textCursor()
-        cursor.setPosition(_utf16_position(self._shown, right))
-        if move_cursor:
-            self.setTextCursor(cursor)
-        cursor.setPosition(_utf16_position(self._shown, left), QTextCursor.MoveMode.KeepAnchor)
-        if move_cursor:
-            self.setTextCursor(cursor)
-        selection = QTextEdit.ExtraSelection()
-        selection.cursor = cursor
-        selection.format.setBackground(self.palette().color(QPalette.ColorRole.Highlight))
-        selection.format.setForeground(self.palette().color(QPalette.ColorRole.HighlightedText))
-        self.setExtraSelections([selection])
-        return True
-
-
-class _WordWrapDelegate(QStyledItemDelegate):
-    """Measure multiline items against the live viewport width so wrapped lines never clip."""
-
-    def sizeHint(self, option, index) -> QSize:  # noqa: N802
-        view = self.parent()
-        width = view.viewport().width() if isinstance(view, QListWidget) else 0
-        if width <= 40:
-            return super().sizeHint(option, index)
-        text = index.data(Qt.ItemDataRole.DisplayRole)
-        if not isinstance(text, str) or not text:
-            return super().sizeHint(option, index)
-        # A state icon takes its width (and a gap) from the text's line.
-        decoration = index.data(Qt.ItemDataRole.DecorationRole)
-        icon_width = 0
-        if isinstance(decoration, QIcon) and not decoration.isNull():
-            size = view.iconSize() if view.iconSize().isValid() else option.decorationSize
-            icon_width = size.width() + 8
-        rect = option.fontMetrics.boundingRect(
-            0, 0, max(20, width - 20 - icon_width), 10_000, Qt.TextFlag.TextWordWrap, text
-        )
-        return QSize(width, rect.height() + 14)
-
-
-class _WrappedListWidget(QListWidget):
-    """Recompute wrapped item heights whenever the list is shown or resized.
-
-    With ``fit_rows`` set, the list is at most as tall as that many whole rows
-    (fewer when it has fewer), so no row is cut in half at any scale."""
-
-    def __init__(self, parent: QWidget | None = None, *, fit_rows: int | None = None) -> None:
-        super().__init__(parent)
-        self.setItemDelegate(_WordWrapDelegate(self))
-        self.fit_rows = fit_rows
-
-    def fit_height(self) -> None:
-        if not self.fit_rows or not self.count():
-            return
-        rows = sum(self.sizeHintForRow(i) for i in range(min(self.count(), self.fit_rows)))
-        height = max(self.minimumHeight(), rows + 2 * self.frameWidth())
-        if self.maximumHeight() != height:
-            self.setMaximumHeight(height)
-
-    def showEvent(self, event) -> None:  # noqa: N802
-        super().showEvent(event)
-        self.scheduleDelayedItemsLayout()
-        self.fit_height()
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self.scheduleDelayedItemsLayout()
-        if event.size().width() != event.oldSize().width():
-            self.fit_height()
-
-
-class _ElidingButton(QPushButton):
-    """A button that may be narrower than its text, so it never widens the
-    inspector: short of room it draws the text elided. Its own sizeHint is the
-    whole text, so it is shown whole whenever there is room; its accessible
-    name and tooltip keep the whole text."""
-
-    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        policy = self.sizePolicy()
-        policy.setHorizontalPolicy(QSizePolicy.Policy.Preferred)
-        self.setSizePolicy(policy)
-
-    def minimumSizeHint(self) -> QSize:  # noqa: N802
-        hint = super().minimumSizeHint()
-        metrics = self.fontMetrics()
-        icon = self.iconSize().width() + 6 if not self.icon().isNull() else 0
-        # Room for the first character and an ellipsis, and the padding.
-        least = icon + metrics.horizontalAdvance(self.text()[:1] + "…") + 26
-        return QSize(min(hint.width(), least), hint.height())
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        if self.width() >= self.sizeHint().width():
-            # Room for the whole text: drawn exactly as any button.
-            super().paintEvent(event)
-            return
-        option = QStyleOptionButton()
-        self.initStyleOption(option)
-        contents = self.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, self)
-        room = contents.width() - (option.iconSize.width() + 6 if not option.icon.isNull() else 0)
-        lines = option.text.split("\n")
-        elided = "\n".join(option.fontMetrics.elidedText(line, Qt.TextElideMode.ElideRight, max(0, room))
-                           for line in lines)
-        if elided == option.text:
-            super().paintEvent(event)
-            return
-        option.text = elided
-        QStylePainter(self).drawControl(QStyle.ControlElement.CE_PushButton, option)
-
-
-class _ElidedDocumentLabel(QLabel):
-    """Keep long filenames inside the command bar and available to readers."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._full_text = ""
-
-    def set_full_text(self, text: str) -> None:
-        self._full_text = text
-        self.setToolTip(text)
-        self.setAccessibleName(text)
-        self._update_elision()
-
-    def _update_elision(self) -> None:
-        self.setText(self.fontMetrics().elidedText(
-            self._full_text, Qt.TextElideMode.ElideMiddle, max(0, self.contentsRect().width())
-        ))
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self._update_elision()
-
-    def changeEvent(self, event) -> None:  # noqa: N802
-        super().changeEvent(event)
-        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange) and hasattr(self, "_full_text"):
-            self._update_elision()
 
 
 class _WorkbenchHostAdapter(WorkbenchHost):
@@ -914,37 +249,6 @@ class _WorkbenchHostAdapter(WorkbenchHost):
         return self._view.clear_live_provenance(seq=seq)
 
 
-def _normalized_game_version(value: object) -> str | None:
-    return tm.normalize_provenance_value(value)
-
-
-def _dictionary_matches_meta(dictionary: Mapping[str, Any], meta: MetaResult) -> bool:
-    term_count = dictionary.get("term_count")
-    if isinstance(term_count, bool) or not isinstance(term_count, (int, float)):
-        return False
-    return (
-        dictionary.get("schema_version") == meta.schema_version
-        and dictionary.get("source_commit") == meta.source_commit
-        and term_count == meta.term_count
-    )
-
-
-def _identity_matches_meta(identity: DictionaryIdentityResult, meta: MetaResult) -> bool:
-    """Whether the identity describes the dictionary state ``/v1/meta`` names.
-
-    The same three fields the review dictionary is checked against: the revision
-    is what this client trusts, but the tuple is what the other endpoint can say
-    about the same dictionary without one.
-    """
-    return (
-        identity.schema_version == meta.schema_version
-        and identity.source_commit == meta.source_commit
-        and identity.term_count == meta.term_count
-        and _normalized_game_version(identity.source_game_version)
-        == _normalized_game_version(meta.source_game_version)
-    )
-
-
 class ManuscriptView(QWidget):
     documentChanged = Signal()
     lookup_requested = Signal(str)
@@ -1006,24 +310,12 @@ class ManuscriptView(QWidget):
             _WorkbenchHostAdapter(self),
             translation_memory=self._translation_memory,
         )
-        self._saved_payload = _copy_payload(self._payload)
-        self._path: Path | None = None
+        self._controller.provenance.set_callbacks(
+            on_changed=self._on_provenance_changed,
+            on_meta_refresh_requested=self.serviceMetaRefreshRequested.emit,
+        )
+        self._workspace = WorkspaceState(self._payload)
         self._report: dict | None = None
-        self._service_meta: MetaResult | None = None
-        # The live ``GET /v1/dictionary`` identity (``dictionary-identity-v1``):
-        # the revision the service is serving now, which needs no review in this
-        # session to be authoritative. None means "not known", never "unchanged".
-        self._service_dictionary: DictionaryIdentityResult | None = None
-        # Request ordinals for that statement. Two producers ask (this window's
-        # background refresh and a press's own probe), and the newer *request*
-        # wins - not the answer that happens to arrive last:
-        # ``_dictionary_request_seq`` is handed out by
-        # ``begin_dictionary_identity_request``, ``_applied_dictionary_seq`` is
-        # the newest request whose answer has been applied (or retired by a
-        # decision that made every pending answer stale).
-        self._dictionary_request_seq = 0
-        self._applied_dictionary_seq = 0
-        self._live_review_dictionary: dict | None = None
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
         # an edit undo must never erase a report added later or undo a save.
@@ -1096,8 +388,8 @@ class ManuscriptView(QWidget):
         self._search_controller = SearchReplaceController()
         self._suppress_find_refresh = False
 
-        self.source_edit = LosslessEditor(self)
-        self.target_edit = LosslessEditor(self)
+        self.source_edit = LosslessEditor(self, promote_label=strings.TERMBASE_PROMOTE_BUTTON)
+        self.target_edit = LosslessEditor(self, promote_label=strings.TERMBASE_PROMOTE_BUTTON)
         self.source_edit.setPlaceholderText(strings.MANUSCRIPT_SOURCE_PLACEHOLDER)
         self.target_edit.setPlaceholderText(strings.MANUSCRIPT_TARGET_PLACEHOLDER)
         self.target_edit.side = "target"
@@ -1143,18 +435,60 @@ class ManuscriptView(QWidget):
         # these can be current; any other history came from a file.
         self._session_snapshots: list[dict] = []
         self.auto_align_button.clicked.connect(self._use_auto_alignment)
-        self.findings = _WrappedListWidget(self)
-        self.findings.setMinimumHeight(76)
-        self.findings.setMaximumHeight(220)
-        self.findings.setWordWrap(True)
-        self.findings.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.findings.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.findings.setAccessibleName(strings.MANUSCRIPT_INSPECTOR_TITLE)
+        self._terms_track = TermsTrackWidget(
+            self,
+            promote_label=strings.TERMBASE_PROMOTE_BUTTON,
+            promote_tooltip=strings.TERMBASE_PROMOTE_TOOLTIP,
+        )
+        self.terms_note = self._terms_track.terms_note
+        self.term_toolbar = self._terms_track.term_toolbar
+        self.term_view_combo = self._terms_track.term_view_combo
+        self.term_view_combo.currentIndexChanged.connect(self._on_term_view_changed)
+        self.term_filter_combo = self._terms_track.term_filter_combo
+        self.term_filter_combo.currentIndexChanged.connect(self._on_term_filter_changed)
+        self.term_groups = self._terms_track.term_groups
+        self.term_groups.currentRowChanged.connect(self._on_group_row_changed)
+        self.term_groups.itemClicked.connect(self._on_group_item_clicked)
+        self.findings = self._terms_track.findings
         self.findings.currentRowChanged.connect(self._select_finding)
-        self.replacement_edit = QLineEdit(self)
-        self.replacement_edit.setPlaceholderText(strings.MANUSCRIPT_REPLACEMENT_HINT)
+        self.ambiguous_toggle = self._terms_track.ambiguous_toggle
+        self.ambiguous_toggle.toggled.connect(self._ambiguous_toggled)
+        self.ambiguous_area = self._terms_track.ambiguous_area
+        self.ambiguous_note = self._terms_track.ambiguous_note
+        self.ambiguous_list = self._terms_track.ambiguous_list
+        self.ambiguous_list.currentRowChanged.connect(self._select_ambiguous)
+        self.ambiguous_actions = self._terms_track.ambiguous_actions
+        self.ambiguous_combo = self._terms_track.ambiguous_combo
+        self.ambiguous_adopt_button = self._terms_track.ambiguous_adopt_button
+        self.ambiguous_adopt_button.clicked.connect(self._adopt_ambiguous)
+        self.ambiguous_ignore_button = self._terms_track.ambiguous_ignore_button
+        self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
+        self.ambiguous_state = self._terms_track.ambiguous_state
+        self.finding_title = self._terms_track.finding_title
+        self.inspector_hint = self._terms_track.inspector_hint
+        self.finding_pair = self._terms_track.finding_pair
+        self.finding_verdict = self._terms_track.finding_verdict
+        self.finding_reason = self._terms_track.finding_reason
+        self.finding_rule = self._terms_track.finding_rule
+        self.finding_positions = self._terms_track.finding_positions
+        self.candidates_label = self._terms_track.candidates_label
+        self.choice_area = self._terms_track.choice_area
+        self.choice_combo = self._terms_track.choice_combo
+        self.choice_button = self._terms_track.choice_button
+        self.choice_button.clicked.connect(self._choose_term)
+        self.unchoice_button = self._terms_track.unchoice_button
+        self.unchoice_button.clicked.connect(self._unchoose_term)
+        self.choice_state = self._terms_track.choice_state
+        self.lookup_button = self._terms_track.lookup_button
+        self.lookup_button.clicked.connect(self._request_lookup)
+        self.replace_toggle = self._terms_track.replace_toggle
+        self.promote_term_button = self._terms_track.promote_term_button
+        self.promote_term_button.clicked.connect(self._promote_from_term_finding)
+        self.manual_edit_label = self._terms_track.manual_edit_label
+        self.replacement_area = self._terms_track.replacement_area
+        self.replacement_edit = self._terms_track.replacement_edit
         self.replacement_edit.textChanged.connect(self._update_controls)
-        self.replace_button = QPushButton(strings.MANUSCRIPT_REPLACE, self)
+        self.replace_button = self._terms_track.replace_button
         self.replace_button.clicked.connect(self._replace_one)
         self.undo_button = QPushButton(strings.MANUSCRIPT_UNDO, self)
         self.undo_button.clicked.connect(self._undo_replace)
@@ -1183,7 +517,7 @@ class ManuscriptView(QWidget):
         self.history_label.setWordWrap(True)
         self.conflict_label = QLabel(strings.MANUSCRIPT_CHOICES_CONFLICT, self)
         self.conflict_label.setWordWrap(True)
-        self.conflict_list = QListWidget(self)
+        self.conflict_list = ModelListView(self)
         self.conflict_list.setMaximumHeight(110)
         self.conflict_list.currentRowChanged.connect(self._update_controls)
         self.remove_choice_button = QPushButton(strings.MANUSCRIPT_REMOVE_CHOICE, self)
@@ -1401,228 +735,7 @@ class ManuscriptView(QWidget):
         tracks.addStretch(1)
         details.addLayout(tracks)
         self.track_stack = QStackedWidget(inspector_body)
-        term_page = QWidget(self.track_stack)
-        term_page.setObjectName("inspectorBody")
-        term_details = QVBoxLayout(term_page)
-        term_details.setContentsMargins(0, 0, 0, 0)
-        term_details.setSpacing(8)
-        self.terms_note = QLabel(strings.MANUSCRIPT_TERMS_NOTE, term_page)
-        self.terms_note.setObjectName("secondaryText")
-        self.terms_note.setWordWrap(True)
-        term_details.addWidget(self.terms_note)
-        self.term_toolbar = QWidget(term_page)
-        self.term_toolbar.setObjectName("inspectorBody")
-        term_bar = QHBoxLayout(self.term_toolbar)
-        term_bar.setContentsMargins(0, 0, 0, 0)
-        term_bar.setSpacing(6)
-        self.term_view_combo = ChevronComboBox(self.term_toolbar)
-        self.term_view_combo.addItem(strings.MANUSCRIPT_TERM_VIEW_GROUPED, "grouped")
-        self.term_view_combo.addItem(strings.MANUSCRIPT_TERM_VIEW_ORDER, "order")
-        self.term_view_combo.setAccessibleName(strings.MANUSCRIPT_TERM_VIEW_LABEL)
-        self.term_view_combo.setToolTip(strings.MANUSCRIPT_TERM_VIEW_LABEL)
-        self.term_view_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.term_view_combo.setMinimumContentsLength(5)
-        self.term_view_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.term_view_combo.currentIndexChanged.connect(self._on_term_view_changed)
-        self.term_filter_combo = ChevronComboBox(self.term_toolbar)
-        for label_text, key in (
-            (strings.MANUSCRIPT_TERM_FILTER_UNHANDLED, "unhandled"),
-            (strings.MANUSCRIPT_TERM_FILTER_ALL, "all"),
-            (strings.MANUSCRIPT_TERM_FILTER_INCONSISTENT, "inconsistent"),
-            (strings.MANUSCRIPT_TERM_FILTER_PENDING, "pending"),
-            (strings.MANUSCRIPT_TERM_FILTER_NOT_EVALUATED, "not_evaluated"),
-            (strings.MANUSCRIPT_TERM_FILTER_CONFIRMED, "confirmed"),
-        ):
-            self.term_filter_combo.addItem(label_text, key)
-        self.term_filter_combo.setAccessibleName(strings.MANUSCRIPT_TERM_FILTER_LABEL)
-        self.term_filter_combo.setToolTip(strings.MANUSCRIPT_TERM_FILTER_LABEL)
-        self.term_filter_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.term_filter_combo.setMinimumContentsLength(3)
-        self.term_filter_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.term_filter_combo.currentIndexChanged.connect(self._on_term_filter_changed)
-        term_bar.addWidget(self.term_view_combo, 1)
-        term_bar.addWidget(self.term_filter_combo, 1)
-        self.term_toolbar.hide()
-        term_details.addWidget(self.term_toolbar)
-        self.term_groups = _WrappedListWidget(term_page)
-        self.term_groups.setMinimumHeight(140)
-        self.term_groups.setMaximumHeight(175)
-        self.term_groups.setWordWrap(True)
-        self.term_groups.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.term_groups.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.term_groups.setAccessibleName(strings.MANUSCRIPT_INSPECTOR_TITLE)
-        self.term_groups.currentRowChanged.connect(self._on_group_row_changed)
-        self.term_groups.itemClicked.connect(self._on_group_item_clicked)
-        self.term_groups.hide()
-        term_details.addWidget(self.term_groups)
-        term_details.addWidget(self.findings)
-        # Ambiguous one-character names: after the judged findings, folded,
-        # never counted with them.
-        self.ambiguous_toggle = _ElidingButton(parent=term_page)
-        self.ambiguous_toggle.setObjectName("commandButton")
-        self.ambiguous_toggle.setCheckable(True)
-        self.ambiguous_toggle.setIconSize(QSize(16, 16))
-        self.ambiguous_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.ambiguous_toggle.toggled.connect(self._ambiguous_toggled)
-        self.ambiguous_toggle.hide()
-        term_details.addWidget(self.ambiguous_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-        self.ambiguous_area = QWidget(term_page)
-        self.ambiguous_area.setObjectName("inspectorBody")
-        ambiguous = QVBoxLayout(self.ambiguous_area)
-        ambiguous.setContentsMargins(0, 0, 0, 0)
-        ambiguous.setSpacing(6)
-        self.ambiguous_note = QLabel(strings.MANUSCRIPT_AMBIGUOUS_NOTE, self.ambiguous_area)
-        self.ambiguous_note.setObjectName("secondaryText")
-        self.ambiguous_note.setWordWrap(True)
-        ambiguous.addWidget(self.ambiguous_note)
-        self.ambiguous_list = _WrappedListWidget(self.ambiguous_area, fit_rows=3)
-        self.ambiguous_list.setMinimumHeight(52)
-        self.ambiguous_list.setWordWrap(True)
-        self.ambiguous_list.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.ambiguous_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.ambiguous_list.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_LIST)
-        self.ambiguous_list.currentRowChanged.connect(self._select_ambiguous)
-        ambiguous.addWidget(self.ambiguous_list)
-        # The candidate pair (Core offers the official name or names; long ones
-        # elide instead of widening the inspector), then adopt or ordinary word.
-        self.ambiguous_actions = QWidget(self.ambiguous_area)
-        self.ambiguous_actions.setObjectName("inspectorBody")
-        actions = QVBoxLayout(self.ambiguous_actions)
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(6)
-        self.ambiguous_combo = ChevronComboBox(self.ambiguous_actions)
-        self.ambiguous_combo.setAccessibleName(strings.MANUSCRIPT_AMBIGUOUS_CANDIDATE)
-        self.ambiguous_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.ambiguous_combo.setMinimumContentsLength(8)
-        self.ambiguous_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        actions.addWidget(self.ambiguous_combo)
-        self.ambiguous_adopt_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_ADOPT_BUTTON, self.ambiguous_actions)
-        self.ambiguous_adopt_button.clicked.connect(self._adopt_ambiguous)
-        self.ambiguous_ignore_button = _ElidingButton(strings.MANUSCRIPT_AMBIGUOUS_IGNORE, self.ambiguous_actions)
-        self.ambiguous_ignore_button.clicked.connect(lambda: self._choose_ambiguous(None))
-        for button in (self.ambiguous_adopt_button, self.ambiguous_ignore_button):
-            # Keep an IME composition in the editor when an action is clicked.
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-            # One per line: side by side they are wider than the narrowest inspector.
-            actions.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
-        ambiguous.addWidget(self.ambiguous_actions)
-        self.ambiguous_state = QLabel(self.ambiguous_area)
-        self.ambiguous_state.setObjectName("secondaryText")
-        self.ambiguous_state.setTextFormat(Qt.TextFormat.PlainText)
-        self.ambiguous_state.setWordWrap(True)
-        ambiguous.addWidget(self.ambiguous_state)
-        self.ambiguous_area.hide()
-        term_details.addWidget(self.ambiguous_area)
-        summary = QHBoxLayout()
-        pair = QVBoxLayout()
-        self.finding_title = QLabel(strings.MANUSCRIPT_FINDING_PROMPT, inspector_body)
-        self.finding_title.setObjectName("findingTitle")
-        self.finding_title.setWordWrap(True)
-        pair.addWidget(self.finding_title)
-        # What to do next while there is nothing to show yet.
-        self.inspector_hint = QLabel(inspector_body)
-        self.inspector_hint.setObjectName("secondaryText")
-        self.inspector_hint.setWordWrap(True)
-        pair.addWidget(self.inspector_hint)
-        self.finding_pair = QLabel(inspector_body)
-        self.finding_pair.setObjectName("findingPair")
-        self.finding_pair.setTextFormat(Qt.TextFormat.PlainText)
-        self.finding_pair.setWordWrap(True)
-        summary.addLayout(pair, 1)
-        self.finding_verdict = QLabel(inspector_body)
-        self.finding_verdict.setObjectName("findingVerdict")
-        self.finding_verdict.setWordWrap(True)
-        summary.addWidget(self.finding_verdict, 0, Qt.AlignmentFlag.AlignTop)
-        term_details.addLayout(summary)
-        term_details.addWidget(self.finding_pair)
-        self.finding_reason = QLabel(inspector_body)
-        self.finding_reason.setObjectName("secondaryText")
-        self.finding_reason.setTextFormat(Qt.TextFormat.PlainText)
-        self.finding_reason.setWordWrap(True)
-        self.finding_reason.hide()
-        term_details.addWidget(self.finding_reason)
-        self.finding_rule = QLabel(inspector_body)
-        self.finding_rule.setObjectName("secondaryText")
-        self.finding_rule.setWordWrap(True)
-        self.finding_positions = QLabel(inspector_body)
-        self.finding_positions.setObjectName("secondaryText")
-        self.finding_positions.setWordWrap(True)
-        self.candidates_label = QLabel(inspector_body)
-        self.candidates_label.setWordWrap(True)
-        term_details.addWidget(self.candidates_label)
-        # Long manuscripts: the owner's term choice at this occurrence. It is
-        # saved with the segment and sent with that segment's next check.
-        self.choice_area = QWidget(inspector_body)
-        self.choice_area.setObjectName("inspectorBody")
-        choice_layout = QVBoxLayout(self.choice_area)
-        choice_layout.setContentsMargins(0, 0, 0, 0)
-        choice_layout.setSpacing(6)
-        choice_label = QLabel(strings.MANUSCRIPT_TERM_CHOICE_LABEL, self.choice_area)
-        self.choice_combo = ChevronComboBox(self.choice_area)
-        self.choice_combo.setAccessibleName(strings.MANUSCRIPT_TERM_CHOICE_LABEL)
-        # Long candidate texts elide instead of widening the inspector.
-        self.choice_combo.setSizeAdjustPolicy(ChevronComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.choice_combo.setMinimumContentsLength(8)
-        self.choice_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        choice_label.setBuddy(self.choice_combo)
-        self.choice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECORD, self.choice_area)
-        self.choice_button.clicked.connect(self._choose_term)
-        self.unchoice_button = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, self.choice_area)
-        self.unchoice_button.clicked.connect(self._unchoose_term)
-        choice_buttons = QHBoxLayout()
-        choice_buttons.setSpacing(6)
-        for button in (self.choice_button, self.unchoice_button):
-            # Keep an IME composition in the editor when an action is clicked.
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-            choice_buttons.addWidget(button)
-        choice_buttons.addStretch(1)
-        self.choice_state = QLabel(self.choice_area)
-        self.choice_state.setObjectName("secondaryText")
-        self.choice_state.setTextFormat(Qt.TextFormat.PlainText)
-        self.choice_state.setWordWrap(True)
-        choice_layout.addWidget(choice_label)
-        choice_layout.addWidget(self.choice_combo)
-        choice_layout.addLayout(choice_buttons)
-        choice_layout.addWidget(self.choice_state)
-        self.choice_area.hide()
-        term_details.addWidget(self.choice_area)
-        self.lookup_button = _ElidingButton(strings.NAV_ITEM_TERMS, inspector_body)
-        self.lookup_button.setIcon(icon("external-link"))
-        self.lookup_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.lookup_button.clicked.connect(self._request_lookup)
-        self.replace_toggle = _ElidingButton(strings.MANUSCRIPT_REPLACE, inspector_body)
-        self.replace_toggle.setCheckable(True)
-        self.replace_toggle.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        term_actions = QHBoxLayout()
-        term_actions.setSpacing(6)
-        term_actions.addWidget(self.replace_toggle)
-        term_actions.addWidget(self.lookup_button)
-        term_actions.addStretch(1)
-        term_details.addLayout(term_actions)
-        self.promote_term_button = _ElidingButton(strings.TERMBASE_PROMOTE_BUTTON, inspector_body)
-        self.promote_term_button.setToolTip(strings.TERMBASE_PROMOTE_TOOLTIP)
-        self.promote_term_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.promote_term_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        self.promote_term_button.clicked.connect(self._promote_from_term_finding)
-        term_details.addWidget(self.promote_term_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.manual_edit_label = QLabel(strings.MANUSCRIPT_MANUAL_EDIT, inspector_body)
-        self.manual_edit_label.setWordWrap(True)
-        term_details.addWidget(self.manual_edit_label)
-        self.replacement_area = QWidget(inspector_body)
-        self.replacement_area.setObjectName("inspectorBody")
-        replacement = QVBoxLayout(self.replacement_area)
-        replacement.setContentsMargins(0, 0, 0, 0)
-        replacement_label = QLabel(strings.MANUSCRIPT_REPLACEMENT, self.replacement_area)
-        replacement_label.setBuddy(self.replacement_edit)
-        replacement.addWidget(replacement_label)
-        replacement.addWidget(self.replacement_edit)
-        replacement.addWidget(self.replace_button)
-        self.replace_toggle.toggled.connect(self.replacement_area.setVisible)
-        term_details.addWidget(self.replacement_area)
-        term_details.addStretch(1)
-        self.track_stack.addWidget(term_page)
+        self.track_stack.addWidget(self._terms_track)
         self.track_stack.addWidget(self.semantic_page)
         self.track_stack.addWidget(self.segments_page)
         details.addWidget(self.track_stack)
@@ -1831,15 +944,73 @@ class ManuscriptView(QWidget):
     def _translate_task(self):
         return self._controller.translate_task
 
+    # Workspace & provenance single-source-of-truth delegators (no duplicated fields).
+    @property
+    def _path(self) -> Path | None:
+        return self._workspace.path
+
+    @_path.setter
+    def _path(self, value: Path | None) -> None:
+        self._workspace.path = value
+
+    @property
+    def _saved_payload(self) -> dict:
+        return self._workspace.saved_payload
+
+    @_saved_payload.setter
+    def _saved_payload(self, value: dict) -> None:
+        self._workspace.saved_payload = value
+
+    @property
+    def _service_meta(self) -> MetaResult | None:
+        return self._controller.provenance.service_meta
+
+    @_service_meta.setter
+    def _service_meta(self, value: MetaResult | None) -> None:
+        self._controller.provenance.service_meta = value
+
+    @property
+    def _service_dictionary(self) -> DictionaryIdentityResult | None:
+        return self._controller.provenance.service_dictionary
+
+    @_service_dictionary.setter
+    def _service_dictionary(self, value: DictionaryIdentityResult | None) -> None:
+        self._controller.provenance.service_dictionary = value
+
+    @property
+    def _dictionary_request_seq(self) -> int:
+        return self._controller.provenance.dictionary_request_seq
+
+    @_dictionary_request_seq.setter
+    def _dictionary_request_seq(self, value: int) -> None:
+        self._controller.provenance.dictionary_request_seq = value
+
+    @property
+    def _applied_dictionary_seq(self) -> int:
+        return self._controller.provenance.applied_dictionary_seq
+
+    @_applied_dictionary_seq.setter
+    def _applied_dictionary_seq(self, value: int) -> None:
+        self._controller.provenance.applied_dictionary_seq = value
+
+    @property
+    def _live_review_dictionary(self) -> dict | None:
+        return self._controller.provenance.live_review_dictionary
+
+    @_live_review_dictionary.setter
+    def _live_review_dictionary(self, value: dict | None) -> None:
+        self._controller.provenance.live_review_dictionary = value
+
+    def _on_provenance_changed(self) -> None:
+        if hasattr(self, "tm_panel"):
+            self._refresh_tm_panel()
+        self.workbenchStatusChanged.emit()
+
     # -- semantic review: widgets -------------------------------------------
     def _build_semantic_widgets(self) -> None:
-        """The two tracks stay apart: deterministic term constraints, and
-        model suspicions that say they may be wrong. Segments get their own
-        list so long manuscripts can be navigated and their gaps explained."""
+        """Assemble track switcher and modular SemanticTrackWidget / SegmentsTrackWidget."""
         self.track_group = QButtonGroup(self)
         self.track_group.setExclusive(True)
-        # They elide rather than widen the inspector when the counts and a wide
-        # system font do not fit side by side.
         self.terms_track_button = _ElidingButton(parent=self)
         self.semantic_track_button = _ElidingButton(parent=self)
         self.segments_track_button = _ElidingButton(parent=self)
@@ -1854,282 +1025,85 @@ class ManuscriptView(QWidget):
         self.semantic_track_button.hide()
         self.track_group.idClicked.connect(self._show_track)
 
-        page = QWidget(self)
-        page.setObjectName("inspectorBody")
-        self.semantic_page = page
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        self.l2_title = QLabel(strings.MANUSCRIPT_L2_TITLE, page)
-        self.l2_title.setObjectName("secondaryText")
-        self.l2_title.setWordWrap(True)
-        layout.addWidget(self.l2_title)
-        self.semantic_badge = QLabel(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL, page)
-        self.semantic_badge.setObjectName("experimentalBadge")
-        self.semantic_badge.setToolTip(strings.MANUSCRIPT_SEMANTIC_EXPERIMENTAL_NOTE)
-        layout.addWidget(self.semantic_badge, 0, Qt.AlignmentFlag.AlignLeft)
-        self.l2_note = QLabel(strings.MANUSCRIPT_L2_NOTE, page)
-        self.l2_note.setObjectName("secondaryText")
-        self.l2_note.setWordWrap(True)
-        layout.addWidget(self.l2_note)
-        # How many issues Layer 1 already shows (ADR 0022: Layer 1 wins an overlap).
-        self.l2_covered = QLabel(page)
-        self.l2_covered.setObjectName("secondaryText")
-        self.l2_covered.setWordWrap(True)
-        self.l2_covered.hide()
-        layout.addWidget(self.l2_covered)
-        self.semantic_note = QLabel(strings.MANUSCRIPT_SEMANTIC_NOTE, page)
-        self.semantic_note.setObjectName("secondaryText")
-        self.semantic_note.setWordWrap(True)
-        layout.addWidget(self.semantic_note)
-        # Shown in the status card above the tracks, so a pause or a limit is
-        # visible from every track, not only from the semantic one.
-        self.semantic_progress = QLabel(strings.MANUSCRIPT_SEMANTIC_NOT_RUN, page)
-        self.semantic_progress.setObjectName("statusText")
-        self.semantic_progress.setWordWrap(True)
-        heading = QHBoxLayout()
-        self.issue_title = QLabel(strings.MANUSCRIPT_SEMANTIC_PROMPT, page)
-        self.issue_title.setObjectName("findingTitle")
-        self.issue_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.issue_title.setWordWrap(True)
-        heading.addWidget(self.issue_title, 1)
-        self.issue_state = QLabel(page)
-        self.issue_state.setObjectName("findingVerdict")
-        self.issue_state.setProperty("reviewState", review_states.UNEVALUATED)
-        heading.addWidget(self.issue_state, 0, Qt.AlignmentFlag.AlignTop)
-        layout.addLayout(heading)
-        self.issue_confidence = QLabel(page)
-        self.issue_confidence.setObjectName("secondaryText")
-        self.issue_confidence.setToolTip(strings.MANUSCRIPT_CONFIDENCE_NOTE)
-        self.issue_excerpts = QLabel(page)
-        self.issue_excerpts.setObjectName("findingPair")
-        self.issue_rationale = QLabel(page)
-        self.issue_suggestion = QLabel(page)
-        self.issue_suggestion.setObjectName("suggestionText")
-        self.issue_term_effect = QLabel(page)
-        self.issue_term_effect.setObjectName("secondaryText")
-        self.issue_notice = QLabel(page)
-        self.issue_notice.setObjectName("noticeText")
-        for label in (self.issue_confidence, self.issue_excerpts, self.issue_rationale,
-                      self.issue_suggestion, self.issue_term_effect, self.issue_notice):
-            # Model text is untrusted: never rendered as rich text.
-            label.setTextFormat(Qt.TextFormat.PlainText)
-            label.setWordWrap(True)
-            layout.addWidget(label)
-        self.issue_alternative_button = QPushButton(page)
-        self.issue_alternative_button.setObjectName("linkButton")
-        self.issue_alternative_button.setCheckable(True)
+        sem = SemanticTrackWidget(
+            self,
+            promote_label=strings.TERMBASE_PROMOTE_BUTTON,
+            promote_tooltip=strings.TERMBASE_PROMOTE_TOOLTIP,
+        )
+        self.semantic_page = sem
+        self.l2_title = sem.l2_title
+        self.semantic_badge = sem.semantic_badge
+        self.l2_note = sem.l2_note
+        self.l2_covered = sem.l2_covered
+        self.semantic_note = sem.semantic_note
+        self.semantic_progress = sem.semantic_progress
+        self.issue_title = sem.issue_title
+        self.issue_state = sem.issue_state
+        self.issue_confidence = sem.issue_confidence
+        self.issue_excerpts = sem.issue_excerpts
+        self.issue_rationale = sem.issue_rationale
+        self.issue_suggestion = sem.issue_suggestion
+        self.issue_term_effect = sem.issue_term_effect
+        self.issue_notice = sem.issue_notice
+        self.issue_alternative_button = sem.issue_alternative_button
         self.issue_alternative_button.toggled.connect(self._alternative_toggled)
-        self.issue_alternative_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-        layout.addWidget(self.issue_alternative_button, 0, Qt.AlignmentFlag.AlignLeft)
-        actions = QHBoxLayout()
-        actions.setSpacing(6)
-        self.accept_button = _ElidingButton(strings.MANUSCRIPT_ACCEPT, page)
-        self.accept_button.setObjectName("primaryButton")
-        self.accept_button.setToolTip(f"{strings.MANUSCRIPT_ACCEPT}（Ctrl+Enter）")
+        self.accept_button = sem.accept_button
         self.accept_button.clicked.connect(self._accept_current)
-        self.adjust_button = _ElidingButton(strings.MANUSCRIPT_ADJUST, page)
-        self.adjust_button.setToolTip(f"{strings.MANUSCRIPT_ADJUST}（Ctrl+Shift+E）")
+        self.adjust_button = sem.adjust_button
         self.adjust_button.clicked.connect(self._adjust_current)
-        self.ignore_button = _ElidingButton(strings.MANUSCRIPT_IGNORE, page)
-        self.ignore_button.setToolTip(f"{strings.MANUSCRIPT_IGNORE}（Ctrl+Shift+I）")
+        self.ignore_button = sem.ignore_button
         self.ignore_button.clicked.connect(self._ignore_current)
-        for button in (self.accept_button, self.adjust_button, self.ignore_button):
-            # Keep an IME composition in the editor when an action is clicked.
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            actions.addWidget(button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-        self.semantic_promote_button = _ElidingButton(strings.TERMBASE_PROMOTE_BUTTON, page)
-        self.semantic_promote_button.setToolTip(strings.TERMBASE_PROMOTE_TOOLTIP)
-        self.semantic_promote_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.semantic_promote_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.semantic_promote_button = sem.semantic_promote_button
         self.semantic_promote_button.clicked.connect(self._promote_from_semantic_issue)
-        layout.addWidget(self.semantic_promote_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.adjust_area = QWidget(page)
-        self.adjust_area.setObjectName("inspectorBody")
-        adjust = QVBoxLayout(self.adjust_area)
-        adjust.setContentsMargins(0, 0, 0, 0)
-        adjust_label = QLabel(strings.MANUSCRIPT_ADJUST_LABEL, self.adjust_area)
-        self.adjust_edit = QPlainTextEdit(self.adjust_area)
-        self.adjust_edit.setMaximumHeight(90)
-        self.adjust_edit.setAccessibleName(strings.MANUSCRIPT_ADJUST_LABEL)
-        adjust_label.setBuddy(self.adjust_edit)
-        self.adjust_apply_button = QPushButton(strings.MANUSCRIPT_ADJUST_APPLY, self.adjust_area)
+        self.adjust_area = sem.adjust_area
+        self.adjust_edit = sem.adjust_edit
+        self.adjust_apply_button = sem.adjust_apply_button
         self.adjust_apply_button.clicked.connect(self._apply_adjustment)
-        adjust.addWidget(adjust_label)
-        adjust.addWidget(self.adjust_edit)
-        adjust.addWidget(self.adjust_apply_button)
-        self.adjust_area.hide()
-        layout.addWidget(self.adjust_area)
-        self.semantic_list = QListWidget(page)
-        self.semantic_list.setMinimumHeight(76)
-        self.semantic_list.setMaximumHeight(180)
-        self.semantic_list.setWordWrap(True)
-        self.semantic_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.semantic_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEMANTIC.format(count="").strip())
+        self.semantic_list = sem.semantic_list
         self.semantic_list.currentRowChanged.connect(self._select_issue)
-        layout.addWidget(self.semantic_list)
-        # Low-confidence issues are folded at the end of the list until opened.
-        self.low_toggle = _ElidingButton(parent=page)
-        self.low_toggle.setObjectName("commandButton")
-        self.low_toggle.setCheckable(True)
-        self.low_toggle.setIconSize(QSize(16, 16))
-        self.low_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.low_toggle = sem.low_toggle
         self.low_toggle.toggled.connect(self._low_toggled)
-        self.low_toggle.hide()
-        layout.addWidget(self.low_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-        # Already accepted/adjusted/ignored issues stay hidden until toggled on.
-        self.handled_toggle = _ElidingButton(parent=page)
-        self.handled_toggle.setObjectName("commandButton")
-        self.handled_toggle.setCheckable(True)
-        self.handled_toggle.setChecked(False)
-        self.handled_toggle.setIconSize(QSize(16, 16))
-        self.handled_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.handled_toggle = sem.handled_toggle
         self.handled_toggle.toggled.connect(self._handled_toggled)
-        self.handled_toggle.hide()
-        layout.addWidget(self.handled_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-        self.shortcuts_label = QLabel(strings.MANUSCRIPT_SHORTCUTS, page)
-        self.shortcuts_label.setObjectName("captionText")
-        self.shortcuts_label.setWordWrap(True)
-        layout.addWidget(self.shortcuts_label)
-        layout.addStretch(1)
+        self.shortcuts_label = sem.shortcuts_label
 
-        page = QWidget(self)
-        page.setObjectName("inspectorBody")
-        self.segments_page = page
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        self.segments_note = QLabel(strings.MANUSCRIPT_SEGMENTS_NOTE, page)
-        self.segments_note.setObjectName("secondaryText")
-        self.segments_note.setWordWrap(True)
-        layout.addWidget(self.segments_note)
-        self.segment_list = _WrappedListWidget(page)
-        self.segment_list.setMinimumHeight(76)
-        self.segment_list.setMaximumHeight(220)
-        # Rows wrap instead of eliding. A row carries the segment's state and
-        # both core lengths; at 150% scaling the single-line form is wider than
-        # the inspector, and an ellipsis hid the counts the row exists for.
-        self.segment_list.setWordWrap(True)
-        self.segment_list.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.segment_list.setUniformItemSizes(False)
-        self.segment_list.setResizeMode(QListView.ResizeMode.Adjust)
-        self.segment_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.segment_list.setAccessibleName(strings.MANUSCRIPT_TRACK_SEGMENTS.format(count="").strip())
+        seg = SegmentsTrackWidget(self)
+        self.segments_page = seg
+        self.segments_note = seg.segments_note
+        self.segment_list = seg.segment_list
         self.segment_list.currentRowChanged.connect(self._select_segment)
-        layout.addWidget(self.segment_list)
-        self.segment_hint = QLabel(page)
-        self.segment_hint.setTextFormat(Qt.TextFormat.PlainText)
-        self.segment_hint.setWordWrap(True)
-        layout.addWidget(self.segment_hint)
-        segment_actions = QHBoxLayout()
-        segment_actions.setSpacing(6)
-        self.finish_button = _ElidingButton(strings.MANUSCRIPT_SEGMENT_FINISH, page)
+        self.segment_hint = seg.segment_hint
+        self.finish_button = seg.finish_button
         self.finish_button.clicked.connect(self._toggle_finished)
-        self.next_pending_button = _ElidingButton(strings.MANUSCRIPT_NEXT_PENDING, page)
+        self.next_pending_button = seg.next_pending_button
         self.next_pending_button.clicked.connect(self._next_pending)
-        for button in (self.finish_button, self.next_pending_button):
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-            segment_actions.addWidget(button)
-        segment_actions.addStretch(1)
-        layout.addLayout(segment_actions)
-        # The selected segment's term choices, and history choices that can
-        # come back here: none is ever dropped without the owner removing it.
-        self.segment_choices = QListWidget(page)
-        self.segment_choices.setMaximumHeight(120)
-        self.segment_choices.setWordWrap(True)
-        self.segment_choices.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.segment_choices.setAccessibleName(strings.MANUSCRIPT_SEGMENT_CHOICES)
+        self.segment_choices = seg.segment_choices
         self.segment_choices.currentRowChanged.connect(self._update_segment_choice_actions)
-        layout.addWidget(self.segment_choices)
-        choice_actions = QHBoxLayout()
-        choice_actions.setSpacing(6)
-        self.segment_choice_action = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_RECONFIRM, page)
+        self.segment_choice_action = seg.segment_choice_action
         self.segment_choice_action.clicked.connect(self._segment_choice_primary)
-        self.segment_choice_remove = _ElidingButton(strings.MANUSCRIPT_TERM_CHOICE_REMOVE, page)
+        self.segment_choice_remove = seg.segment_choice_remove
         self.segment_choice_remove.clicked.connect(self._segment_choice_removed)
-        for button in (self.segment_choice_action, self.segment_choice_remove):
-            button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
-            choice_actions.addWidget(button)
-        choice_actions.addStretch(1)
-        layout.addLayout(choice_actions)
         self._segment_choice_rows: list[tuple] = []
-        self.translate_segment_button = _ElidingButton(strings.MANUSCRIPT_TRANSLATE_SEGMENT, page)
-        self.translate_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.translate_segment_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.translate_segment_button = seg.translate_segment_button
         self.translate_segment_button.clicked.connect(self._translate_segment)
-        layout.addWidget(self.translate_segment_button)
-        layout.addStretch(1)
 
     def _build_layer_widgets(self) -> None:
-        """The layered review card above the tracks: Layer 1 deterministic
-        structure checks (user-triggered, never saved), a line that sums up
-        Layer 2 (the semantic track), and the reserved Layer 3 switch (off by
-        default; it sends and stores nothing)."""
-        card = QFrame(self)
-        card.setObjectName("reviewStatus")
-        card.setProperty("tone", "neutral")
+        """Mount modular LayersCardWidget above the tracks."""
+        card = LayersCardWidget(self)
         self.layers_card = card
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 8, 12, 10)
-        layout.setSpacing(6)
-        self.layers_title = QLabel(strings.MANUSCRIPT_LAYERS_TITLE, card)
-        self.layers_title.setObjectName("sectionTitle")
-        layout.addWidget(self.layers_title)
-        self.l1_title = QLabel(strings.MANUSCRIPT_L1_TITLE, card)
-        self.l1_title.setObjectName("statusText")
-        self.l1_title.setWordWrap(True)
-        self.l1_title.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
-        layout.addWidget(self.l1_title)
-        self.l1_note = QLabel(strings.MANUSCRIPT_L1_NOTE, card)
-        self.l1_note.setObjectName("secondaryText")
-        self.l1_note.setWordWrap(True)
-        self.l1_note.setToolTip(strings.MANUSCRIPT_L1_NOTE_DETAIL)
-        layout.addWidget(self.l1_note)
-        self.l1_run_button = _ElidingButton(strings.MANUSCRIPT_L1_RUN.format(count=0), card)
-        self.l1_run_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.l1_run_button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.layers_title = card.layers_title
+        self.l1_title = card.l1_title
+        self.l1_note = card.l1_note
+        self.l1_run_button = card.l1_run_button
         self.l1_run_button.clicked.connect(self._run_structure_check)
-        layout.addWidget(self.l1_run_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.l1_status = QLabel(strings.MANUSCRIPT_L1_NOT_RUN, card)
-        self.l1_status.setObjectName("secondaryText")
-        self.l1_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.l1_status.setWordWrap(True)
-        layout.addWidget(self.l1_status)
-        self.l1_list = _WrappedListWidget(card, fit_rows=3)
-        self.l1_list.setMinimumHeight(52)
-        self.l1_list.setWordWrap(True)
-        self.l1_list.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.l1_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.l1_list.setAccessibleName(strings.MANUSCRIPT_L1_LIST)
+        self.l1_status = card.l1_status
+        self.l1_list = card.l1_list
         self.l1_list.currentRowChanged.connect(self._select_l1_row)
-        self.l1_list.hide()
-        layout.addWidget(self.l1_list)
-        # A label, not a button: it wraps, so it never widens the inspector.
-        self.l2_overview = QLabel(card)
-        self.l2_overview.setObjectName("secondaryText")
-        self.l2_overview.setTextFormat(Qt.TextFormat.PlainText)
-        self.l2_overview.setWordWrap(True)
-        self.l2_overview.hide()
-        layout.addWidget(self.l2_overview)
-        # The title wraps; the switch beside it has a short label, so neither
-        # widens the inspector. Component state only: never saved, never sent.
-        self.l3_title = QLabel(strings.MANUSCRIPT_L3_TITLE, card)
-        self.l3_title.setObjectName("statusText")
-        self.l3_title.setWordWrap(True)
-        layout.addWidget(self.l3_title)
-        self.l3_check = QCheckBox(strings.MANUSCRIPT_L3_TOGGLE, card)
-        self.l3_check.setChecked(False)
-        self.l3_check.setAccessibleName(strings.MANUSCRIPT_L3_TITLE)
+        self.l2_overview = card.l2_overview
+        self.l3_title = card.l3_title
+        self.l3_check = card.l3_check
         self.l3_check.toggled.connect(self._style_toggled)
-        layout.addWidget(self.l3_check)
-        self.l3_note = QLabel(strings.MANUSCRIPT_L3_OFF, card)
-        self.l3_note.setObjectName("secondaryText")
-        self.l3_note.setWordWrap(True)
-        layout.addWidget(self.l3_note)
+        self.l3_note = card.l3_note
 
     def _style_toggled(self, on: bool) -> None:
         """Layer 3 is a reserved place: switching it on sends and stores nothing."""
@@ -2230,12 +1204,10 @@ class ManuscriptView(QWidget):
         if rows != self._l1_rows or self.l1_list.count() != len(rows):
             self._l1_rows = rows
             self.l1_list.blockSignals(True)
-            self.l1_list.clear()
-            for row, text in enumerate(texts):
-                self.l1_list.addItem(text)
-                item = self.l1_list.item(row)
-                item.setToolTip(text)
-                review_states.mark(item, review_states.NEEDS_CHECK)
+            self.l1_list.set_rows([
+                ReviewRow(text=text, state=review_states.NEEDS_CHECK, tooltip=text)
+                for text in texts
+            ])
             self.l1_list.setCurrentRow(-1)
             self.l1_list.blockSignals(False)
         self.l1_list.setVisible(bool(rows) and not unavailable)
@@ -2255,10 +1227,10 @@ class ManuscriptView(QWidget):
         pairs = self._cached_pairs() or []
         with self.scroll_sync.suspended():
             if finding["source_span"] is not None:
-                located = self.source_edit.select_raw_span(finding["source_span"])
+                located = self.source_edit.select_raw_span(finding["source_span"], pulse=True)
                 self.target_edit.setExtraSelections([])
             elif finding["target_span"] is not None:
-                located = self.target_edit.select_raw_span(finding["target_span"])
+                located = self.target_edit.select_raw_span(finding["target_span"], pulse=True)
                 self.source_edit.setExtraSelections([])
             elif 0 <= index < len(pairs):
                 self._select_cores(pairs[index])
@@ -2716,12 +1688,17 @@ class ManuscriptView(QWidget):
             if not same:
                 self._issue_rows = rows
                 self._row_texts = [self._issue_row_text(issue) for issue in rows]
-                self.semantic_list.clear()
-                self.semantic_list.addItems(self._row_texts)
-                for row, issue in enumerate(rows):
+                model_rows = []
+                for issue, text in zip(rows, self._row_texts):
                     state = self._issue_state(issue)
-                    review_states.mark(self.semantic_list.item(row), review_states.for_issue(state),
-                                       label=strings.MANUSCRIPT_ISSUE_STATE[state])
+                    model_rows.append(
+                        ReviewRow(
+                            text=text,
+                            state=review_states.for_issue(state),
+                            state_label=strings.MANUSCRIPT_ISSUE_STATE[state],
+                        )
+                    )
+                self.semantic_list.set_rows(model_rows)
                 self.semantic_list.setCurrentRow(rows.index(current) if current in rows else -1)
                 self._rows_dirty = False
             elif not visible:
@@ -2731,12 +1708,15 @@ class ManuscriptView(QWidget):
                     text = self._issue_row_text(issue)
                     if text != self._row_texts[row]:
                         self._row_texts[row] = text
-                        item = self.semantic_list.item(row)
-                        item.setText(text)
-                        item.setToolTip("")
                         state = self._issue_state(issue)
-                        review_states.mark(item, review_states.for_issue(state),
-                                           label=strings.MANUSCRIPT_ISSUE_STATE[state])
+                        self.semantic_list.update_row(
+                            row,
+                            ReviewRow(
+                                text=text,
+                                state=review_states.for_issue(state),
+                                state_label=strings.MANUSCRIPT_ISSUE_STATE[state],
+                            ),
+                        )
                 self._rows_dirty = False
         finally:
             self._refreshing_lists = False
@@ -2755,20 +1735,15 @@ class ManuscriptView(QWidget):
         if not issues or not self._controller.structure.results:
             return list(issues), 0
         pairs = self._cached_pairs()
-        # While a fresh edit waits for its pairing, the last views decide, so
-        # the list does not flicker on every keystroke.
         views = self._controller.structure_views(pairs) if pairs is not None else self._l1_views
         pairs = pairs if pairs is not None else self._controller.pairs
-        listed, covered = [], 0
-        for issue in issues:
-            if self._issue_state(issue) in sessions.UNHANDLED:
-                index = self._issue_pair(issue, pairs)
-                view = views[index] if index is not None and index < len(views) else None
-                if l1.covered_by(issue.issue["category"], issue.source_span, issue.target_span, view):
-                    covered += 1
-                    continue
-            listed.append(issue)
-        return listed, covered
+        return _project_layer2_rows(
+            issues,
+            self._issue_state,
+            pairs,
+            views,
+            bool(self._controller.structure.results),
+        )
 
     @staticmethod
     def _issue_pair(issue: sessions.LiveIssue, pairs: list) -> int | None:
@@ -3141,14 +2116,19 @@ class ManuscriptView(QWidget):
         self._refreshing_lists = True
         try:
             self._segment_rows, self._segment_rows_from = list(pairs), pairs
-            self.segment_list.clear()
-            for pair in pairs:
-                self.segment_list.addItem(strings.MANUSCRIPT_SEGMENT_ITEM.format(
-                    number=pair.index + 1, status=self._segment_row_status(pair, records),
-                    source=pair.source.core_end - pair.source.core_start,
-                    target=pair.target.core_end - pair.target.core_start))
-                review_states.mark(self.segment_list.item(self.segment_list.count() - 1),
-                                   review_states.for_segment(self._segment_status(pair)))
+            seg_rows = [
+                ReviewRow(
+                    text=strings.MANUSCRIPT_SEGMENT_ITEM.format(
+                        number=pair.index + 1,
+                        status=self._segment_row_status(pair, records),
+                        source=pair.source.core_end - pair.source.core_start,
+                        target=pair.target.core_end - pair.target.core_start,
+                    ),
+                    state=review_states.for_segment(self._segment_status(pair)),
+                )
+                for pair in pairs
+            ]
+            self.segment_list.set_rows(seg_rows)
             self.segment_list.setCurrentRow(row if row < len(pairs) else -1)
         finally:
             self._refreshing_lists = False
@@ -3240,7 +2220,7 @@ class ManuscriptView(QWidget):
         shows them all as waiting. Only an unconfirmed choice of a record with a
         result needs reconfirmation."""
         rows: list[tuple] = []
-        self.segment_choices.clear()
+        choice_model_rows: list[ReviewRow] = []
         if index is not None:
             record = self._payload["segments"][index]
             pending = record["status"] == "pending"
@@ -3249,15 +2229,20 @@ class ManuscriptView(QWidget):
                 template = (strings.MANUSCRIPT_SEGMENT_CHOICE_WAITING if pending
                             else strings.MANUSCRIPT_SEGMENT_CHOICE_ITEM if choice["confirmed"]
                             else strings.MANUSCRIPT_SEGMENT_CHOICE_UNCONFIRMED)
-                self.segment_choices.addItem(template.format(text=choice["source_span"]["text"],
-                                                             choice=self._describe_choice(choice)))
+                choice_model_rows.append(
+                    ReviewRow(text=template.format(text=choice["source_span"]["text"],
+                                                   choice=self._describe_choice(choice)))
+                )
             history = sr.parts_of(self._payload).history
             for position, target in sr.restorable(self._payload):
                 if target == index:
                     entry = history[position]
                     rows.append(("history", position))
-                    self.segment_choices.addItem(strings.MANUSCRIPT_SEGMENT_CHOICE_HISTORY.format(
-                        text=entry["source_span"]["text"], choice=self._describe_choice(entry)))
+                    choice_model_rows.append(
+                        ReviewRow(text=strings.MANUSCRIPT_SEGMENT_CHOICE_HISTORY.format(
+                            text=entry["source_span"]["text"], choice=self._describe_choice(entry)))
+                    )
+        self.segment_choices.set_rows(choice_model_rows)
         self._segment_choice_rows = rows
         self.segment_choices.setVisible(bool(rows))
         self.segment_choice_action.setVisible(bool(rows))
@@ -3520,7 +2505,7 @@ class ManuscriptView(QWidget):
             self._term_filter = data
         self._refresh_term_lists(quiet=False, preferred_index=self.findings.currentRow())
 
-    def _on_group_item_clicked(self, item: QListWidgetItem) -> None:
+    def _on_group_item_clicked(self, item) -> None:
         if self._syncing_term_selection or not self._input_ready():
             return
         if item.data(Qt.ItemDataRole.UserRole) is None:
@@ -3556,60 +2541,7 @@ class ManuscriptView(QWidget):
 
     def _build_document_term_groups(self, report: dict) -> list[dict]:
         """Group findings of a short/document-mode report with the same rules."""
-        source, target, direction = self._payload["source"], self._payload["target"], self._payload["direction"]
-        if not report["findings"]:
-            return []
-        synthetic_findings = [
-            {**f, "rule_id": sr.TERM_PAIR_RULE} for f in report["findings"]
-            if isinstance(f.get("source_span"), dict)
-        ]
-        synthetic_report = {
-            "request_id": report.get("request_id") or "doc",
-            "source_revision": sr.content_hash(source),
-            "target_revision": sr.content_hash(target),
-            "rule_version": sr.RULE_VERSION,
-            "matcher_revision": report.get("matcher_revision") or ("0" * 64),
-            "dictionary": {
-                "schema_version": (report.get("dictionary") or {}).get("schema_version") or "1",
-                "source_commit": (report.get("dictionary") or {}).get("source_commit") or "doc",
-                "term_count": int((report.get("dictionary") or {}).get("term_count") or 0),
-                "revision": (report.get("dictionary") or {}).get("revision") or ("0" * 64),
-            },
-            "coverage": {
-                "evaluated": int((report.get("coverage") or {}).get("evaluated") or 0),
-                "not_evaluated": int((report.get("coverage") or {}).get("not_evaluated") or 0),
-                "rules": list(sr.COVERAGE_RULES),
-            },
-            "findings": synthetic_findings,
-            "truncated": bool(report.get("truncated")),
-        }
-        compact = sr.compact_result(synthetic_report, source, target)
-        if compact is None:
-            return []
-        basis = sr.basis_of(synthetic_report)
-        record = {
-            "index": 0,
-            "segmentation_version": "segmentation-v1",
-            "source_start": 0,
-            "source_end": len(source),
-            "target_start": 0,
-            "target_end": len(target),
-            "source_hash": sr.content_hash(source),
-            "target_hash": sr.content_hash(target),
-            "status": "done" if self._review_state == "current" else "stale",
-            "direction": direction,
-            "alignment_input": sr.alignment_input(
-                self._payload["alignments"], source, target, (0, len(source)), (0, len(target))
-            ),
-            "basis": basis,
-            "result": compact,
-            "choices": [],
-        }
-        return sr.group_term_occurrences(
-            [record], [], source, target, direction,
-            alignments=self._payload["alignments"],
-            basis=basis if self._review_state == "current" else None,
-        )
+        return _build_doc_term_groups(self._payload, report, review_state=self._review_state)
 
     def _group_status_label(self, group: dict) -> str:
         """The group header's status word. A saved result's basis is not the live
@@ -3633,11 +2565,9 @@ class ManuscriptView(QWidget):
             self.term_filter_combo.blockSignals(False)
 
             self.term_groups.blockSignals(True)
-            self.term_groups.clear()
+            group_rows: list[ReviewRow] = []
             if report is not None and total > 0:
                 for group in self._term_groups_data:
-                    # A filter shows a group that holds a place in that state,
-                    # whatever the group's own status is (``group_matches_filter``).
                     if not sr.group_matches_filter(group, self._term_filter):
                         continue
                     header_text = strings.MANUSCRIPT_TERM_GROUP_HEADER.format(
@@ -3647,24 +2577,24 @@ class ManuscriptView(QWidget):
                         distribution=group["distribution_text"],
                     )
                     if group.get("saved_count"):
-                        # The results come from the file, not from this session: the
-                        # header says so and never reads as 已核 before the check.
                         header_text += "\n" + strings.MANUSCRIPT_TERM_SAVED_NOTE
                     if group["unverified_segments"]:
-                        # Places the group does not hold yet: the header says so
-                        # rather than counting a manuscript as settled.
                         header_text += "\n" + strings.MANUSCRIPT_TERM_GROUP_UNVERIFIED.format(
                             count=len(group["unverified_segments"]),
                             segments="、".join(f"#{n}" for n in group["unverified_segments"]),
                         )
-                    header_item = QListWidgetItem(header_text)
-                    review_states.mark(header_item, review_states.for_group(
-                        group["status"], saved=bool(group.get("saved_count"))))
-                    header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    header_item.setData(Qt.ItemDataRole.UserRole, None)
-                    first_occ_row = self.term_groups.count() + 1
-                    header_item.setData(Qt.ItemDataRole.UserRole + 1, first_occ_row)
-                    self.term_groups.addItem(header_item)
+                    first_occ_row = len(group_rows) + 1
+                    group_rows.append(
+                        ReviewRow(
+                            text=header_text,
+                            state=review_states.for_group(
+                                group["status"], saved=bool(group.get("saved_count"))
+                            ),
+                            user_data=None,
+                            aux_data=first_occ_row,
+                            selectable=False,
+                        )
+                    )
 
                     for occ in group["occurrences"]:
                         summary_parts = []
@@ -3691,19 +2621,25 @@ class ManuscriptView(QWidget):
                             source_context=occ["source_context"],
                             target_context=occ["target_context"],
                         )
-                        occ_item = QListWidgetItem(row_text)
-                        occ_item.setData(Qt.ItemDataRole.UserRole, occ["finding_index"])
-                        occ_item.setToolTip(
-                            strings.MANUSCRIPT_TERM_OCCURRENCE_TOOLTIP.format(
-                                segment=occ["segment_number"],
-                                summary=summary_str,
-                                source_context=occ["source_context"],
-                                target_context=occ["target_context"],
+                        tooltip = strings.MANUSCRIPT_TERM_OCCURRENCE_TOOLTIP.format(
+                            segment=occ["segment_number"],
+                            summary=summary_str,
+                            source_context=occ["source_context"],
+                            target_context=occ["target_context"],
+                        )
+                        group_rows.append(
+                            ReviewRow(
+                                text=row_text,
+                                state=review_states.for_verdict(
+                                    occ["verdict"],
+                                    saved=occ["freshness"] == "saved",
+                                    recheck=occ["freshness"] == "stale",
+                                ),
+                                tooltip=tooltip,
+                                user_data=occ["finding_index"],
                             )
                         )
-                        review_states.mark(occ_item, review_states.for_verdict(
-                            occ["verdict"], saved=occ["freshness"] == "saved", recheck=occ["freshness"] == "stale"))
-                        self.term_groups.addItem(occ_item)
+            self.term_groups.set_rows(group_rows)
             self.term_groups.blockSignals(False)
 
             for i in range(self.findings.count()):
@@ -3996,11 +2932,14 @@ class ManuscriptView(QWidget):
         self.ambiguous_toggle.setVisible(bool(count))
         row = self.ambiguous_list.currentRow()
         self.ambiguous_list.blockSignals(True)
-        self.ambiguous_list.clear()
-        for index, (finding, ref) in enumerate(items):
-            self.ambiguous_list.addItem(self._ambiguous_row_text(finding, ref))
-            review_states.mark(self.ambiguous_list.item(index), review_states.UNEVALUATED,
-                               label=strings.MANUSCRIPT_VERDICT_NOT_EVALUATED)
+        self.ambiguous_list.set_rows([
+            ReviewRow(
+                text=self._ambiguous_row_text(finding, ref),
+                state=review_states.UNEVALUATED,
+                state_label=strings.MANUSCRIPT_VERDICT_NOT_EVALUATED,
+            )
+            for finding, ref in items
+        ])
         self.ambiguous_list.setCurrentRow(row if 0 <= row < count else (0 if count else -1))
         self.ambiguous_list.blockSignals(False)
         self.ambiguous_area.setVisible(bool(count) and expanded)
@@ -4383,7 +3322,7 @@ class ManuscriptView(QWidget):
 
     @staticmethod
     def _has_recovery_content(payload: dict) -> bool:
-        return any(bool(payload.get(k)) for k in ("source", "target", "choices", "history", "semantic_decisions"))
+        return has_recovery_content(payload)
 
     def _check_startup_recovery(self) -> None:
         if self._recovery_path is None:
@@ -4467,11 +3406,7 @@ class ManuscriptView(QWidget):
         self._recovery_timer.stop()
         if self.document_dirty and self._has_recovery_content(self._payload):
             try:
-                snapshot = _copy_payload(self._payload)
-                if snapshot.get("semantic_decisions") or snapshot.get("semantic_history"):
-                    snapshot.setdefault("semantic_history", [])
-                    snapshot["semantic_texts"] = self._controller.semantic_texts(snapshot)
-                    _normalize_semantic(snapshot)
+                snapshot = prepare_recovery_snapshot(self._payload, self._controller.semantic_texts)
                 save_recovery(self._recovery_path, snapshot, source_path=self._path,
                               alignment_invalidations=self._controller.alignment_invalidations)
             except (OSError, WorkfileError):
@@ -4507,15 +3442,9 @@ class ManuscriptView(QWidget):
         self._stop_translation()
         self._clear_semantic()
         self._capabilities = None
-        self._service_meta = None
-        self._live_review_dictionary = None
-        self._forget_service_dictionary()
-        self._controller.live_dictionary_identity = None
-        self._controller.identity_probe_state = None
+        self._controller.provenance.reset_for_endpoint_change()
         # Another service: its basis is unknown until its first check.
         self._reset_term_session(self._segment_cursor)
-        self._refresh_tm_panel()
-        self.workbenchStatusChanged.emit()
         self.status_label.setText(strings.MANUSCRIPT_ENDPOINT_CHANGED)
         self._update_controls()
 
@@ -4620,7 +3549,7 @@ class ManuscriptView(QWidget):
         self._finding_saved = list(saved or [False] * len(report["findings"]))
         self._set_review_state(state, request_id=report["request_id"])
         self.findings.blockSignals(True)
-        self.findings.clear()
+        finding_rows: list[ReviewRow] = []
         for index, finding in enumerate(report["findings"]):
             source_span = finding.get("source_span") or {}
             target_span = finding.get("target_span") or {}
@@ -4630,8 +3559,6 @@ class ManuscriptView(QWidget):
                 finding.get("reason") if finding["verdict"] == "not_evaluated" else None,
             )
             if self._finding_saved[index]:
-                # A saved result is not this session's verification: the row says
-                # that instead of naming a verdict it cannot vouch for.
                 verdict = strings.MANUSCRIPT_TERM_SAVED_NOTE
             second_line = f"{target_text} · {verdict}" if target_text else verdict
             choice = self._choice_at(index)
@@ -4640,9 +3567,17 @@ class ManuscriptView(QWidget):
                                         else strings.MANUSCRIPT_FINDING_RECONFIRM)
             if self._finding_recheck[index]:
                 second_line += " · " + strings.MANUSCRIPT_FINDING_RECHECK
-            self.findings.addItem(f'{source_span.get("text", "")}\n{second_line}')
-            review_states.mark(self.findings.item(index), review_states.for_verdict(
-                finding["verdict"], saved=self._finding_saved[index], recheck=self._finding_recheck[index]))
+            finding_rows.append(
+                ReviewRow(
+                    text=f'{source_span.get("text", "")}\n{second_line}',
+                    state=review_states.for_verdict(
+                        finding["verdict"],
+                        saved=self._finding_saved[index],
+                        recheck=self._finding_recheck[index],
+                    ),
+                )
+            )
+        self.findings.set_rows(finding_rows)
         self.findings.blockSignals(False)
 
         if refs is not None:
@@ -4986,286 +3921,53 @@ class ManuscriptView(QWidget):
 
     def set_service_meta(self, meta: MetaResult | None) -> None:
         """Update the live service metadata from ``GET /v1/meta``."""
-        if meta is None:
-            changed = (
-                self._service_meta is not None
-                or self._live_review_dictionary is not None
-                or self._service_dictionary is not None
-            )
-            self._service_meta = None
-            self._live_review_dictionary = None
-            changed = self._forget_service_dictionary() or changed
-            if changed:
-                self._refresh_tm_panel()
-                self.workbenchStatusChanged.emit()
-            return
-        previous_meta = self._service_meta
-        changed = previous_meta != meta
-        if changed:
-            # A service can be upgraded in place. What it lists is part of this
-            # refresh's question, so the answer from the previous meta is not
-            # reused for it.
+        outcome = self._controller.provenance.set_service_meta(meta)
+        if outcome.reset_capabilities:
             self._capabilities = None
-        self._service_meta = meta
-        review_mismatch = (
-            self._live_review_dictionary is not None
-            and not _dictionary_matches_meta(self._live_review_dictionary, meta)
-        )
-        if review_mismatch:
-            self._live_review_dictionary = None
-            changed = True
-        identity = self._service_dictionary
-        identity_mismatch = identity is not None and not _identity_matches_meta(identity, meta)
-        if identity_mismatch:
-            # The fresh meta names a different dictionary state than the identity
-            # does: the identity describes the dictionary that was served before
-            # this refresh. Dropped here rather than kept until the identity is
-            # fetched again, because a 翻译 pressed in between would reuse
-            # entries confirmed under the previous dictionary. Unknown is the
-            # safe answer, and unknown reuses nothing.
-            changed = self._forget_service_dictionary() or changed
-        elif review_mismatch or (
-            previous_meta is not None
-            and (
-                previous_meta.schema_version != meta.schema_version
-                or previous_meta.source_commit != meta.source_commit
-                or previous_meta.term_count != meta.term_count
-                or _normalized_game_version(previous_meta.source_game_version)
-                != _normalized_game_version(meta.source_game_version)
-            )
-        ):
-            self._retire_dictionary_requests()
-        if changed:
-            self._refresh_tm_panel()
-            self.workbenchStatusChanged.emit()
 
     def _retire_dictionary_requests(self) -> None:
-        """Make every pending identity answer older than this decision.
-
-        Called wherever the statement is decided without an answer - a cleared or
-        refused `/v1/meta`, a review that contradicts it, another address, a new
-        credential - and by a clear. The request ordinal moves even when there was
-        no cached statement to drop, because the point is the *pending* answers:
-        an answer asked about the service before this decision must not be
-        installed after it.
-        """
-        self._dictionary_request_seq += 1
-        self._applied_dictionary_seq = self._dictionary_request_seq
+        self._controller.provenance.retire_requests()
 
     def begin_dictionary_identity_request(self) -> int:
-        """Reserve the next request ordinal for an identity request.
-
-        The caller passes it back with the answer. Two requests are ordered by
-        when they were *asked*, so an answer that arrives out of order cannot
-        overwrite a newer request's answer - only a newer request can.
-        """
-        self._dictionary_request_seq += 1
-        return self._dictionary_request_seq
+        return self._controller.provenance.begin_identity_request()
 
     def apply_dictionary_identity(
         self, identity: "DictionaryIdentityResult | None", *, seq: int | None = None
     ) -> bool:
-        """Install an identity answer unless a newer request already decided it.
-
-        ``seq`` is the ordinal ``begin_dictionary_identity_request`` handed out
-        when this request started. An answer from an older request than one
-        already applied is refused and reports False, so the caller can classify
-        it as superseded instead of believing it installed anything.
-        """
-        if seq is not None and seq < self._applied_dictionary_seq:
-            return False
-        self._applied_dictionary_seq = max(
-            self._applied_dictionary_seq,
-            self._dictionary_request_seq if seq is None else seq,
-        )
-        self._write_service_dictionary(identity)
-        return True
+        return self._controller.provenance.apply_identity(identity, seq=seq)
 
     def _forget_service_dictionary(self) -> bool:
-        """Drop the live identity statement and retire every pending request."""
-        self._retire_dictionary_requests()
-        if self._service_dictionary is None:
-            return False
-        self._service_dictionary = None
-        return True
+        return self._controller.provenance.forget_service_dictionary()
 
     def set_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
-        """Update the live dictionary identity from ``GET /v1/dictionary``.
-
-        ``None`` clears it: the identity describes the dictionary the service
-        was serving, so a failed request, an older server, or another address
-        leaves this workbench with no authoritative revision rather than with
-        the previous one. That is the fail-closed direction - an unknown
-        revision reuses nothing.
-
-        A live review dictionary that names a *different* revision belongs to
-        a dictionary this service no longer serves. It is dropped here (and a
-        non-destructive refresh is requested), because keeping either value
-        would state a provenance the other endpoint contradicts.
-        """
-        self.apply_dictionary_identity(identity, seq=self.begin_dictionary_identity_request())
+        self._controller.provenance.set_service_dictionary(identity)
 
     def _write_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
-        """Put one identity in place and render what follows from it."""
-        if identity is self._service_dictionary or identity == self._service_dictionary:
-            return
-        self._service_dictionary = identity
-        if identity is not None:
-            self._drop_conflicting_review_dictionary(identity.revision)
-        self._refresh_tm_panel()
-        self.workbenchStatusChanged.emit()
+        self._controller.provenance._write_service_dictionary(identity)
 
     def clear_live_provenance(self, *, seq: int | None = None) -> bool:
-        """Forget both live statements about the served dictionary.
-
-        The identity and this session's review dictionary each name a
-        dictionary. When a request meant to confirm one of them fails, neither
-        is knowledge any more: a run must fall back to no revision rather than
-        to whichever of the two is older.
-
-        ``seq`` is the ordinal of the request that failed. An answer from an
-        older request than one already applied never clears anything (returns
-        False). Otherwise both caches are cleared: a sequenced failure advances
-        ``_applied_dictionary_seq`` to at least ``seq`` without retiring newer
-        in-flight requests, while an unsequenced clear (``seq is None``)
-        unconditionally retires every pending request.
-        """
-        if seq is not None and seq < self._applied_dictionary_seq:
-            return False
-        if seq is None:
-            self._retire_dictionary_requests()
-        else:
-            self._applied_dictionary_seq = max(self._applied_dictionary_seq, seq)
-        self._service_dictionary = None
-        self._live_review_dictionary = None
-        self._refresh_tm_panel()
-        self.workbenchStatusChanged.emit()
-        return True
+        return self._controller.provenance.clear_live_provenance(seq=seq)
 
     def _drop_conflicting_review_dictionary(self, revision: str | None) -> bool:
-        """Forget a live review dictionary whose revision the identity contradicts.
-
-        Returns whether anything was dropped. The identity is the served
-        dictionary and a review dictionary is the snapshot one review ran
-        against, so when they disagree the review's basis is stale: every
-        entry confirmed under it is classified known-stale rather than reused.
-        """
-        dictionary = self._live_review_dictionary
-        if not isinstance(dictionary, dict) or revision is None:
-            return False
-        recorded = tm.normalize_provenance_value(dictionary.get("revision"))
-        if recorded is None or recorded == revision:
-            return False
-        self._live_review_dictionary = None
-        self.serviceMetaRefreshRequested.emit()
-        return True
+        return self._controller.provenance._drop_conflicting_review_dictionary(revision)
 
     def _record_live_review_dictionary(self, dictionary: Mapping[str, Any] | None) -> None:
-        """Record the dictionary metadata returned by a live ``POST /v1/reviews``
-        call in this session against the active endpoint."""
-        if not isinstance(dictionary, Mapping):
-            return
-        recorded = copy.deepcopy(dict(dictionary))
-        # The revision conflict is checked FIRST. A review that reports both a new
-        # revision and a new metadata tuple would otherwise leave through the
-        # metadata branch below with the contradicted identity still installed.
-        identity = self._service_dictionary
-        if identity is not None:
-            review_revision = tm.normalize_provenance_value(recorded.get("revision"))
-            if review_revision is not None and review_revision != identity.revision:
-                # A review is served by the same process as the identity but
-                # happens LATER, so this answer describes a dictionary the
-                # cached identity no longer matches - and the identity may be
-                # the superseded one. Neither statement is kept: reuse stays off
-                # (unknown revision) until a refresh says which dictionary is
-                # served now. Keeping the identity here would let 翻译 reuse
-                # entries confirmed under a dictionary the service replaced.
-                self._live_review_dictionary = None
-                self._forget_service_dictionary()
-                self.serviceMetaRefreshRequested.emit()
-                self._refresh_tm_panel()
-                self.workbenchStatusChanged.emit()
-                return
-        if (
-            self._service_meta is not None
-            and not _dictionary_matches_meta(recorded, self._service_meta)
-        ):
-            # Do not discard or downgrade known _service_meta and do not adopt
-            # a stale/conflicting review dictionary; trigger a non-destructive
-            # silent /v1/meta check while keeping auto reuse paused.
-            self._live_review_dictionary = None
-            self._retire_dictionary_requests()
-            self.serviceMetaRefreshRequested.emit()
-            self._refresh_tm_panel()
-            self.workbenchStatusChanged.emit()
-            return
-        self._live_review_dictionary = recorded
-        self._refresh_tm_panel()
-        self.workbenchStatusChanged.emit()
+        self._controller.provenance.record_live_review_dictionary(dictionary)
 
     def reset_for_credential_change(self) -> None:
         """Clear live service provenance and advance both review generations so
         in-flight requests issued under the previous credential cannot commit."""
-        self._service_meta = None
-        self._live_review_dictionary = None
-        self._forget_service_dictionary()
+        self._controller.provenance.reset_for_credential_change()
         self._controller.invalidate_provenance_for_credential_change()
         if self._review_state == "reviewing":
             self._set_review_state("stopped")
-        self._refresh_tm_panel()
-        self.workbenchStatusChanged.emit()
         self._update_controls()
 
     def _terms_db_revision(self) -> str | None:
-        """The verified live dictionary revision.
-
-        The authoritative ``GET /v1/dictionary`` identity wins when it is
-        known: it is the dictionary the service serves now, so no review and no
-        `/v1/meta` provenance tuple is needed to state it - and unlike
-        ``(schema_version, source_commit, term_count)`` it changes whenever an
-        entry does (ADR 0023). A live review dictionary recorded against a
-        different revision is a conflict, dropped here.
-
-        Without an identity the older path is unchanged: the revision from this
-        session's ``/v1/reviews``, checked against live ``/v1/meta`` when
-        available. Never treats historical ``.wuwaterm`` report/basis state on
-        disk as the currently running service's dictionary revision.
-        """
-        identity = self._service_dictionary
-        if identity is not None:
-            self._drop_conflicting_review_dictionary(identity.revision)
-            return tm.normalize_provenance_value(identity.revision)
-        dictionary = self._live_review_dictionary
-        if not isinstance(dictionary, dict):
-            return None
-        if self._service_meta is not None and not _dictionary_matches_meta(dictionary, self._service_meta):
-            return None
-        return tm.normalize_provenance_value(dictionary.get("revision"))
+        return self._controller.provenance.terms_db_revision()
 
     def _game_version(self) -> str | None:
-        """The live game version: the dictionary identity's own
-        ``source_game_version`` first, then ``/v1/meta``, then explicit
-        ``game_version`` / ``source_game_version`` from a live review dictionary.
-
-        Never substitutes ``source_commit`` for ``game_version``, and never
-        reads historical ``.wuwaterm`` report/basis state.
-        """
-        identity = self._service_dictionary
-        if identity is not None:
-            # The identity describes the dictionary being served, so its game
-            # version is the one confirmed entries are compared with. A null
-            # there is "this dictionary states none", not "fall back to the
-            # older /v1/meta reading", which may belong to another dictionary.
-            return _normalized_game_version(identity.source_game_version)
-        if self._service_meta is not None:
-            return _normalized_game_version(self._service_meta.source_game_version)
-        dictionary = self._live_review_dictionary
-        if isinstance(dictionary, dict):
-            for key in ("game_version", "source_game_version"):
-                version = _normalized_game_version(dictionary.get(key))
-                if version is not None:
-                    return version
-        return None
+        return self._controller.provenance.game_version()
 
     def _active_segment_pair(self):
         """The segment the memory is read for: the selected row, else the caret's."""
@@ -5686,10 +4388,14 @@ class ManuscriptView(QWidget):
             self.conflict_label.setText(strings.MANUSCRIPT_HISTORY_FULL.format(
                 count=len(history), limit=MAX_SEGMENT_CHOICE_HISTORY))
             self.remove_choice_button.setText(strings.MANUSCRIPT_REMOVE_HISTORY_CHOICE)
-            self.conflict_list.clear()
-            for number, entry in enumerate(history, 1):
-                self.conflict_list.addItem(strings.MANUSCRIPT_HISTORY_ITEM.format(
-                    number=number, text=entry["source_span"]["text"], choice=self._describe_choice(entry)))
+            self.conflict_list.set_rows([
+                ReviewRow(
+                    text=strings.MANUSCRIPT_HISTORY_ITEM.format(
+                        number=number, text=entry["source_span"]["text"], choice=self._describe_choice(entry)
+                    )
+                )
+                for number, entry in enumerate(history, 1)
+            ])
             for widget in (self.conflict_label, self.conflict_list, self.remove_choice_button):
                 widget.setVisible(True)
             self.resolve_conflicts_save_button.setVisible(False)
@@ -5707,7 +4413,7 @@ class ManuscriptView(QWidget):
             _, remaining_duplicates = sanitize_duplicate_choices(self._payload)
         has_conflicts = self._conflict_mode and (bool(groups) or remaining_duplicates > 0)
         self._conflict_indexes = [index for group in groups for index in group]
-        self.conflict_list.clear()
+        conflict_rows: list[ReviewRow] = []
         for group_number, group in enumerate(groups, 1):
             for index in group:
                 choice = self._payload["choices"][index]
@@ -5718,9 +4424,15 @@ class ManuscriptView(QWidget):
                     decision = strings.MANUSCRIPT_CHOICE_OFFICIAL.format(**choice["candidate"])
                 context = choice["source"][max(0, start - 16):end + 16]
                 context = context.replace("\r\n", " ↵ ").replace("\n", " ↵ ").replace("\r", " ↵ ")
-                self.conflict_list.addItem(strings.MANUSCRIPT_CHOICE_ITEM.format(
-                    group=group_number, number=index + 1, decision=decision, context=context,
-                    start=start + 1, end=end))
+                conflict_rows.append(
+                    ReviewRow(
+                        text=strings.MANUSCRIPT_CHOICE_ITEM.format(
+                            group=group_number, number=index + 1, decision=decision, context=context,
+                            start=start + 1, end=end,
+                        )
+                    )
+                )
+        self.conflict_list.set_rows(conflict_rows)
         self.conflict_label.setVisible(has_conflicts)
         self.conflict_list.setVisible(bool(groups))
         self.remove_choice_button.setVisible(bool(groups))
@@ -5774,24 +4486,8 @@ class ManuscriptView(QWidget):
         if self._path is not None and destination.resolve() == self._path.resolve():
             self.status_label.setText(strings.MANUSCRIPT_EXPORT_PROSE_OVER_MANUSCRIPT)
             return False
-        source_text = self._payload["source"]
-        target_text = self._payload["target"]
-        sections = [source_text]
-        if target_text:
-            sections.append(f"---\n\n{target_text}")
-        content = ("\n\n".join(sections)).encode("utf-8")
         try:
-            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-            try:
-                with os.fdopen(fd, "wb") as file:
-                    file.write(content)
-                os.replace(temporary, destination)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
-                raise
+            atomic_write_bytes(destination, build_prose_export(self._payload))
         except OSError as exc:
             self.status_label.setText(strings.MANUSCRIPT_EXPORT_PROSE_FAILED.format(reason=str(exc)))
             return False
@@ -5832,10 +4528,10 @@ class ManuscriptView(QWidget):
         payload = self._payload
         parts = sr.parts_of(payload)
         cursor = self._segment_cursor
-        if parts.segments and cursor is not None and 0 <= cursor < len(parts.segments):
-            payload = sr.with_parts(payload, sr.set_current(parts, cursor))
         try:
-            save_workfile(path, payload)
+            written, adopted_parts, features = save_manuscript_file(
+                path, payload, segment_cursor=cursor, writer=save_workfile
+            )
         except WorkfileError as exc:
             if exc.code == "workfile_duplicate_choices":
                 self._conflict_mode = True
@@ -5850,28 +4546,22 @@ class ManuscriptView(QWidget):
         except OSError as exc:
             self.status_label.setText(strings.MANUSCRIPT_SAVE_FAILED.format(reason=str(exc)))
             return False
-        if payload is not self._payload:
-            self._put_parts(sr.parts_of(payload))
-        # Hold exactly what was written: the writer may have dropped history to
-        # fit 1 MiB (possibly falling back to v1) and unneeded old texts.
-        written = parse_workfile(serialize_workfile(self._payload))
+        if parts.segments and cursor is not None and 0 <= cursor < len(parts.segments):
+            self._put_parts(sr.set_current(parts, cursor))
         for key in ("semantic_decisions", "semantic_texts", "semantic_history"):
             if key in written:
                 self._payload[key] = written[key]
             else:
                 self._payload.pop(key, None)
-        # The review features the file records are now the manuscript's own.
-        parts, features = sr.adopt_file_features(self._payload, written.get("review_features") or ())
         if features:
             self._payload["review_features"] = list(features)
         else:
             self._payload.pop("review_features", None)
-        if parts.segments is not sr.parts_of(self._payload).segments:
-            self._put_parts(parts)
+        if adopted_parts.segments is not sr.parts_of(self._payload).segments:
+            self._put_parts(adopted_parts)
         self._conflict_mode = False
         self._refresh_conflicts()
-        self._path = path
-        self._saved_payload = _copy_payload(self._payload)
+        self._workspace.mark_saved(path, self._payload)
         self._recovery_pending = False
         self._recovery_timer.stop()
         self._clear_recovery_draft()
@@ -5994,101 +4684,23 @@ class ManuscriptView(QWidget):
     # -- report export ----------------------------------------------------------
     def _report_input(self) -> dict:
         """What the Markdown report shows, with the Web export's meanings."""
-        payload = self._payload
-        source, target, direction = payload["source"], payload["target"], payload["direction"]
-
-        def snapshot(entry: dict | None) -> dict | None:
-            if entry is None:
-                return None
-            return {**entry, "resolutions": entry.get("resolutions"),
-                    "trusted": any(entry == own for own in self._session_snapshots)}
-        # A long manuscript's result is its segment reports (the Web export's
-        # rule): a document report left from an earlier, shorter text is not
-        # exported, and the result is current only when every segment is
-        # ready and every record current.
-        long = self._long_now()
-        history = [] if long else payload["history"]
-        latest = snapshot(history[-1] if history else None)
-        previous = snapshot(history[-2] if len(history) > 1 else None)
-        # The Web's rule: checked in this session, for exactly this text, and
-        # the workbench still holds it as the current report (an endpoint
-        # change or a failed re-review ends that, though the text is the same).
-        current = bool(latest and latest["trusted"] and self._review_state == "current"
-                       and latest["source"] == source and latest["target"] == target
-                       and latest["direction"] == direction and latest["alignments"] == payload["alignments"])
-        currency = "none" if latest is None else "current" if current else "stale" if latest["trusted"] else "imported"
-        draft = {"source": source, "target": target, "direction": direction, "alignments": payload["alignments"]}
-        segment_terms = None
-        records = self._records()
-        if records is not None:
-            segment_terms = []
-            for index, record in enumerate(records):
-                state = self._term_state(record)
-                if record["result"] is None and not record["choices"]:
-                    continue
-                findings = []
-                if record["result"] is not None:
-                    for finding in sr.expand_result(record, source, target)["findings"]:
-                        exported_finding: dict = {
-                            "verdict": finding["verdict"],
-                            "source_span": _offset(finding["source_span"], record["source_start"]),
-                            "target_span": _offset(finding["target_span"], record["target_start"]),
-                            "candidates": [{"zh": c["zh"], "en": c["en"]} for c in finding["candidates"]],
-                            "candidates_truncated": finding["candidates_truncated"] is True,
-                        }
-                        if "reason" in finding:
-                            exported_finding["reason"] = finding["reason"]
-                        findings.append(exported_finding)
-                choices = [{**choice, "source_span": _offset(choice["source_span"], record["source_start"])}
-                           for choice in record["choices"]]
-                # Truncation goes with the row, so an export never reads complete
-                # when findings or candidates were left out.
-                truncated = record["result"] is not None and record["result"]["truncated"] is True
-                segment_terms.append({"index": index, "state": state, "stale": state != "current",
-                                      "truncated": truncated, "findings": findings, "choices": choices})
-        semantic_part = None
-        issues = self._session.issues()
-        if issues or self._decisions():
-            statuses = {"needs_reconfirm": "needs_reconfirmation", "ignored_carried": "ignored"}
-            items = []
-            for issue in issues:
-                raw = issue.issue
-                state = self._issue_state(issue)
-                items.append({"issue_id": raw["id"], "category": raw["category"], "confidence": raw["confidence"],
-                              "segment_index": raw.get("segment_index"), "source_excerpt": raw.get("source_excerpt"),
-                              "target_excerpt": raw.get("target_excerpt"), "rationale": raw["rationale"],
-                              "suggestion": raw["suggestion"]["replacement"] if raw.get("suggestion") else None,
-                              "suggestion_withheld": raw.get("suggestion_withheld"),
-                              "status": statuses.get(state, state)})
-            ready = [pair for pair in self._current_pairs() if pair.status == STATUS_READY]
-            reviewed = sum(1 for pair in ready if (result := self._session.result_for(pair, source, target)) is not None
-                           and result.report is not None)
-            semantic_part = {"items": items, "resolved": sum(1 for item in items
-                                                             if item["status"] in ("accepted", "adjusted", "ignored")),
-                             "segments": {"total": len(ready), "reviewed": reviewed}}
-        if long:
-            records = records or []
-            if not any(record["result"] is not None for record in records):
-                currency = "none"
-            elif (all(pair.status == STATUS_READY for pair in self._current_pairs())
-                  and all(self._term_state(record) == "current" for record in records)):
-                currency = "current"
-            else:
-                currency = "stale"
-        return {
-            "draft": draft, "latest": latest, "previous": previous, "currency": currency,
-            "choices": payload["choices"],
-            # This session's own choices (an ambiguous name adopted or marked an
-            # ordinary word) are the ones a document check sends.
-            "reconciled": mdr.reconcile_choices(payload["choices"], draft, latest,
-                                                own=self._controller.is_session_choice),
-            "comparison": mdr.compare_reports(previous, latest) if latest and previous else None,
-            "semantic": semantic_part, "segment_terms": segment_terms,
-            "segment_choice_history": len(payload.get("segment_choice_history") or []),
-        }
+        return build_report_input(
+            payload=self._payload,
+            review_state=self._review_state,
+            session_snapshots=self._session_snapshots,
+            long_mode=self._long_now(),
+            records=self._records(),
+            term_state_fn=self._term_state,
+            issues=self._session.issues(),
+            decisions=self._decisions(),
+            issue_state_fn=self._issue_state,
+            pairs=self._current_pairs(),
+            session_result_for=self._session.result_for,
+            is_session_choice=self._controller.is_session_choice,
+        )
 
     def report_markdown(self) -> str:
-        return mdr.render(self._report_input())
+        return render_report_markdown(self._report_input())
 
     def export_report(self, _checked: bool = False) -> bool:
         """Write the Markdown report: a read-only snapshot, not a manuscript.
@@ -6102,361 +4714,98 @@ class ManuscriptView(QWidget):
             return False
         destination = Path(name)
         if self._path is not None and destination.resolve() == self._path.resolve():
-            # A report is not a manuscript: never replace the open one with it.
             self.status_label.setText(strings.MANUSCRIPT_EXPORT_OVER_MANUSCRIPT)
             return False
-        content = self.report_markdown().encode("utf-8")
         try:
-            fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-            try:
-                with os.fdopen(fd, "wb") as file:
-                    file.write(content)
-                os.replace(temporary, destination)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
-                raise
+            atomic_write_bytes(destination, self.report_markdown().encode("utf-8"))
         except OSError as exc:
             self.status_label.setText(strings.MANUSCRIPT_EXPORT_FAILED.format(reason=str(exc)))
             return False
         self.status_label.setText(strings.MANUSCRIPT_EXPORT_DONE)
         return True
 
+    @property
+    def _suppress_find_refresh(self) -> bool:
+        return self.find_bar.suppress_refresh if hasattr(self, "find_bar") else False
+
+    @_suppress_find_refresh.setter
+    def _suppress_find_refresh(self, value: bool) -> None:
+        if hasattr(self, "find_bar"):
+            self.find_bar.suppress_refresh = value
+
     def _build_find_bar(self) -> None:
-        """Collapsible in-editor Find & Replace bar (Ctrl+F / Ctrl+H)."""
-        bar = QFrame(self)
-        bar.setObjectName("workbenchToolbar")
-        bar.hide()
+        bar = FindReplaceBar(
+            self,
+            search_controller=self._search_controller,
+            get_payload=lambda: self._payload,
+            get_editor=lambda side: self.target_edit if side == "target" else self.source_edit,
+            get_last_side=lambda: self._last_side,
+            get_segment_context=self._find_segment_context,
+            get_caret_offset=lambda side: (
+                self.target_edit if side == "target" else self.source_edit
+            ).raw_cursor_offset(),
+            is_composing=lambda: self.source_edit._ime_active or self.target_edit._ime_active,
+            is_input_ready=self._input_ready,
+            suspend_scroll_sync=self.scroll_sync.suspended,
+            set_status=self.status_label.setText,
+            draft_snapshot=self._draft_snapshot,
+            apply_edit=self._apply_edit,
+        )
         self.find_bar = bar
-        outer = QVBoxLayout(bar)
-        outer.setContentsMargins(10, 6, 10, 6)
-        outer.setSpacing(6)
-
-        find_row = QHBoxLayout()
-        find_row.setContentsMargins(0, 0, 0, 0)
-        find_row.setSpacing(6)
-
-        self.find_query_edit = QLineEdit(bar)
-        self.find_query_edit.setObjectName("searchField")
-        self.find_query_edit.setPlaceholderText(strings.FIND_BAR_QUERY_PLACEHOLDER)
-        self.find_query_edit.setAccessibleName(strings.FIND_BAR_QUERY_LABEL)
-        self.find_query_edit.textChanged.connect(lambda _t: self._refresh_find_matches(preserve_current=False))
-
-        self.find_side_combo = ChevronComboBox(bar)
-        self.find_side_combo.addItem(strings.FIND_BAR_SIDE_TARGET, "target")
-        self.find_side_combo.addItem(strings.FIND_BAR_SIDE_SOURCE, "source")
-        self.find_side_combo.setAccessibleName(strings.FIND_BAR_SIDE_LABEL)
-        self.find_side_combo.currentIndexChanged.connect(lambda _i: self._refresh_find_matches(preserve_current=False))
-
-        self.find_case_check = QCheckBox(strings.FIND_BAR_CASE_SENSITIVE, bar)
-        self.find_case_check.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_case_check.toggled.connect(lambda _c: self._refresh_find_matches(preserve_current=False))
-
-        self.find_scope_check = QCheckBox(strings.FIND_BAR_SCOPE_SEGMENT, bar)
-        self.find_scope_check.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_scope_check.toggled.connect(lambda _c: self._refresh_find_matches(preserve_current=False))
-
-        self.find_count_label = QLabel(strings.FIND_BAR_COUNT_NONE, bar)
-        self.find_count_label.setObjectName("secondaryText")
-
-        self.find_prev_button = QPushButton(bar)
-        self.find_prev_button.setObjectName("commandButton")
-        self.find_prev_button.setIcon(icon("chevron-up"))
-        self.find_prev_button.setIconSize(QSize(16, 16))
-        self.find_prev_button.setFixedWidth(34)
-        self.find_prev_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_prev_button.setToolTip(strings.FIND_BAR_PREV)
-        self.find_prev_button.setAccessibleName(strings.FIND_BAR_PREV)
-        self.find_prev_button.clicked.connect(self._find_prev)
-
-        self.find_next_button = QPushButton(bar)
-        self.find_next_button.setObjectName("commandButton")
-        self.find_next_button.setIcon(icon("chevron-down"))
-        self.find_next_button.setIconSize(QSize(16, 16))
-        self.find_next_button.setFixedWidth(34)
-        self.find_next_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_next_button.setToolTip(strings.FIND_BAR_NEXT)
-        self.find_next_button.setAccessibleName(strings.FIND_BAR_NEXT)
-        self.find_next_button.clicked.connect(self._find_next)
-
-        self.find_replace_toggle = QPushButton(strings.FIND_BAR_TOGGLE_REPLACE, bar)
-        self.find_replace_toggle.setObjectName("commandButton")
-        self.find_replace_toggle.setCheckable(True)
-        self.find_replace_toggle.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_replace_toggle.toggled.connect(self._set_find_replace_visible)
-
-        self.find_close_button = QPushButton(bar)
-        self.find_close_button.setObjectName("commandButton")
-        self.find_close_button.setIcon(icon("x"))
-        self.find_close_button.setIconSize(QSize(16, 16))
-        self.find_close_button.setFixedWidth(34)
-        self.find_close_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_close_button.setToolTip(strings.FIND_BAR_CLOSE)
-        self.find_close_button.setAccessibleName(strings.FIND_BAR_CLOSE)
-        self.find_close_button.clicked.connect(lambda: self._close_find_bar())
-
-        find_row.addWidget(self.find_query_edit, 1)
-        find_row.addWidget(self.find_side_combo)
-        find_row.addWidget(self.find_case_check)
-        find_row.addWidget(self.find_scope_check)
-        find_row.addWidget(self.find_count_label)
-        find_row.addWidget(self.find_prev_button)
-        find_row.addWidget(self.find_next_button)
-        find_row.addWidget(self.find_replace_toggle)
-        find_row.addWidget(self.find_close_button)
-        outer.addLayout(find_row)
-
-        self.find_replace_row = QWidget(bar)
-        self.find_replace_row.setObjectName("inspectorBody")
-        replace_layout = QHBoxLayout(self.find_replace_row)
-        replace_layout.setContentsMargins(0, 0, 0, 0)
-        replace_layout.setSpacing(6)
-
-        self.find_replace_edit = QLineEdit(self.find_replace_row)
-        self.find_replace_edit.setPlaceholderText(strings.FIND_BAR_REPLACE_PLACEHOLDER)
-        self.find_replace_edit.setAccessibleName(strings.FIND_BAR_REPLACE_LABEL)
-        self.find_replace_edit.returnPressed.connect(self._find_replace_current)
-
-        self.find_replace_one_button = QPushButton(strings.FIND_BAR_REPLACE_ONE, self.find_replace_row)
-        self.find_replace_one_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_replace_one_button.clicked.connect(self._find_replace_current)
-
-        self.find_replace_segment_button = QPushButton(strings.FIND_BAR_REPLACE_SEGMENT, self.find_replace_row)
-        self.find_replace_segment_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.find_replace_segment_button.setToolTip(strings.FIND_BAR_REPLACE_SEGMENT_TOOLTIP)
-        self.find_replace_segment_button.clicked.connect(self._find_replace_in_segment)
-
-        replace_layout.addWidget(self.find_replace_edit, 1)
-        replace_layout.addWidget(self.find_replace_one_button)
-        replace_layout.addWidget(self.find_replace_segment_button)
-        self.find_replace_row.hide()
-        outer.addWidget(self.find_replace_row)
+        self.find_query_edit = bar.find_query_edit
+        self.find_side_combo = bar.find_side_combo
+        self.find_case_check = bar.find_case_check
+        self.find_scope_check = bar.find_scope_check
+        self.find_count_label = bar.find_count_label
+        self.find_prev_button = bar.find_prev_button
+        self.find_next_button = bar.find_next_button
+        self.find_replace_toggle = bar.find_replace_toggle
+        self.find_close_button = bar.find_close_button
+        self.find_replace_row = bar.find_replace_row
+        self.find_replace_edit = bar.find_replace_edit
+        self.find_replace_one_button = bar.find_replace_one_button
+        self.find_replace_segment_button = bar.find_replace_segment_button
 
     def _set_find_replace_visible(self, visible: bool) -> None:
-        self.find_replace_row.setVisible(visible)
-        self._update_find_controls()
+        self.find_bar.set_replace_visible(visible)
 
     def _find_segment_context(self, side: str, *, offset: int | None = None) -> tuple[list[tuple[int, int]], int | None]:
         pairs = self._current_pairs()
-        if not pairs:
-            return [], None
-        ranges = [(getattr(pair, side).core_start, getattr(pair, side).core_end) for pair in pairs]
-        resolved_offset = self._caret_offset(side) if offset is None else offset
-        seg_idx = self._pair_index_at(pairs, side, resolved_offset)
+        ranges = [
+            (pair.target.core_start, pair.target.core_end) if side == "target" else (pair.source.core_start, pair.source.core_end)
+            for pair in pairs
+        ]
+        editor = self.target_edit if side == "target" else self.source_edit
+        caret = editor.raw_cursor_offset() if offset is None else offset
+        seg_idx = self._pair_index_at(pairs, side, caret)
         return ranges, seg_idx
 
     def _open_find_bar(self, *, replace: bool = False) -> None:
-        if not self._input_ready():
-            return
-        if self.source_edit.hasFocus():
-            side = "source"
-        elif self.target_edit.hasFocus():
-            side = "target"
-        elif not self.find_bar.isVisible():
-            side = self._last_side
-        else:
-            side = self.find_side_combo.currentData() or self._last_side
-
-        selected = self._editor(side).selected_raw_text()
-        if selected and "\n" not in selected and "\r" not in selected:
-            self.find_query_edit.blockSignals(True)
-            self.find_query_edit.setText(selected)
-            self.find_query_edit.blockSignals(False)
-
-        side_idx = self.find_side_combo.findData(side)
-        if side_idx >= 0 and self.find_side_combo.currentIndex() != side_idx:
-            self.find_side_combo.blockSignals(True)
-            self.find_side_combo.setCurrentIndex(side_idx)
-            self.find_side_combo.blockSignals(False)
-
-        self.find_bar.show()
-        if replace:
-            self.find_replace_toggle.setChecked(True)
-        elif not self.find_replace_row.isVisible():
-            self.find_replace_toggle.setChecked(False)
-        self._refresh_find_matches(preserve_current=True)
-        self.find_query_edit.setFocus()
-        self.find_query_edit.selectAll()
+        self.find_bar.open_bar(replace=replace)
 
     def _close_find_bar(self, *, restore_focus: bool = True) -> None:
-        self.find_bar.hide()
-        self._search_controller.clear()
-        self.source_edit.setExtraSelections([])
-        self.target_edit.setExtraSelections([])
-        self.find_count_label.setText(strings.FIND_BAR_COUNT_NONE)
-        if restore_focus:
-            self._editor(self._last_side).setFocus()
+        self.find_bar.close_bar(restore_focus=restore_focus)
 
     def _refresh_find_matches(self, *, preserve_current: bool = True, cursor_offset: int | None = None) -> None:
-        side = self.find_side_combo.currentData() or "target"
-        ctrl = self._search_controller
-        ctrl.query = self.find_query_edit.text()
-        ctrl.replacement = self.find_replace_edit.text()
-        ctrl.side = side
-        ctrl.case_sensitive = self.find_case_check.isChecked()
-        ctrl.scope = "segment" if self.find_scope_check.isChecked() else "all"
-        anchor = self._caret_offset(side) if cursor_offset is None else cursor_offset
-        ranges, seg_idx = self._find_segment_context(side, offset=anchor)
-        ctrl.refresh(
-            self._payload[side],
-            segment_ranges=ranges,
-            scope_segment=seg_idx,
-            cursor_offset=anchor,
-            preserve_current=preserve_current,
-        )
-        self._highlight_find_match()
-        self._update_find_controls(seg_idx=seg_idx if ctrl.scope == "segment" else None)
+        self.find_bar.refresh_matches(preserve_current=preserve_current, cursor_offset=cursor_offset)
 
     def _highlight_find_match(self) -> None:
-        match = self._search_controller.current_match()
-        if match is None:
-            self.source_edit.setExtraSelections([])
-            self.target_edit.setExtraSelections([])
-            self.find_count_label.setText(strings.FIND_BAR_COUNT_NONE)
-            return
-        editor = self._editor(match.side)
-        other = self.target_edit if match.side == "source" else self.source_edit
-        other.setExtraSelections([])
-        with self.scroll_sync.suspended():
-            editor.select_raw_span(match.span(), move_cursor=True)
-            editor.ensureCursorVisible()
-        current = (self._search_controller.current_index or 0) + 1
-        self.find_count_label.setText(strings.FIND_BAR_COUNT.format(current=current, total=len(self._search_controller.matches)))
+        self.find_bar.highlight_match()
 
     def _update_find_controls(self, *, seg_idx: int | None = None) -> None:
-        composing = self.source_edit._ime_active or self.target_edit._ime_active
-        has_matches = bool(self._search_controller.matches)
-        side = self.find_side_combo.currentData() or "target"
-        ranges, resolved_seg_idx = self._find_segment_context(side)
-        if seg_idx is not None:
-            resolved_seg_idx = seg_idx
-        has_segment_match = False
-        if (
-            not composing
-            and self._search_controller.query
-            and resolved_seg_idx is not None
-            and 0 <= resolved_seg_idx < len(ranges)
-        ):
-            seg_start, seg_end = ranges[resolved_seg_idx]
-            has_segment_match = any(
-                seg_start <= m.start and m.end <= seg_end for m in self._search_controller.matches
-            )
-        self.find_prev_button.setEnabled(not composing and has_matches)
-        self.find_next_button.setEnabled(not composing and has_matches)
-        self.find_replace_one_button.setEnabled(not composing and self._search_controller.current_match() is not None)
-        self.find_replace_segment_button.setEnabled(not composing and has_segment_match)
+        self.find_bar.update_controls(seg_idx=seg_idx)
 
     def _find_next(self) -> None:
-        if not self.find_bar.isVisible():
-            return
-        if not self._search_controller.matches and self.find_query_edit.text():
-            self._refresh_find_matches(preserve_current=False)
-            return
-        side = self.find_side_combo.currentData() or "target"
-        self._search_controller.step(forward=True, cursor_offset=self._caret_offset(side))
-        self._highlight_find_match()
-        self._update_find_controls()
+        self.find_bar.find_next()
 
     def _find_prev(self) -> None:
-        if not self.find_bar.isVisible():
-            return
-        if not self._search_controller.matches and self.find_query_edit.text():
-            self._refresh_find_matches(preserve_current=False)
-            return
-        side = self.find_side_combo.currentData() or "target"
-        self._search_controller.step(forward=False, cursor_offset=self._caret_offset(side))
-        self._highlight_find_match()
-        self._update_find_controls()
+        self.find_bar.find_prev()
 
     def _find_replace_current(self) -> None:
-        if not self._input_ready():
-            return
-        match = self._search_controller.current_match()
-        if match is None:
-            self.status_label.setText(strings.FIND_BAR_NO_MATCH)
-            return
-        side = match.side
-        editor = self._editor(side)
-        raw = self._payload[side]
-        try:
-            result = self._search_controller.replace_current(raw, self.find_replace_edit.text())
-        except ValueError:
-            self._refresh_find_matches(preserve_current=False)
-            return
-        if result is None:
-            return
-        if result.text == raw:
-            editor.set_raw_cursor_offset(result.new_cursor_offset)
-            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
-            return
-        if not editor.can_display(result.text):
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            return
-        value = self._draft_snapshot()
-        value[side] = result.text
-        next_source = result.text if side == "source" else value["source"]
-        next_target = result.text if side == "target" else value["target"]
-        _, start, old_end, new_len = result.edit
-        remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
-        value["alignments"] = remap.alignments
-        self._suppress_find_refresh = True
-        try:
-            self._apply_edit(value, edits=[result.edit], remap=remap)
-        finally:
-            self._suppress_find_refresh = False
-        editor.set_raw_cursor_offset(result.new_cursor_offset)
-        self.status_label.setText(strings.FIND_BAR_REPLACED_ONE)
-        self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+        self.find_bar.replace_current()
 
     def _find_replace_in_segment(self) -> None:
-        if not self._input_ready():
-            return
-        side = self.find_side_combo.currentData() or "target"
-        editor = self._editor(side)
-        ranges, seg_idx = self._find_segment_context(side)
-        match = self._search_controller.current_match()
-        if match is not None and match.segment_index is not None:
-            seg_idx = match.segment_index
-        if seg_idx is None or not 0 <= seg_idx < len(ranges):
-            self.status_label.setText(strings.FIND_BAR_NO_SEGMENT)
-            return
-        raw = self._payload[side]
-        self._search_controller.query = self.find_query_edit.text()
-        self._search_controller.side = side
-        self._search_controller.case_sensitive = self.find_case_check.isChecked()
-        result = self._search_controller.replace_scoped_segment(
-            raw,
-            ranges[seg_idx],
-            segment_index=seg_idx,
-            replacement=self.find_replace_edit.text(),
-        )
-        if result is None:
-            self.status_label.setText(strings.FIND_BAR_NO_MATCH)
-            return
-        if result.text == raw:
-            editor.set_raw_cursor_offset(result.new_cursor_offset)
-            self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
-            return
-        if not editor.can_display(result.text):
-            self.status_label.setText(strings.MANUSCRIPT_EDIT_REJECTED)
-            return
-        value = self._draft_snapshot()
-        value[side] = result.text
-        next_source = result.text if side == "source" else value["source"]
-        next_target = result.text if side == "target" else value["target"]
-        _, start, old_end, new_len = result.edit
-        remap = remap_splice(value["alignments"], side, next_source, next_target, start, old_end, new_len)
-        value["alignments"] = remap.alignments
-        self._suppress_find_refresh = True
-        try:
-            self._apply_edit(value, edits=[result.edit], remap=remap)
-        finally:
-            self._suppress_find_refresh = False
-        editor.set_raw_cursor_offset(result.new_cursor_offset)
-        self.status_label.setText(strings.FIND_BAR_REPLACED_SEGMENT.format(count=result.replaced_count))
-        self._refresh_find_matches(preserve_current=False, cursor_offset=result.new_cursor_offset)
+        self.find_bar.replace_in_segment()
 
     # -- file continuity: import, clipboard, work position -------------------
     def _guard_text_inputs(self) -> None:
@@ -6544,35 +4893,14 @@ class ManuscriptView(QWidget):
         return False
 
     def _read_import_text(self, path: Path) -> str | None:
-        try:
-            with path.open("rb") as handle:
-                data = handle.read(MAX_IMPORT_BYTES + 1)
-        except OSError as exc:
-            self.status_label.setText(strings.IMPORT_READ_FAILED.format(reason=exc.strerror or type(exc).__name__))
-            return None
-        if len(data) > MAX_IMPORT_BYTES:
-            self.status_label.setText(strings.IMPORT_TOO_LARGE)
-            return None
-        try:
-            text = data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            self.status_label.setText(strings.IMPORT_NOT_UTF8)
-            return None
-        if mdr.is_report_export(text):
-            self.status_label.setText(strings.MANUSCRIPT_REPORT_NOT_MANUSCRIPT)
-            return None
+        text, error = read_import_text(path)
+        if error is not None:
+            self.status_label.setText(error)
         return text
 
     @staticmethod
     def _is_report_file(path: Path) -> bool:
-        """An exported report, by the Web's rule (its first line); unreadable
-        files are left to the manuscript reader's own message."""
-        try:
-            with path.open("rb") as handle:
-                head = handle.read(4096)
-        except OSError:
-            return False
-        return mdr.is_report_export(head.decode("utf-8", errors="replace"))
+        return is_report_file(path)
 
     def _replace_side(self, side: str, text: str) -> bool:
         """Replace one whole side as a single undoable edit."""
