@@ -4908,6 +4908,17 @@ class ManuscriptView(QWidget):
         side = self._caret_side
         return pairs[self._pair_index_at(pairs, side, self._caret_offset(side))]
 
+    @staticmethod
+    def _memory_text(text: str) -> str | None:
+        """A text the store can hold, or None where it cannot.
+
+        The store refuses a blank value and one longer than ``SOURCE_SCALARS``;
+        such a neighbour is no context it can hash, which is what None means
+        here. Passing the text anyway would raise a refused-value error, and the
+        workbench would report the memory file as broken.
+        """
+        return text if text.strip() and len(text) <= tm.SOURCE_SCALARS[1] else None
+
     def _active_segment_context(self) -> ActiveSegment | None:
         """The active segment's texts and neighbours, as the memory wants them."""
         pair = self._active_segment_pair()
@@ -4920,12 +4931,17 @@ class ManuscriptView(QWidget):
         def core(text: str, region) -> str:
             return text[region.core_start:region.core_end]
 
+        def neighbour(position: int) -> str | None:
+            if not 0 <= position < len(pairs):
+                return None
+            return self._memory_text(core(source, pairs[position].source))
+
         return ActiveSegment(
             source=core(source, pair.source),
             target=core(target, pair.target),
             direction=self._payload["direction"],
-            prev_source=core(source, pairs[index - 1].source) if index > 0 else None,
-            next_source=core(source, pairs[index + 1].source) if index + 1 < len(pairs) else None,
+            prev_source=neighbour(index - 1),
+            next_source=neighbour(index + 1),
             terms_db_revision=self._terms_db_revision(),
         )
 
@@ -5051,15 +5067,11 @@ class ManuscriptView(QWidget):
         either, so it is passed as none - the truth about the context - instead
         of the text that would be refused.
         """
-        limit = tm.SOURCE_SCALARS[1]
-
         def readable(text: str) -> bool:
-            return bool(text.strip()) and len(text) <= limit
+            return self._memory_text(text) is not None
 
         def neighbour(index: int) -> str | None:
-            if not 0 <= index < len(sources) or not readable(sources[index]):
-                return None
-            return sources[index]
+            return self._memory_text(sources[index]) if 0 <= index < len(sources) else None
 
         classes: list[tm.TmSegmentClassification | None] = [None] * len(sources)
         run: list[int] = []

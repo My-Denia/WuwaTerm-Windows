@@ -470,6 +470,39 @@ def test_the_reuse_check_classifies_the_segments_it_can_read(qapp, memory) -> No
         view.close()
 
 
+def test_a_long_next_segment_is_no_context_not_a_broken_file(qapp, memory) -> None:
+    """A short segment followed by a >2000-character tail: the neighbour the
+    store cannot hash must not turn the panel's read or its confirm into an
+    error about the file."""
+    limit = tm.SOURCE_SCALARS[1]
+    short = "First line."
+    long_tail = "字" * (limit + 1)
+    source = f"{short}\n\n{long_tail}"
+    target = "甲句。"
+    alignments = alignments_for(source, target, [(short, "甲句。"), (long_tail, "")])
+    memory.add(short, "首句。", "en", origin="human_confirmed")
+    view = ManuscriptView(ApiClient(None), translation_memory=memory)
+    try:
+        install(view, source, target, alignments=alignments)
+        assert len(view._active_segment_context().source) == len(short)
+        assert view._active_segment_context().next_source is None
+        view.segment_list.setCurrentRow(0)
+        view._refresh_tm_panel()
+        # The stored pair is found, and neither action is disabled.
+        assert view.tm_panel.matches and view.tm_panel.matches[0].entry.target_text == "首句。"
+        assert strings.TM_PANEL_UNUSABLE.split("{")[0] not in view.tm_panel.notice_label.text()
+        assert view.tm_panel.confirm_button.isEnabled() is True
+        assert view.tm_panel.check_button.isEnabled() is True
+        # Confirming writes what the segment says now, beside the older pair.
+        view.tm_panel.confirm_button.click()
+        assert len(memory) == 2
+        assert sorted(entry.target_text for entry in memory.entries()) == ["甲句。", "首句。"]
+        for entry in memory.entries():
+            assert entry.next_source_hash is None
+    finally:
+        view.close()
+
+
 # -- opening the memory, and what a failure means ---------------------------------
 
 
