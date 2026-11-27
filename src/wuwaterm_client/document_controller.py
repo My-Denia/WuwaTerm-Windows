@@ -2173,7 +2173,13 @@ class DocumentRunController:
         current = self.translate_task
         if current is not None and current is self.provenance_task and not current.done():
             return
-        probe = asyncio.ensure_future(self._start_translation_after_identity(single_segment))
+        payload = self.payload
+        # What this press was pressed on. A run is bound to the text it started
+        # from (``translation_basis_unchanged``); a press held up by the identity
+        # request has to hold the same line, or an edit made during the wait is
+        # translated without anybody pressing 翻译 for it.
+        basis = (payload["source"], payload["target"], payload["direction"])
+        probe = asyncio.ensure_future(self._start_translation_after_identity(single_segment, basis))
         self.provenance_task = probe
         self.translate_task = probe
         # The wait is a network round trip, so it is shown and cancellable like
@@ -2183,7 +2189,7 @@ class DocumentRunController:
         self.host.report_status(strings.MANUSCRIPT_TRANSLATE_PROVENANCE)
         self._translation_ui()
 
-    async def _start_translation_after_identity(self, single_segment: bool) -> None:
+    async def _start_translation_after_identity(self, single_segment: bool, basis: tuple[str, str, str]) -> None:
         generation = self.translate_generation
         await self.refresh_live_dictionary_identity()
         # A stop (Cancel, an endpoint change, a replaced run) during the request
@@ -2194,6 +2200,15 @@ class DocumentRunController:
             self.provenance_task = None
         if self.translate_task is asyncio.current_task():
             self.translate_task = None
+        payload = self.payload
+        if (payload["source"], payload["target"], payload["direction"]) != basis:
+            # The owner edited the document, or switched direction, while the
+            # identity was in flight. The press belonged to the earlier text, so
+            # it ends the way a changed run ends: nothing written, said so.
+            self.translate_run, self.translate_state = None, TRANSLATION_IDLE
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_CHANGED)
+            self._translation_ui()
+            return
         self._start_translation(single_segment=single_segment)
         if self.translate_state == TRANSLATION_PROBING:
             # Nothing was launched (a refusal or a completion line is already on

@@ -2046,3 +2046,42 @@ def test_a_credential_change_drops_a_pending_identity_request(tmp_path) -> None:
         assert client.translation_calls == []
 
     asyncio.run(scenario())
+
+
+def test_an_edit_during_the_identity_wait_ends_the_press_instead_of_adopting_it(tmp_path) -> None:
+    """A run is bound to the text it started from.
+
+    The probe puts a network round trip between the press and the run, and the
+    editors stay usable during it. An edit - or a direction change - made in that
+    window belongs to the owner's next press, not to the one already waiting, so
+    the waiting press ends the way a changed run ends: nothing written, and a
+    line saying so.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        value = controller.draft_snapshot()
+        value["source"] = "\n\n".join(sources) + "\n\n新增的一段。" + "文" * 960
+        controller.apply_edit(value)
+        gate.set()
+        await settle(controller)
+
+        assert client.translation_calls == [], "the edited text was translated without a press"
+        assert controller.payload["target"] == ""
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_CHANGED
+
+    asyncio.run(scenario())
