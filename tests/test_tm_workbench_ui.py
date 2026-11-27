@@ -2404,3 +2404,83 @@ def test_the_window_fetches_the_identity_with_the_meta_and_clears_it_on_failure(
             window.close()
 
     asyncio.run(scenario())
+
+
+def test_the_identity_wait_shows_cancel_and_cancelling_leaves_the_text_alone(qapp, memory) -> None:
+    """The press that waits for the dictionary is cancellable on screen.
+
+    The probe is a new network round trip on the path to 翻译, so it has to look
+    like one: busy controls, a Cancel button, and a status line that says what
+    is being waited for. Cancelling it must not write a reused segment or a
+    translated one - no model call has been made yet.
+    """
+    asked: list[str] = []
+    gate: list[asyncio.Event] = []
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+        gate.append(release)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            asked.append(path)
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                await release.wait()
+                return httpx.Response(200, json=_dictionary_payload())
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION, game_version="3.7.0")
+        view = ManuscriptView(client, translation_memory=memory)
+        try:
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            view._translate()
+            for _ in range(200):
+                if "/v1/dictionary" in asked:
+                    break
+                await asyncio.sleep(0)
+            assert "/v1/dictionary" in asked, asked
+
+            assert view.cancel_button.isHidden() is False, "a waiting press offered no Cancel"
+            assert view.cancel_button.isEnabled() is True
+            assert view._translating() is True
+            assert view.translate_button.isEnabled() is False, "a second press was left available"
+            assert view.status_label.text() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE
+
+            view.cancel_button.click()
+            for _ in range(200):
+                if view._controller.translate_task is None:
+                    break
+                await asyncio.sleep(0)
+
+            assert view.status_label.text() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED
+            assert view.cancel_button.isHidden() is True
+            assert view.translate_button.isEnabled() is True
+            assert view._payload["target"] == target, "a cancelled press wrote text"
+            assert "/v1/translations" not in asked
+
+            release.set()
+            for _ in range(50):
+                await asyncio.sleep(0)
+            assert view._payload["target"] == target
+            assert view._controller.translate_task is None
+            assert "/v1/translations" not in asked, "the cancelled press started a run"
+        finally:
+            gate[0].set()
+            await client.aclose()
+            view.close()
+
+    asyncio.run(scenario())

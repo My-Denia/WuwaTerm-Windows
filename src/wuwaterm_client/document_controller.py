@@ -98,8 +98,10 @@ REPEATED_FAILURES = 2
 # A stopped translation run, by the state it left: both offer a next press, and
 # both are dropped once the text is no longer what the run left.
 TRANSLATION_RESUMABLE = ("paused", "failed")
-# The translation run's phases: idle, and the four the view renders apart.
+# The translation run's phases: idle, the wait for the served dictionary's
+# identity before any reuse decision, and the four the view renders apart.
 TRANSLATION_IDLE = "idle"
+TRANSLATION_PROBING = "probing"
 
 # The draft primitives (``copy_payload``, ``normalize_semantic``, ``PART_KEYS``)
 # live in ``document_edits``: the runs and the commands commit through them,
@@ -579,6 +581,17 @@ class DocumentRunController:
         write back."""
         self.live_review_dictionary = None
         self.live_dictionary_identity = None
+        # A 翻译 press waiting on the identity request was issued under the old
+        # credential. Dropped before its answer lands: otherwise the reply
+        # restores the provenance just cleared and starts the run anyway.
+        probe, self.provenance_task = self.provenance_task, None
+        if probe is not None and not probe.done():
+            self.translate_generation += 1
+            if self.translate_task is probe:
+                self.translate_task = None
+            self.translate_run = None
+            self.translate_state = TRANSLATION_IDLE
+            probe.cancel()
         self.cancel_pending()
         self.stop_semantic("paused" if self.semantic_running() else None)
 
@@ -2163,6 +2176,12 @@ class DocumentRunController:
         probe = asyncio.ensure_future(self._start_translation_after_identity(single_segment))
         self.provenance_task = probe
         self.translate_task = probe
+        # The wait is a network round trip, so it is shown and cancellable like
+        # any other: without this the workbench would render a press that
+        # apparently did nothing, with no Cancel, until the answer arrived.
+        self.translate_state = TRANSLATION_PROBING
+        self.host.report_status(strings.MANUSCRIPT_TRANSLATE_PROVENANCE)
+        self._translation_ui()
 
     async def _start_translation_after_identity(self, single_segment: bool) -> None:
         generation = self.translate_generation
@@ -2176,6 +2195,11 @@ class DocumentRunController:
         if self.translate_task is asyncio.current_task():
             self.translate_task = None
         self._start_translation(single_segment=single_segment)
+        if self.translate_state == TRANSLATION_PROBING:
+            # Nothing was launched (a refusal or a completion line is already on
+            # screen): back to idle, so no Cancel outlives the wait it belonged to.
+            self.translate_state = TRANSLATION_IDLE
+            self._translation_ui()
 
     def _start_translation(self, *, single_segment: bool = False) -> None:
         payload = self.payload
@@ -2631,11 +2655,25 @@ class DocumentRunController:
                                      len(inserted))
         return self.host.apply_target_write(changed, edit, remap=remap)
 
-    def translation_stopped(self, run: Translation, state: str, reason: str = "", *,
+    def translation_stopped(self, run: Translation | None, state: str, reason: str = "", *,
                             quota: bool = False) -> None:
         """The run ended before its last piece: the owner paused it, the
         service asked to wait, or a piece failed. The run stays as the cursor
-        for the next press."""
+        for the next press.
+
+        ``run`` is None when the owner cancelled a press that was still waiting
+        for the served dictionary's identity: no piece ran, so there is no
+        cursor to keep and nothing to report - the document is untouched and
+        the controls come back.
+        """
+        if run is None:
+            self.translate_task = None
+            self.provenance_task = None
+            self.translate_run = None
+            self.translate_state, self.translate_status = TRANSLATION_IDLE, ""
+            self.host.report_status(strings.MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED)
+            self._translation_ui()
+            return
         self.translate_task = None
         if not self.translation_basis_unchanged(run):
             self.translate_run, self.translate_state = None, TRANSLATION_IDLE

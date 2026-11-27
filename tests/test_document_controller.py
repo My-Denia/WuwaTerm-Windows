@@ -1926,3 +1926,123 @@ def test_a_client_stand_in_written_before_the_endpoint_still_translates(tmp_path
         assert controller._tm_provenance() == (None, None)
 
     asyncio.run(scenario())
+
+
+def test_the_identity_wait_is_rendered_and_cancellable(tmp_path) -> None:
+    """The press is not silent while the dictionary is asked for.
+
+    The probe is a network round trip: the controls have to say the workbench is
+    busy (which is what shows Cancel) and the status line has to say why, or a
+    slow service looks like a press that did nothing.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        assert controller.translate_state == dc.TRANSLATION_PROBING
+        assert controller.translating() is True, "Cancel would stay hidden"
+        assert "update_controls" in host.calls, "the controls were never re-rendered"
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE
+
+        gate.set()
+        await settle(controller)
+
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert [call["text"] for call in client.translation_calls] == []
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_while_the_identity_is_pending_ends_the_press_quietly(tmp_path) -> None:
+    """The Cancel button reaches `cancel_review`, not `stop_translation`.
+
+    Before, a probe with no run made that path call `translation_stopped(None)`,
+    which read `run.source` and raised. Nothing ran, so there is no cursor, no
+    write and no crash - and the run must not start once the answer arrives.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+
+        controller.cancel_review()
+
+        assert controller.translate_task is None
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+        assert "update_controls" in host.calls
+        assert host.current_status() == strings.MANUSCRIPT_TRANSLATE_PROVENANCE_CANCELLED
+
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert client.translation_calls == [], "the cancelled press started a run"
+        assert controller.payload["target"] == ""
+
+    asyncio.run(scenario())
+
+
+def test_a_credential_change_drops_a_pending_identity_request(tmp_path) -> None:
+    """The answer was requested with the previous credential.
+
+    If it is allowed to land it restores the provenance this reset just cleared
+    and starts the run under the new credential - the stale-provenance write
+    MY-491 #64 removed, arriving through the endpoint that replaced it.
+    """
+    rev = hashlib.sha256(b"served").hexdigest()
+
+    async def scenario() -> None:
+        memory, sources, _targets = seeded_memory(tmp_path, rev, game_version="3.7.0")
+        client = FakeClient(capabilities=(dc.semantic.CAPABILITY_DICTIONARY_IDENTITY,))
+        client.dictionary = fake_identity(rev)
+        gate = asyncio.Event()
+        client.hold["get_dictionary"] = (1, gate)
+        host = StubHost()
+        controller = dc.DocumentRunController(client, host, translation_memory=memory)
+        host.controller = controller
+        controller.payload = blank_draft(sources)
+
+        controller.start_translation()
+        await until(lambda: client.dictionary_calls == 1)
+        generation = controller.translate_generation
+
+        controller.invalidate_provenance_for_credential_change()
+
+        assert controller.translate_generation > generation, "the pending answer was not invalidated"
+        assert controller.provenance_task is None
+        assert controller.translate_task is None
+        assert controller.translate_state == dc.TRANSLATION_IDLE
+
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert controller.live_dictionary_identity is None
+        assert controller._tm_provenance() == (None, None)
+        assert host.service_dictionaries == [], "an old credential's answer restored provenance"
+        assert client.translation_calls == []
+
+    asyncio.run(scenario())
