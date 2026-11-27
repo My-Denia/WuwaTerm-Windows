@@ -32,6 +32,7 @@ from wuwaterm_client import strings
 from wuwaterm_client import translation_memory as tm
 from wuwaterm_client.api import ApiClient, DictionaryIdentityResult, MetaResult
 from wuwaterm_client.config import ClientConfig
+from wuwaterm_client.document_controller import IDENTITY_FAILED, IDENTITY_FRESH, IDENTITY_SUPERSEDED
 from wuwaterm_client.manuscript import empty_workfile
 from wuwaterm_client.semantic_session import SegmentResult
 from wuwaterm_client.ui.main_window import MainWindow
@@ -2927,12 +2928,13 @@ def test_a_review_contradicting_both_revision_and_metadata_clears_the_identity(q
 
 
 def test_every_identity_reset_moves_the_statement_epoch(qapp, memory) -> None:
-    """One counter, moved by every path that changes the statement.
+    """Every invalidation path retires pending requests unconditionally.
 
     The two producers (the window's background refresh and a press's probe)
-    compare this value to decide whether their answer is still the newest. A path
-    that clears the identity without moving it would let an older in-flight answer
-    put a superseded revision back.
+    reserve monotonic request ordinals. Every path that clears or contradicts
+    the identity must advance both ``_dictionary_request_seq`` and
+    ``_applied_dictionary_seq`` so any older in-flight request is rejected,
+    even on a cold start when both caches are still None.
     """
     identity = DictionaryIdentityResult(
         revision=REVISION, schema_version="1", source_commit="a" * 40,
@@ -2940,7 +2942,15 @@ def test_every_identity_reset_moves_the_statement_epoch(qapp, memory) -> None:
     )
     view = ManuscriptView(ApiClient(None), translation_memory=memory)
     try:
-        epoch = view.dictionary_identity_epoch()
+        # Cold start: clear_live_provenance advances both sequences even when empty.
+        cold_seq = view.begin_dictionary_identity_request()
+        assert view._service_dictionary is None and view._live_review_dictionary is None
+        assert view.clear_live_provenance() is True
+        assert view._dictionary_request_seq > cold_seq
+        assert view._applied_dictionary_seq == view._dictionary_request_seq
+        assert view.apply_dictionary_identity(identity, seq=cold_seq) is False
+        assert view._service_dictionary is None
+
         for reset in (
             lambda: view.set_service_dictionary(None),
             lambda: view.clear_live_provenance(),
@@ -2954,12 +2964,14 @@ def test_every_identity_reset_moves_the_statement_epoch(qapp, memory) -> None:
             view.reset_for_endpoint_change,
         ):
             view.set_service_dictionary(identity)
-            before = view.dictionary_identity_epoch()
+            stale_seq = view.begin_dictionary_identity_request()
+            before_applied = view._applied_dictionary_seq
             reset()
             assert view._service_dictionary is None, reset
-            assert view.dictionary_identity_epoch() > before, ("a reset left the epoch where it was", reset)
-            epoch = view.dictionary_identity_epoch()
-        assert epoch > 0
+            assert view._applied_dictionary_seq > before_applied, ("a reset left _applied_dictionary_seq behind", reset)
+            assert view._applied_dictionary_seq == view._dictionary_request_seq, reset
+            assert view.apply_dictionary_identity(identity, seq=stale_seq) is False, reset
+            assert view._service_dictionary is None, reset
     finally:
         view.close()
 
@@ -3040,6 +3052,276 @@ def test_a_background_answer_cannot_resurrect_what_a_failed_press_cleared(
             assert view._terms_db_revision() is None
         finally:
             release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_foreground_started_first_is_rejected_when_newer_background_finishes_first(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Foreground starts first (A) -> Background starts second (B) -> B finishes first -> A finishes:
+    B stays installed, A is rejected and not reused."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        fg_started = asyncio.Event()
+        fg_release = asyncio.Event()
+        state = {"mode": "startup"}
+        translate_calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["mode"] == "fg":
+                    fg_started.set()
+                    await fg_release.wait()
+                    return httpx.Response(200, json=_dictionary_payload(REVISION))
+                if state["mode"] == "bg":
+                    return httpx.Response(200, json=_dictionary_payload(OTHER_REVISION))
+                return httpx.Response(200, json=_dictionary_payload(REVISION))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                translate_calls.append(body["text"])
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=REVISION, game_version="3.7.0")
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            # 1. Foreground starts first (seq=N, A) and waits on the network.
+            state["mode"] = "fg"
+            view._controller.start_translation()
+            await asyncio.wait_for(fg_started.wait(), timeout=2.0)
+
+            # 2. Background starts second (seq=N+1, B) and finishes first.
+            state["mode"] = "bg"
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+
+            # 3. Foreground finishes late with A: must be rejected and not reused.
+            fg_release.set()
+            await _settle_translation(view)
+
+            assert view._controller.identity_probe_state == IDENTITY_SUPERSEDED
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+            assert view._terms_db_revision() == OTHER_REVISION
+            assert translate_calls, "superseded revision A was reused"
+        finally:
+            fg_release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_background_started_first_does_not_drop_newer_foreground(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Background starts first (A) -> Foreground starts second (B) -> A finishes first -> B finishes:
+    B installs and wins (not dropped because older A finished first)."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        bg_started = asyncio.Event()
+        bg_release = asyncio.Event()
+        fg_started = asyncio.Event()
+        fg_release = asyncio.Event()
+        state = {"mode": "startup"}
+        translate_calls: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["mode"] == "bg":
+                    bg_started.set()
+                    await bg_release.wait()
+                    return httpx.Response(200, json=_dictionary_payload(REVISION))
+                if state["mode"] == "fg":
+                    fg_started.set()
+                    await fg_release.wait()
+                    return httpx.Response(200, json=_dictionary_payload(OTHER_REVISION))
+                return httpx.Response(200, json=_dictionary_payload(REVISION))
+            if path == "/v1/translations":
+                body = json.loads(request.content)
+                translate_calls.append(body["text"])
+                return httpx.Response(200, json={
+                    "kind": "llm", "text": f"[MT:{body['text']}]", "direction": body.get("to") or "en",
+                    "dictionary_miss": False, "request_id": "tr-1",
+                })
+            raise AssertionError(f"unexpected path: {path}")
+
+        memory.add("Second line.", "乙句。", "en", prev_source="First line.", origin="human_confirmed",
+                   terms_db_revision=OTHER_REVISION, game_version="3.7.0")
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            if window._dictionary_task is not None:
+                await asyncio.wait_for(window._dictionary_task, timeout=2.0)
+
+            view = window.manuscript_view
+            source, target, alignments = two_segments()
+            install(view, source, target, alignments=alignments)
+
+            # 1. Background starts first (seq=N, A) and holds.
+            state["mode"] = "bg"
+            window.status_view._on_refresh_clicked()
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(bg_started.wait(), timeout=2.0)
+            background = window._dictionary_task
+
+            # 2. Foreground starts second (seq=N+1, B) and holds.
+            state["mode"] = "fg"
+            view._controller.start_translation()
+            await asyncio.wait_for(fg_started.wait(), timeout=2.0)
+
+            # 3. Background finishes first with A.
+            bg_release.set()
+            if background is not None:
+                await asyncio.wait_for(background, timeout=2.0)
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == REVISION
+
+            # 4. Foreground finishes second with B: must install and win.
+            fg_release.set()
+            await _settle_translation(view)
+
+            assert view._controller.identity_probe_state == IDENTITY_FRESH
+            assert view._service_dictionary is not None
+            assert view._service_dictionary.revision == OTHER_REVISION
+            assert view._terms_db_revision() == OTHER_REVISION
+            assert translate_calls == [], "newer revision B was dropped instead of reusing confirmed segment"
+        finally:
+            bg_release.set()
+            fg_release.set()
+            await client.aclose()
+            window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
+            window.close()
+
+    asyncio.run(scenario())
+
+
+def test_cold_start_foreground_503_rejects_late_background_identity(
+    qapp, tmp_path, monkeypatch, memory
+) -> None:
+    """Cold start (_service_dictionary=None, _live_review_dictionary=None):
+    Background starts first (A) -> Foreground starts second and hits 503 ->
+    late Background A is rejected and _terms_db_revision() stays None."""
+    from wuwaterm_client import config as config_module
+    from wuwaterm_client.ui import main_window as main_window_module
+
+    async def scenario() -> None:
+        monkeypatch.setattr(config_module, "app_data_dir", lambda: tmp_path)
+        monkeypatch.setattr(main_window_module, "has_token", lambda: True)
+        monkeypatch.setattr(main_window_module, "open_translation_memory", lambda: memory)
+
+        bg_started = asyncio.Event()
+        bg_release = asyncio.Event()
+        state = {"fail_fg": False}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/v1/meta":
+                return httpx.Response(200, json=_meta_payload())
+            if path == "/v1/capabilities":
+                return httpx.Response(200, json={"api_version": "v1", "capabilities": ["dictionary-identity-v1"],
+                                                 "request_id": "caps"})
+            if path == "/v1/dictionary":
+                if state["fail_fg"]:
+                    return httpx.Response(503, json={"error": {"code": "llm_unavailable"}, "request_id": "req-fg"})
+                bg_started.set()
+                await bg_release.wait()
+                return httpx.Response(200, json=_dictionary_payload(REVISION))
+            raise AssertionError(f"unexpected path: {path}")
+
+        client = ApiClient("https://api.example.invalid", token_provider=lambda: "wtd1.test",
+                           _test_transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(main_window_module.ApiClient, "from_config", classmethod(lambda cls, _cfg: client))
+
+        window = MainWindow(ClientConfig(base_url="https://api.example.invalid"))
+        try:
+            await asyncio.sleep(0)
+            if window.status_view._task is not None:
+                await asyncio.wait_for(window.status_view._task, timeout=2.0)
+            await asyncio.wait_for(bg_started.wait(), timeout=2.0)
+            background = window._dictionary_task
+            view = window.manuscript_view
+            assert view._service_dictionary is None
+            assert view._live_review_dictionary is None
+
+            # Foreground starts second (seq=2) and hits 503 on cold start.
+            state["fail_fg"] = True
+            assert await view._controller.refresh_live_dictionary_identity() is None
+            assert view._controller.identity_probe_state == IDENTITY_FAILED
+            assert view._service_dictionary is None
+            assert view._live_review_dictionary is None
+            assert view._terms_db_revision() is None
+
+            # Late Background A (seq=1) arrives now and must be rejected.
+            bg_release.set()
+            if background is not None:
+                await asyncio.gather(background, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            assert view._service_dictionary is None
+            assert view._live_review_dictionary is None
+            assert view._terms_db_revision() is None
+        finally:
+            bg_release.set()
             await client.aclose()
             window.manuscript_view._saved_payload = dict(window.manuscript_view._payload)
             window.close()

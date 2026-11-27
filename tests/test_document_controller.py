@@ -217,9 +217,10 @@ class StubHost:
         # How many times the controller asked this host to forget both live
         # statements (an identity answer it could not read).
         self.cleared_provenance = 0
-        # The statement counter the two identity producers share (see
-        # ManuscriptView.dictionary_identity_epoch).
-        self.dictionary_epoch = 0
+        # Request ordinals the two identity producers share (see
+        # ManuscriptView.begin_dictionary_identity_request).
+        self.dictionary_request_seq = 0
+        self.applied_dictionary_seq = 0
         # What the editor would say its view state is; opaque to the controller.
         self.view = {"side": "target", "source": {}, "target": {}}
         self.editor_states = 0
@@ -277,16 +278,30 @@ class StubHost:
     def trust_review_snapshot(self, snapshot: dict) -> None:
         self.snapshots.append(snapshot)
 
-    def set_service_dictionary(self, identity) -> None:
+    def begin_dictionary_identity_request(self) -> int:
+        self.dictionary_request_seq += 1
+        return self.dictionary_request_seq
+
+    def apply_dictionary_identity(self, identity, *, seq: int | None = None) -> bool:
+        if seq is not None and seq < self.applied_dictionary_seq:
+            return False
+        self.applied_dictionary_seq = max(
+            self.applied_dictionary_seq,
+            self.dictionary_request_seq if seq is None else seq,
+        )
         self.service_dictionaries.append(identity)
-        self.dictionary_epoch += 1
+        return True
 
-    def dictionary_identity_epoch(self) -> int:
-        return self.dictionary_epoch
+    def set_service_dictionary(self, identity) -> None:
+        self.apply_dictionary_identity(identity, seq=self.begin_dictionary_identity_request())
 
-    def clear_live_provenance(self) -> None:
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
+        if seq is not None and seq < self.applied_dictionary_seq:
+            return False
+        self.dictionary_request_seq += 1
+        self.applied_dictionary_seq = self.dictionary_request_seq
         self.cleared_provenance += 1
-        self.dictionary_epoch += 1
+        return True
 
     def precedents_selected(self) -> bool:
         return self.precedents

@@ -899,11 +899,19 @@ class _WorkbenchHostAdapter(WorkbenchHost):
     def record_live_review_dictionary(self, dictionary: Mapping[str, Any] | None) -> None:
         self._view._record_live_review_dictionary(dictionary)
 
+    def begin_dictionary_identity_request(self) -> int:
+        return self._view.begin_dictionary_identity_request()
+
+    def apply_dictionary_identity(
+        self, identity: "DictionaryIdentityResult | None", *, seq: int | None = None
+    ) -> bool:
+        return self._view.apply_dictionary_identity(identity, seq=seq)
+
     def set_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
         self._view.set_service_dictionary(identity)
 
-    def clear_live_provenance(self) -> None:
-        self._view.clear_live_provenance()
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
+        return self._view.clear_live_provenance(seq=seq)
 
 
 def _normalized_game_version(value: object) -> str | None:
@@ -1006,11 +1014,15 @@ class ManuscriptView(QWidget):
         # the revision the service is serving now, which needs no review in this
         # session to be authoritative. None means "not known", never "unchanged".
         self._service_dictionary: DictionaryIdentityResult | None = None
-        # How many times that statement has changed - by either producer (this
-        # window's background refresh and a press's own probe). Whichever answer
-        # is newer wins, and a request that captured this value before it started
-        # drops its answer when the value has moved since.
-        self._dictionary_identity_epoch = 0
+        # Request ordinals for that statement. Two producers ask (this window's
+        # background refresh and a press's own probe), and the newer *request*
+        # wins - not the answer that happens to arrive last:
+        # ``_dictionary_request_seq`` is handed out by
+        # ``begin_dictionary_identity_request``, ``_applied_dictionary_seq`` is
+        # the newest request whose answer has been applied (or retired by a
+        # decision that made every pending answer stale).
+        self._dictionary_request_seq = 0
+        self._applied_dictionary_seq = 0
         self._live_review_dictionary: dict | None = None
         self._updating = False
         # Document history excludes report snapshots, saved baseline and path:
@@ -4987,21 +4999,24 @@ class ManuscriptView(QWidget):
                 self._refresh_tm_panel()
                 self.workbenchStatusChanged.emit()
             return
-        changed = self._service_meta != meta
+        previous_meta = self._service_meta
+        changed = previous_meta != meta
         if changed:
             # A service can be upgraded in place. What it lists is part of this
             # refresh's question, so the answer from the previous meta is not
             # reused for it.
             self._capabilities = None
         self._service_meta = meta
-        if (
+        review_mismatch = (
             self._live_review_dictionary is not None
             and not _dictionary_matches_meta(self._live_review_dictionary, meta)
-        ):
+        )
+        if review_mismatch:
             self._live_review_dictionary = None
             changed = True
         identity = self._service_dictionary
-        if identity is not None and not _identity_matches_meta(identity, meta):
+        identity_mismatch = identity is not None and not _identity_matches_meta(identity, meta)
+        if identity_mismatch:
             # The fresh meta names a different dictionary state than the identity
             # does: the identity describes the dictionary that was served before
             # this refresh. Dropped here rather than kept until the identity is
@@ -5009,35 +5024,70 @@ class ManuscriptView(QWidget):
             # entries confirmed under the previous dictionary. Unknown is the
             # safe answer, and unknown reuses nothing.
             changed = self._forget_service_dictionary() or changed
+        elif review_mismatch or (
+            previous_meta is not None
+            and (
+                previous_meta.schema_version != meta.schema_version
+                or previous_meta.source_commit != meta.source_commit
+                or previous_meta.term_count != meta.term_count
+                or _normalized_game_version(previous_meta.source_game_version)
+                != _normalized_game_version(meta.source_game_version)
+            )
+        ):
+            self._retire_dictionary_requests()
         if changed:
             self._refresh_tm_panel()
             self.workbenchStatusChanged.emit()
 
-    def _forget_service_dictionary(self) -> bool:
-        """Drop the live identity statement, and count it as a change.
+    def _retire_dictionary_requests(self) -> None:
+        """Make every pending identity answer older than this decision.
 
-        Every path that takes the statement away goes through here - a cleared
-        `/v1/meta`, a refused meta tuple, a review that contradicts it, another
-        address, a new credential - so the epoch the two producers compare is
-        moved by all of them, not only by the two writers.
+        Called wherever the statement is decided without an answer - a cleared or
+        refused `/v1/meta`, a review that contradicts it, another address, a new
+        credential - and by a clear. The request ordinal moves even when there was
+        no cached statement to drop, because the point is the *pending* answers:
+        an answer asked about the service before this decision must not be
+        installed after it.
         """
+        self._dictionary_request_seq += 1
+        self._applied_dictionary_seq = self._dictionary_request_seq
+
+    def begin_dictionary_identity_request(self) -> int:
+        """Reserve the next request ordinal for an identity request.
+
+        The caller passes it back with the answer. Two requests are ordered by
+        when they were *asked*, so an answer that arrives out of order cannot
+        overwrite a newer request's answer - only a newer request can.
+        """
+        self._dictionary_request_seq += 1
+        return self._dictionary_request_seq
+
+    def apply_dictionary_identity(
+        self, identity: "DictionaryIdentityResult | None", *, seq: int | None = None
+    ) -> bool:
+        """Install an identity answer unless a newer request already decided it.
+
+        ``seq`` is the ordinal ``begin_dictionary_identity_request`` handed out
+        when this request started. An answer from an older request than one
+        already applied is refused and reports False, so the caller can classify
+        it as superseded instead of believing it installed anything.
+        """
+        if seq is not None and seq < self._applied_dictionary_seq:
+            return False
+        self._applied_dictionary_seq = max(
+            self._applied_dictionary_seq,
+            self._dictionary_request_seq if seq is None else seq,
+        )
+        self._write_service_dictionary(identity)
+        return True
+
+    def _forget_service_dictionary(self) -> bool:
+        """Drop the live identity statement and retire every pending request."""
+        self._retire_dictionary_requests()
         if self._service_dictionary is None:
             return False
         self._service_dictionary = None
-        self._dictionary_identity_epoch += 1
         return True
-
-    def dictionary_identity_epoch(self) -> int:
-        """How many times the live identity statement has changed.
-
-        Two producers write it: the window's background refresh and the probe a
-        press runs before it may reuse. Only one order is correct - the newer
-        statement wins - so a request reads this before it starts and drops its
-        answer if the value moved while it was out. That is what keeps an older
-        in-flight answer from overwriting a newer identity, and it needs no
-        agreement between the two callers.
-        """
-        return self._dictionary_identity_epoch
 
     def set_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
         """Update the live dictionary identity from ``GET /v1/dictionary``.
@@ -5053,29 +5103,40 @@ class ManuscriptView(QWidget):
         non-destructive refresh is requested), because keeping either value
         would state a provenance the other endpoint contradicts.
         """
+        self.apply_dictionary_identity(identity, seq=self.begin_dictionary_identity_request())
+
+    def _write_service_dictionary(self, identity: "DictionaryIdentityResult | None") -> None:
+        """Put one identity in place and render what follows from it."""
         if identity is self._service_dictionary or identity == self._service_dictionary:
             return
         self._service_dictionary = identity
-        self._dictionary_identity_epoch += 1
         if identity is not None:
             self._drop_conflicting_review_dictionary(identity.revision)
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
 
-    def clear_live_provenance(self) -> None:
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
         """Forget both live statements about the served dictionary.
 
         The identity and this session's review dictionary each name a
         dictionary. When a request meant to confirm one of them fails, neither
         is knowledge any more: a run must fall back to no revision rather than
         to whichever of the two is older.
+
+        ``seq`` is the ordinal of the request that failed. An answer from an
+        older request than one already applied never clears anything (returns
+        False). Otherwise the clear happens even when nothing is cached yet -
+        that is the cold start - because its real effect is retiring the pending
+        answers that were asked before this failure.
         """
-        if self._service_dictionary is None and self._live_review_dictionary is None:
-            return
-        self._forget_service_dictionary()
+        if seq is not None and seq < self._applied_dictionary_seq:
+            return False
+        self._retire_dictionary_requests()
+        self._service_dictionary = None
         self._live_review_dictionary = None
         self._refresh_tm_panel()
         self.workbenchStatusChanged.emit()
+        return True
 
     def _drop_conflicting_review_dictionary(self, revision: str | None) -> bool:
         """Forget a live review dictionary whose revision the identity contradicts.
@@ -5129,6 +5190,7 @@ class ManuscriptView(QWidget):
             # a stale/conflicting review dictionary; trigger a non-destructive
             # silent /v1/meta check while keeping auto reuse paused.
             self._live_review_dictionary = None
+            self._retire_dictionary_requests()
             self.serviceMetaRefreshRequested.emit()
             self._refresh_tm_panel()
             self.workbenchStatusChanged.emit()

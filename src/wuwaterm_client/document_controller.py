@@ -556,6 +556,19 @@ class DocumentRunController:
         if callable(setter):
             setter(identity)
 
+    def _apply_dictionary_identity(
+        self, identity: DictionaryIdentity | None, *, seq: int | None = None
+    ) -> bool:
+        """Install an identity answer on the host unless a newer request won."""
+        applier = getattr(self.host, "apply_dictionary_identity", None)
+        if callable(applier):
+            if applier(identity, seq=seq) is False:
+                return False
+            self.live_dictionary_identity = identity
+            return True
+        self.record_live_dictionary_identity(identity)
+        return True
+
     async def refresh_live_dictionary_identity(self) -> DictionaryIdentity | None:
         """Ask the service for its authoritative dictionary identity, once.
 
@@ -582,11 +595,11 @@ class DocumentRunController:
             return None
         client = self.api_client
         getter = getattr(client, "get_dictionary", None)
-        # The statement this answer would replace must be the one that was there
-        # when the request started. The window refreshes the same statement in
-        # the background, and the newer of the two answers wins whichever caller
-        # it came from.
-        start_epoch = self._identity_epoch()
+        # Reserve a monotonic request ordinal before awaiting the network.
+        # Two producers (this press and the window's background refresh) are
+        # ordered by when their requests started, so an older request finishing
+        # last cannot overwrite a newer request's decision.
+        seq = self._begin_identity_request()
         try:
             # Capabilities are part of this press's basis, not a session-wide
             # constant: a service can be upgraded or rolled back in place, and a
@@ -594,14 +607,18 @@ class DocumentRunController:
             # revision in charge for the rest of the session.
             self.capabilities = await client.get_capabilities()
             if semantic.CAPABILITY_DICTIONARY_IDENTITY not in self.capabilities:
-                self.identity_probe_state = IDENTITY_UNSUPPORTED
                 # A server that has stopped advertising the endpoint cannot
                 # confirm the identity this session read earlier, so it goes.
-                self.record_live_dictionary_identity(None)
+                if not self._apply_dictionary_identity(None, seq=seq):
+                    self.identity_probe_state = IDENTITY_SUPERSEDED
+                    return None
+                self.identity_probe_state = IDENTITY_UNSUPPORTED
                 return None
             if not callable(getter):
+                if not self._apply_dictionary_identity(None, seq=seq):
+                    self.identity_probe_state = IDENTITY_SUPERSEDED
+                    return None
                 self.identity_probe_state = IDENTITY_UNSUPPORTED
-                self.record_live_dictionary_identity(None)
                 return None
             identity = await getter()
         except ClientError as exc:
@@ -609,17 +626,16 @@ class DocumentRunController:
                 # The owner cancelled the wait. Nothing was learned, and nothing
                 # already verified was disproved - a cancel is not a 503.
                 return None
+            if not self.clear_live_provenance(seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
             self.identity_probe_state = IDENTITY_FAILED
-            self.clear_live_provenance()
             return None
         except Exception:  # noqa: BLE001 - see the docstring: fail closed, never raise
+            if not self.clear_live_provenance(seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
             self.identity_probe_state = IDENTITY_FAILED
-            self.clear_live_provenance()
-            return None
-        if self._identity_epoch() != start_epoch:
-            # Something newer was installed while this request was out. Adopting
-            # this answer would restore the statement it replaced.
-            self.identity_probe_state = IDENTITY_SUPERSEDED
             return None
         if identity is None:
             # The endpoint answered "no identity": an older server, or a
@@ -627,27 +643,33 @@ class DocumentRunController:
             # session cached earlier is not confirmable now, so it goes with the
             # answer. The review basis stays - that is the fallback ADR 0023
             # keeps for a server without the endpoint.
+            if not self._apply_dictionary_identity(None, seq=seq):
+                self.identity_probe_state = IDENTITY_SUPERSEDED
+                return None
             self.identity_probe_state = IDENTITY_UNSUPPORTED
-            self.record_live_dictionary_identity(None)
             return None
-        self.record_live_dictionary_identity(identity)
+        if not self._apply_dictionary_identity(identity, seq=seq):
+            # A newer request already decided the identity while this request
+            # was out. Adopting this answer would restore an older statement.
+            self.identity_probe_state = IDENTITY_SUPERSEDED
+            return None
         self.identity_probe_state = IDENTITY_FRESH
         return identity
 
-    def _identity_epoch(self) -> int | None:
-        """The host's statement counter, or None for a host that has none.
+    def _begin_identity_request(self) -> int | None:
+        """Reserve the host's next request ordinal, or None for a host without one.
 
         The two producers of the identity (this press and the window's
         background refresh) share it through the host. A stand-in without one -
         the controller's own tests, a headless run - keeps the older behaviour of
         no ordering check rather than gaining a fake one.
         """
-        getter = getattr(self.host, "dictionary_identity_epoch", None)
-        if not callable(getter):
+        beginner = getattr(self.host, "begin_dictionary_identity_request", None)
+        if not callable(beginner):
             return None
-        return getter()
+        return beginner()
 
-    def clear_live_provenance(self) -> None:
+    def clear_live_provenance(self, *, seq: int | None = None) -> bool:
         """Forget both live statements about the served dictionary.
 
         Called when the identity request could not be read: the run that asked
@@ -655,15 +677,20 @@ class DocumentRunController:
         not a substitute for the answer that did not arrive - it may describe a
         dictionary the service has since replaced.
         """
-        self.live_review_dictionary = None
-        self.live_dictionary_identity = None
         clearer = getattr(self.host, "clear_live_provenance", None)
         if callable(clearer):
-            clearer()
-            return
+            applied = clearer() if seq is None else clearer(seq=seq)
+            if applied is False:
+                return False
+            self.live_review_dictionary = None
+            self.live_dictionary_identity = None
+            return True
+        self.live_review_dictionary = None
+        self.live_dictionary_identity = None
         identity_setter = getattr(self.host, "set_service_dictionary", None)
         if callable(identity_setter):
             identity_setter(None)
+        return True
 
     def invalidate_provenance_for_credential_change(self) -> None:
         """Clear live review and dictionary provenance and advance both review

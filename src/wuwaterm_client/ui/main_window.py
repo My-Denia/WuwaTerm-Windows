@@ -689,12 +689,10 @@ class MainWindow(QMainWindow):
         """
         client = self.api_client
         origin = client.current_origin
-        # The statement this answer will replace must be the one that was there
-        # when the request started. A press runs its own probe against the same
-        # view, and the newer of the two answers wins: if the value moved while
-        # this one was out, the answer describes a dictionary that has already
-        # been superseded.
-        epoch = self.manuscript_view.dictionary_identity_epoch()
+        # Reserve a monotonic request ordinal before awaiting the network so a
+        # newer request (e.g. a foreground press) is never overwritten by an
+        # older request arriving late.
+        seq = self.manuscript_view.begin_dictionary_identity_request()
         identity: "DictionaryIdentityResult | None" = None
         failed = False
         try:
@@ -709,12 +707,10 @@ class MainWindow(QMainWindow):
             # The address changed while the request was in flight; the reply
             # describes the previous service.
             return
-        if self.manuscript_view.dictionary_identity_epoch() != epoch:
-            return
         if failed:
-            self.manuscript_view.clear_live_provenance()
+            self.manuscript_view.clear_live_provenance(seq=seq)
             return
-        self.manuscript_view.set_service_dictionary(identity)
+        self.manuscript_view.apply_dictionary_identity(identity, seq=seq)
 
     def _on_service_meta_refresh_requested(self) -> None:
         # Non-destructive: retain known _meta / _service_meta until a fresh
