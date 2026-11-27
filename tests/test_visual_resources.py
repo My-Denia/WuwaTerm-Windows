@@ -217,7 +217,50 @@ def test_inspector_body_and_selected_finding_use_theme(qapp, preserve_theme, sch
         _assert_color(palette.color(QPalette.ColorRole.Window), QColor(tokens[background]))
         assert _contrast(QColor(tokens[foreground]), QColor(tokens[background])) >= 4.5, value
         assert _contrast(palette.color(QPalette.ColorRole.WindowText), palette.color(QPalette.ColorRole.Window)) >= 4.5
+    # Fluent layered surface & interaction contrast parity.
+    assert _contrast(QColor(tokens["text-primary"]), QColor(tokens["bg-layer"])) >= 4.5
+    assert _contrast(QColor(tokens["text-primary"]), QColor(tokens["bg-hover"])) >= 4.5
+    assert _contrast(QColor(tokens["text-primary"]), QColor(tokens["bg-pressed"])) >= 4.5
+    assert _contrast(QColor(tokens["accent-fg"]), QColor(tokens["accent-pressed"])) >= 4.5
     inspector.close()
+
+
+@pytest.mark.parametrize("scheme", [theme.SCHEME_LIGHT, theme.SCHEME_DARK])
+def test_model_list_view_uses_fluent_selection_tokens(qapp, preserve_theme, scheme):
+    from PySide6.QtGui import QColor
+
+    from wuwaterm_client.ui.review_models import ModelListView, ReviewRow
+
+    theme.apply_theme(qapp, scheme)
+    inspector = QFrame()
+    inspector.setObjectName("reviewInspector")
+    outer = QVBoxLayout(inspector)
+    body = QWidget(inspector)
+    body.setObjectName("inspectorBody")
+    outer.addWidget(body)
+    content = QVBoxLayout(body)
+    view = ModelListView(body)
+    view.set_rows([ReviewRow(text="Fluent row", state="verified")])
+    view.setCurrentRow(0)
+    content.addWidget(view)
+    inspector.resize(300, 140)
+    inspector.show()
+    qapp.processEvents()
+    try:
+        tokens = theme.TOKENS_BY_SCHEME[scheme]
+        image = view.viewport().grab().toImage()
+        selected_bg = QColor(tokens["accent-soft-bg"])
+        accent_bar = QColor(tokens["accent"])
+        assert any(
+            image.pixelColor(x, y) == selected_bg
+            for y in range(image.height()) for x in range(image.width())
+        )
+        assert any(
+            image.pixelColor(x, y) == accent_bar
+            for y in range(image.height()) for x in range(image.width())
+        )
+    finally:
+        inspector.close()
 
 
 @pytest.mark.parametrize("scheme", [theme.SCHEME_LIGHT, theme.SCHEME_DARK])

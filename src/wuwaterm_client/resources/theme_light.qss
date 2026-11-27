@@ -100,7 +100,7 @@ QDialog #pageTitle {
 }
 
 #statusStrip {
-    background-color: @bg-canvas@;
+    background-color: @bg-layer@;
     border-top: 1px solid @border-subtle@;
     color: @text-muted@;
     font-size: @font-size-caption@;
@@ -128,12 +128,17 @@ QDialog #pageTitle {
 }
 
 #navItem:hover {
-    background-color: @bg-sunken@;
+    background-color: @bg-hover@;
+    color: @text-primary@;
+}
+
+#navItem:pressed {
+    background-color: @bg-pressed@;
     color: @text-primary@;
 }
 
 #navItem:focus {
-    background-color: @bg-sunken@;
+    background-color: @bg-hover@;
     color: @text-primary@;
     border-left: 3px solid @focus-ring@;
 }
@@ -142,7 +147,7 @@ QDialog #pageTitle {
     background-color: @accent-soft-bg@;
     color: @accent-soft-fg@;
     border-left: 3px solid @accent@;
-    font-weight: 500;
+    font-weight: 600;
 }
 
 /* 地址芯片:圆点说状态,文字说地址。两者的 state 取值必须同步设置。 */
@@ -188,8 +193,8 @@ QDialog #pageTitle {
 
 #card {
     background-color: @bg-surface@;
-    border: 1px solid @border-subtle@;
-    border-radius: 10px;
+    border: 1px solid @border-card@;
+    border-radius: 8px;
     padding: 16px;
 }
 
@@ -377,12 +382,12 @@ QPushButton {
 }
 
 QPushButton:hover {
-    background-color: @bg-sunken@;
+    background-color: @bg-hover@;
     border: 1px solid @border-strong@;
 }
 
 QPushButton:pressed {
-    background-color: @bg-sunken@;
+    background-color: @bg-pressed@;
     border: 1px solid @border-strong@;
 }
 
@@ -410,8 +415,8 @@ QPushButton:disabled {
 }
 
 #primaryButton:pressed {
-    background-color: @accent-hover@;
-    border: 1px solid @accent-hover@;
+    background-color: @accent-pressed@;
+    border: 1px solid @accent-pressed@;
 }
 
 /* 焦点环用前景色而不是 accent:填充色本身就是 accent,同色的环等于没有环。 */
@@ -433,7 +438,13 @@ QPushButton:disabled {
 }
 
 #secondaryButton:hover {
-    background-color: @bg-sunken@;
+    background-color: @bg-hover@;
+    color: @text-primary@;
+    border: 1px solid @border-strong@;
+}
+
+#secondaryButton:pressed {
+    background-color: @bg-pressed@;
     color: @text-primary@;
     border: 1px solid @border-strong@;
 }
@@ -917,7 +928,7 @@ QProgressBar::chunk {
 /* ------------------------------------------------------------ 菜单 */
 
 QMenuBar {
-    background-color: @bg-canvas@;
+    background-color: @bg-layer@;
     color: @text-primary@;
     border: none;
     border-bottom: 1px solid @border-subtle@;
@@ -944,7 +955,7 @@ QMenu {
     background-color: @bg-surface@;
     color: @text-primary@;
     border: 1px solid @border-strong@;
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 4px;
 }
 
@@ -1028,45 +1039,66 @@ QDialogButtonBox {
 /* ---------------------------------------------------------- 工作台 */
 
 #workbenchToolbar {
-    background-color: @bg-surface@;
-    border-bottom: 1px solid @border-subtle@;
+    background-color: @bg-layer@;
+    border-bottom: 1px solid @border-card@;
+}
+
+#findBar {
+    background-color: @bg-layer@;
+    border: 1px solid @border-card@;
+    border-radius: 8px;
 }
 
 #editorSurface,
 #reviewInspector {
     background-color: @bg-surface@;
-    border: 1px solid @border-subtle@;
-    border-radius: 6px;
+    border: 1px solid @border-card@;
+    border-radius: 8px;
+}
+
+QSplitter::handle {
+    background-color: transparent;
+    border-radius: 3px;
+}
+
+QSplitter::handle:hover {
+    background-color: @border-subtle@;
 }
 
 #inspectorBody {
     background-color: @bg-surface@;
 }
 
-#reviewInspector QListWidget {
+#reviewInspector QListWidget,
+#reviewInspector QListView {
     background-color: @bg-surface@;
     color: @text-primary@;
-    border: 1px solid @border-subtle@;
+    border: 1px solid @border-card@;
     border-radius: 6px;
+    outline: none;
 }
 
-#reviewInspector QListWidget::item {
+#reviewInspector QListWidget::item,
+#reviewInspector QListView::item {
     padding: 6px 8px;
+    border-radius: 4px;
 }
 
-#reviewInspector QListWidget::item:hover {
-    background-color: @bg-sunken@;
+#reviewInspector QListWidget::item:hover,
+#reviewInspector QListView::item:hover {
+    background-color: @bg-hover@;
 }
 
-#reviewInspector QListWidget::item:selected {
+#reviewInspector QListWidget::item:selected,
+#reviewInspector QListView::item:selected {
     background-color: @accent-soft-bg@;
     color: @accent-soft-fg@;
 }
 
 #editorHeader {
-    background-color: @bg-surface@;
+    background-color: @bg-layer@;
     border: none;
-    border-bottom: 1px solid @border-subtle@;
+    border-bottom: 1px solid @border-card@;
     min-height: 40px;
 }
 
@@ -1100,7 +1132,13 @@ QDialogButtonBox {
 
 #commandButton:hover,
 #activityItem:hover {
-    background-color: @bg-sunken@;
+    background-color: @bg-hover@;
+    border: 1px solid @border-subtle@;
+}
+
+#commandButton:pressed,
+#activityItem:pressed {
+    background-color: @bg-pressed@;
     border: 1px solid @border-subtle@;
 }
 
@@ -1120,8 +1158,9 @@ QDialogButtonBox {
 #activityItem:checked {
     background-color: @accent-soft-bg@;
     color: @accent-soft-fg@;
-    border-left: 2px solid @accent@;
-    padding-left: 7px;
+    border-left: 3px solid @accent@;
+    padding-left: 6px;
+    font-weight: 600;
 }
 
 #activityItem:checked:focus {
@@ -1219,7 +1258,8 @@ QDialogButtonBox {
     font-size: @font-size-secondary@;
 }
 
-#reviewInspector QListWidget:focus {
+#reviewInspector QListWidget:focus,
+#reviewInspector QListView:focus {
     border: 2px solid @focus-ring@;
 }
 
@@ -1227,13 +1267,13 @@ QDialogButtonBox {
    完成与未开始同样中性:没有疑点不等于通过。 */
 #reviewStatus {
     background-color: @bg-sunken@;
-    border: 1px solid @border-subtle@;
-    border-radius: 6px;
+    border: 1px solid @border-card@;
+    border-radius: 8px;
 }
 
 #reviewStatus[tone="neutral"] {
     background-color: @bg-sunken@;
-    border: 1px solid @border-subtle@;
+    border: 1px solid @border-card@;
 }
 
 #reviewStatus[tone="busy"] {
