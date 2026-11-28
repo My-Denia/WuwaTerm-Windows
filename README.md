@@ -9,7 +9,7 @@
 
 ## 版本与接口兼容
 
-当前版本 **0.10.0**（待发布；最近已发布版本 `0.9.0` 的发布日期与资产见下文「发布」一节的发布记录，下载步骤以已发布的 `0.9.0` 为例）。客户端有自己的版本号，与服务端的版本号分开走。自 `0.7.0` 以来新增：
+当前版本 **0.10.0**（下载步骤以它为例；历次已发布版本的发布日期与资产见下文「发布」一节的发布记录）。客户端有自己的版本号，与服务端的版本号分开走。自 `0.7.0` 以来新增：
 
 - **0.10.0**（#69、#70）：工作台拆分文档、审校与服务模块，列表改为 Qt Model/View 并更新深/浅色 Fluent 主题样式；新增离线性能基准与重构前后对比脚本及报告。
 - **0.9.0**（#66、#68）：通过 `GET /v1/dictionary`（`dictionary-identity-v1`）直接读取服务端当前词库身份，与实时 `GET /v1/meta` 和 `POST /v1/reviews` 相互校验并严格隔离历史稿件记录，为翻译记忆可信复用提供权威词库版本判定。
@@ -47,11 +47,11 @@
 
 可从 [WuwaTerm Windows Releases](https://github.com/My-Denia/WuwaTerm-Windows/releases) 下载便携压缩包及同次发布的 `SHA256SUMS`；也可按下文自行构建。
 
-1. 下载对应版本的便携压缩包（例如 `WuwaTerm-0.9.0-windows-x64.zip`）和同一次发布的 `SHA256SUMS`。
+1. 下载对应版本的便携压缩包（例如 `WuwaTerm-0.10.0-windows-x64.zip`）和同一次发布的 `SHA256SUMS`。
 2. 核对校验和，再解压：
 
 ```powershell
-Get-FileHash .\WuwaTerm-0.9.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WuwaTerm-0.10.0-windows-x64.zip -Algorithm SHA256
 ```
 
    将输出与 `SHA256SUMS` 中该文件的哈希比对，不一致时不要解压。
