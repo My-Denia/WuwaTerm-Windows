@@ -22,12 +22,14 @@ import argparse
 import contextlib
 import ctypes
 import gc
+import io
 import json
 import os
 import shutil
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tracemalloc
@@ -60,6 +62,8 @@ def _windows_rss_mib() -> float | None:
     """Query current process WorkingSetSize on Windows via psapi/kernel32."""
     try:
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
         handle = kernel32.GetCurrentProcess()
         counters = _PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
@@ -301,6 +305,7 @@ def _make_list_adapter(app_parent: Any = None):
     from PySide6.QtCore import Qt
 
     try:
+        from wuwaterm_client.ui import review_states
         from wuwaterm_client.ui.review_models import ModelListView, ReviewRow  # type: ignore[import-not-found]
 
         class _ModelListAdapter:
@@ -313,7 +318,7 @@ def _make_list_adapter(app_parent: Any = None):
                 rows = [
                     ReviewRow(
                         text=text,
-                        state=state,
+                        state=review_states.for_verdict(state),
                         tooltip=tooltip,
                         user_data=idx,
                         filter_keys=frozenset({"all", state}),
@@ -408,6 +413,8 @@ def _rss_mib():
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
             k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.argtypes = []
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
             h = k32.GetCurrentProcess()
             c = _PMC()
             c.cb = ctypes.sizeof(c)
@@ -431,6 +438,29 @@ def _rss_mib():
                 if len(parts) >= 2 and int(parts[1]) > 0:
                     return round(int(parts[1]) / 1024.0, 2)
     return None
+
+try:
+    import keyring
+    from keyring.backend import KeyringBackend
+
+    class _MemoryKeyring(KeyringBackend):
+        priority = 1
+
+        def __init__(self) -> None:
+            self._values: dict[tuple[str, str], str] = {}
+
+        def get_password(self, service: str, username: str) -> str | None:
+            return self._values.get((service, username))
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self._values[(service, username)] = password
+
+        def delete_password(self, service: str, username: str) -> None:
+            self._values.pop((service, username), None)
+
+    keyring.set_keyring(_MemoryKeyring())
+except Exception:
+    pass
 
 app = QApplication([])
 app.setApplicationName(strings.APP_TITLE)
@@ -494,6 +524,7 @@ def measure_cold_start_and_idle_rss(repo_root: Path, samples: int) -> dict[str, 
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=60,
                 check=True,
             )
@@ -850,6 +881,7 @@ def run_revision_suite(
     keystrokes: int = 30,
     scroll_items: int = 1000,
     scroll_steps: int = 25,
+    sizes: tuple[int, ...] = _BENCH_SIZES,
 ) -> dict[str, Any]:
     """Measure all 6 metrics for ``repo_root`` using isolated subprocesses."""
     repo_root = repo_root.resolve()
@@ -857,7 +889,7 @@ def run_revision_suite(
     run_cold = 1 if quick else max(1, cold_samples)
     run_keys = 6 if quick else max(1, keystrokes)
     run_scroll_steps = 5 if quick else max(2, scroll_steps)
-    sizes = (200, 500, 1000)
+    run_sizes = tuple(sizes) or _BENCH_SIZES
 
     cold_and_idle = measure_cold_start_and_idle_rss(repo_root, run_cold)
 
@@ -876,11 +908,11 @@ def run_revision_suite(
         "--scroll-steps",
         str(run_scroll_steps),
         "--sizes",
-        ",".join(str(s) for s in sizes),
+        ",".join(str(s) for s in run_sizes),
     ]
     env = dict(os.environ)
     env["QT_QPA_PLATFORM"] = "offscreen"
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=180)
     if proc.returncode != 0:
         raise RuntimeError(
             f"worker benchmark failed ({proc.returncode}) for {repo_root}:\n{proc.stderr}\n{proc.stdout}"
@@ -914,23 +946,16 @@ def _export_git_ref(repo_root: Path, ref: str, dest: Path) -> None:
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.Popen(
-        ["git", "-C", str(repo_root), "archive", ref],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert archive.stdout is not None
-    extract = subprocess.run(
-        ["tar", "-x", "-C", str(dest)],
-        stdin=archive.stdout,
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "archive", "--format=tar", ref],
         capture_output=True,
-        check=True,
+        check=False,
     )
-    archive.stdout.close()
-    rc = archive.wait()
-    if rc != 0:
-        err = archive.stderr.read().decode("utf-8", errors="replace") if archive.stderr else ""
-        raise RuntimeError(f"git archive {ref} failed ({rc}): {err} {extract.stderr.decode('utf-8', errors='replace')}")
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"git archive {ref} failed ({proc.returncode}): {err}")
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:*") as tf:
+        tf.extractall(dest, filter="data")
 
 
 def _resolve_git_sha(repo_root: Path, ref: str) -> str:
@@ -938,6 +963,7 @@ def _resolve_git_sha(repo_root: Path, ref: str) -> str:
         ["git", "-C", str(repo_root), "rev-parse", "--short", ref],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return proc.stdout.strip()
@@ -999,9 +1025,12 @@ def build_comparison(before: dict[str, Any], after: dict[str, Any]) -> dict[str,
         },
     ]
 
-    for size_key in ("200", "500", "1000"):
-        b_sz = before["large_manuscript_list_refresh"]["sizes"][size_key]
-        a_sz = after["large_manuscript_list_refresh"]["sizes"][size_key]
+    b_sizes = before["large_manuscript_list_refresh"]["sizes"]
+    a_sizes = after["large_manuscript_list_refresh"]["sizes"]
+    common_sizes = sorted((key for key in b_sizes if key in a_sizes), key=int)
+    for size_key in common_sizes:
+        b_sz = b_sizes[size_key]
+        a_sz = a_sizes[size_key]
         rows.extend([
             {
                 "metric": f"manuscript_{size_key}_segment_load_ms",
@@ -1107,7 +1136,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--before-root", type=Path, help="Existing checkout directory for the 'before' revision")
     parser.add_argument("--after-root", type=Path, help="Existing checkout directory for the 'after' revision")
     parser.add_argument("--before-ref", default="e6835f3", help="Git ref to export for 'before' when --before-root omitted")
-    parser.add_argument("--after-ref", default="HEAD", help="Git ref label for 'after' (default: HEAD)")
+    parser.add_argument(
+        "--after-ref",
+        default="WORKTREE",
+        help="Git ref to export for 'after' when --after-root omitted (default: WORKTREE measures live checkout)",
+    )
     parser.add_argument("--quick", action="store_true", help="Fast single-sample smoke run")
     parser.add_argument("--samples", type=int, default=3, help="Sample count for list/scroll/recovery benchmarks")
     parser.add_argument("--cold-samples", type=int, default=5, help="Sample count for cold start / idle RSS subprocesses")
@@ -1118,8 +1151,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON only")
     args = parser.parse_args(argv)
 
+    sizes = tuple(int(part) for part in args.sizes.split(",") if part.strip())
+    if not sizes or any(s <= 0 for s in sizes):
+        parser.error("--sizes must contain positive integers")
+
     if args._worker_root is not None:
-        sizes = tuple(int(part) for part in args.sizes.split(",") if part.strip())
         payload = measure_inprocess_suite(
             repo_root=args._worker_root,
             samples=args.samples,
@@ -1141,13 +1177,12 @@ def main(argv: list[str] | None = None) -> int:
             keystrokes=args.keystrokes,
             scroll_items=args.items,
             scroll_steps=args.scroll_steps,
+            sizes=sizes,
         )
         print(json.dumps(single, ensure_ascii=False, indent=2))
         return 0
 
     work_repo = Path(__file__).resolve().parents[1]
-    after_root = args.after_root or work_repo
-    after_label = _resolve_git_sha(work_repo, args.after_ref) if args.after_root is None else str(after_root)
 
     if args.before_root is not None:
         before_res = run_revision_suite(
@@ -1159,6 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
             keystrokes=args.keystrokes,
             scroll_items=args.items,
             scroll_steps=args.scroll_steps,
+            sizes=sizes,
         )
     else:
         before_label = _resolve_git_sha(work_repo, args.before_ref)
@@ -1174,18 +1210,49 @@ def main(argv: list[str] | None = None) -> int:
                 keystrokes=args.keystrokes,
                 scroll_items=args.items,
                 scroll_steps=args.scroll_steps,
+                sizes=sizes,
             )
 
-    after_res = run_revision_suite(
-        after_root,
-        label=after_label,
-        quick=args.quick,
-        samples=args.samples,
-        cold_samples=args.cold_samples,
-        keystrokes=args.keystrokes,
-        scroll_items=args.items,
-        scroll_steps=args.scroll_steps,
-    )
+    if args.after_root is not None:
+        after_res = run_revision_suite(
+            args.after_root,
+            label=str(args.after_root),
+            quick=args.quick,
+            samples=args.samples,
+            cold_samples=args.cold_samples,
+            keystrokes=args.keystrokes,
+            scroll_items=args.items,
+            scroll_steps=args.scroll_steps,
+            sizes=sizes,
+        )
+    elif args.after_ref == "WORKTREE":
+        after_res = run_revision_suite(
+            work_repo,
+            label=_resolve_git_sha(work_repo, "HEAD"),
+            quick=args.quick,
+            samples=args.samples,
+            cold_samples=args.cold_samples,
+            keystrokes=args.keystrokes,
+            scroll_items=args.items,
+            scroll_steps=args.scroll_steps,
+            sizes=sizes,
+        )
+    else:
+        after_label = _resolve_git_sha(work_repo, args.after_ref)
+        with tempfile.TemporaryDirectory(prefix="win-bench-after-") as tmp_after:
+            after_dir = Path(tmp_after)
+            _export_git_ref(work_repo, args.after_ref, after_dir)
+            after_res = run_revision_suite(
+                after_dir,
+                label=after_label,
+                quick=args.quick,
+                samples=args.samples,
+                cold_samples=args.cold_samples,
+                keystrokes=args.keystrokes,
+                scroll_items=args.items,
+                scroll_steps=args.scroll_steps,
+                sizes=sizes,
+            )
     comparison = build_comparison(before_res, after_res)
     if args.json:
         print(json.dumps(comparison, ensure_ascii=False, indent=2))

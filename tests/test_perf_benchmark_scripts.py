@@ -114,6 +114,7 @@ def test_benchmark_windows_perf_quick_json_cli(tmp_path: Path) -> None:
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
@@ -147,12 +148,15 @@ def test_compare_perf_revisions_quick_json_cli(tmp_path: Path) -> None:
             "--repo-root",
             str(REPO_ROOT),
             "--quick",
+            "--sizes",
+            "50,150",
             "--json",
         ],
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=90,
     )
     assert proc.returncode == 0, proc.stderr
@@ -167,8 +171,108 @@ def test_compare_perf_revisions_quick_json_cli(tmp_path: Path) -> None:
         "draft_recovery",
     ):
         assert key in data
-    assert set(data["large_manuscript_list_refresh"]["sizes"].keys()) == {"200", "500", "1000"}
+    assert set(data["large_manuscript_list_refresh"]["sizes"].keys()) == {"50", "150"}
     assert data["typing_latency"]["keystroke_dispatch_ms"]["p50"] > 0
     assert data["typing_latency"]["state_sync_ms"]["p95"] > 0
     assert data["draft_recovery"]["segments"] == 500
     assert list(sentinel.iterdir()) == []
+
+
+def test_model_list_adapter_maps_verdict_states_and_keeps_filter_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    src_dir = str(REPO_ROOT / "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    QApplication.instance() or QApplication([])
+
+    mod = _load_compare_module()
+    adapter = mod._make_list_adapter()
+    specs = [
+        ("Row 0", "verified_constraint", "tip0", 0),
+        ("Row 1", "confirmed_conflict", "tip1", 1),
+        ("Row 2", "needs_review", "tip2", 2),
+        ("Row 3", "not_evaluated", "tip3", 3),
+    ]
+    adapter.set_rows(specs)
+    try:
+        states = [adapter.widget.source_model.row_at(i).state for i in range(4)]
+        assert states == ["verified", "conflict", "needs_check", "unevaluated"]
+        assert any(state != "unevaluated" for state in states)
+
+        adapter.apply_filter("confirmed_conflict")
+        assert adapter.count() == 1
+        assert adapter.widget.item(0).data() == 1
+        adapter.apply_filter("all")
+        assert adapter.count() == 4
+    finally:
+        adapter.widget.close()
+        adapter.widget.deleteLater()
+
+
+def test_main_exports_after_ref_and_passes_custom_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mod = _load_compare_module()
+    exported: list[tuple[str, Path]] = []
+    called_suites: list[tuple[Path, str, tuple[int, ...]]] = []
+
+    def fake_export(repo_root: Path, ref: str, dest: Path) -> None:
+        exported.append((ref, dest))
+        dest.mkdir(parents=True, exist_ok=True)
+
+    def fake_resolve(_repo_root: Path, ref: str) -> str:
+        return f"sha-{ref}"
+
+    def fake_run_suite(
+        repo_root: Path,
+        *,
+        label: str,
+        sizes: tuple[int, ...] = (200, 500, 1000),
+        **_kwargs,
+    ) -> dict:
+        called_suites.append((repo_root, label, sizes))
+        stats = {"min": 1.0, "p50": 1.0, "p95": 1.0, "max": 1.0}
+        return {
+            "label": label,
+            "cold_start": {"samples": 1, "cold_start_ms": stats, "window_construct_ms": stats, "subprocess_wall_ms": stats},
+            "idle_rss": {"samples": 1, "rss_mib": stats, "tracemalloc_current_mib": stats, "tracemalloc_peak_mib": stats},
+            "typing_latency": {"keystroke_dispatch_ms": stats, "state_sync_ms": stats},
+            "large_manuscript_list_refresh": {
+                "sizes": {
+                    str(sz): {
+                        "segment_list_load_ms": stats,
+                        "term_report_load_ms": stats,
+                        "view_filter_cycle_ms": stats,
+                        "widget_bulk_load_ms": stats,
+                        "widget_filter_cycle_ms": stats,
+                    }
+                    for sz in sizes
+                }
+            },
+            "scroll_perf": {
+                "viewport_scroll_render_ms": stats,
+                "scroll_5_jumps_ms": stats,
+                "resize_relayout_render_ms": stats,
+            },
+            "draft_recovery": {"deserialize_ms": stats, "restore_workbench_ms": stats, "total_ms": stats},
+        }
+
+    monkeypatch.setattr(mod, "_export_git_ref", fake_export)
+    monkeypatch.setattr(mod, "_resolve_git_sha", fake_resolve)
+    monkeypatch.setattr(mod, "run_revision_suite", fake_run_suite)
+
+    rc = mod.main(["--before-ref", "e6835f3", "--after-ref", "bd239c7", "--sizes", "40,120", "--quick", "--json"])
+    assert rc == 0
+    assert [ref for ref, _ in exported] == ["e6835f3", "bd239c7"]
+    assert exported[0][1] != exported[1][1]
+    assert called_suites[0][2] == (40, 120)
+    assert called_suites[1][2] == (40, 120)
+    assert called_suites[1][0] == exported[1][1]
+
+    out = json.loads(capsys.readouterr().out)
+    metrics = [row["metric"] for row in out["summary"]]
+    assert "manuscript_40_segment_load_ms" in metrics
+    assert "manuscript_120_segment_load_ms" in metrics
+    assert "manuscript_200_segment_load_ms" not in metrics
