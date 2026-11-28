@@ -172,10 +172,22 @@ def test_compare_perf_revisions_quick_json_cli(tmp_path: Path) -> None:
     ):
         assert key in data
     assert set(data["large_manuscript_list_refresh"]["sizes"].keys()) == {"50", "150"}
+    assert data["large_manuscript_list_refresh"]["sizes"]["50"]["term_group_count"] > 0
+    assert data["large_manuscript_list_refresh"]["sizes"]["150"]["term_group_count"] > 0
     assert data["typing_latency"]["keystroke_dispatch_ms"]["p50"] > 0
     assert data["typing_latency"]["state_sync_ms"]["p95"] > 0
     assert data["draft_recovery"]["segments"] == 500
     assert list(sentinel.iterdir()) == []
+
+
+def test_cold_start_child_script_disables_tracemalloc_by_default() -> None:
+    mod = _load_compare_module()
+    cold_only = mod._cold_start_child_script(enable_tracemalloc=False)
+    assert "import tracemalloc" not in cold_only
+    assert "tracemalloc.start()" not in cold_only
+    with_tm = mod._cold_start_child_script(enable_tracemalloc=True)
+    assert "import tracemalloc" in with_tm
+    assert "tracemalloc.start()" in with_tm
 
 
 def test_model_list_adapter_maps_verdict_states_and_keeps_filter_keys(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -189,52 +189,13 @@ def _build_large_manuscript(segments: int) -> tuple[str, str]:
     return "\n\n".join(src_parts), "\n\n".join(tgt_parts)
 
 
-def _build_document_term_report(source: str, target: str, count: int) -> dict[str, Any]:
-    """Build a synthetic document-level term report with ``count`` findings across the manuscript."""
-    verdicts = ("verified_constraint", "confirmed_conflict", "needs_review", "not_evaluated")
-    src_blocks = source.split("\n\n")
-    tgt_blocks = target.split("\n\n")
-    findings: list[dict[str, Any]] = []
-    src_offset = 0
-    tgt_offset = 0
-    for i in range(min(count, len(src_blocks), len(tgt_blocks))):
-        src_block = src_blocks[i]
-        tgt_block = tgt_blocks[i]
-        term_src = "共鸣者" if i % 2 == 0 else "声骸"
-        term_tgt = "Rover" if i % 2 == 0 else "Echo"
-        s_pos = src_offset + src_block.index(term_src)
-        t_pos = tgt_offset + tgt_block.index(term_tgt)
-        verdict = verdicts[i % len(verdicts)]
-        finding: dict[str, Any] = {
-            "source_span": {"start": s_pos, "end": s_pos + len(term_src), "text": term_src},
-            "target_span": {"start": t_pos, "end": t_pos + len(term_tgt), "text": term_tgt},
-            "verdict": verdict,
-            "candidates": [
-                {"source": term_src, "target": term_tgt, "category": "character" if i % 2 == 0 else "system"}
-            ],
-            "candidates_truncated": False,
-        }
-        if verdict == "not_evaluated":
-            finding["reason"] = "untranslated"
-        findings.append(finding)
-        src_offset += len(src_block) + 2
-        tgt_offset += len(tgt_block) + 2
+def _build_populated_long_payload(segments: int = 500, *, check_limits: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a v5-compatible long-mode payload with ``segments`` populated records and basis.
 
-    evaluated = sum(1 for f in findings if f["verdict"] != "not_evaluated")
-    return {
-        "request_id": "bench-report-1",
-        "direction": "en",
-        "coverage": {
-            "evaluated": evaluated,
-            "not_evaluated": len(findings) - evaluated,
-        },
-        "truncated": False,
-        "findings": findings,
-    }
-
-
-def _build_large_recovery_payload(segments: int = 500) -> dict[str, Any]:
-    """Build a valid v5 workfile payload with ``segments`` (<= 512) populated records."""
+    Uses three distinct term surfaces mapped to ``verified_constraint``,
+    ``confirmed_conflict``, and ``needs_review`` so ``sr.group_term_occurrences``
+    produces non-empty groups for ``all``, ``confirmed``, ``pending``, and ``unhandled``.
+    """
     from wuwaterm_client import manuscript, segment_records as sr
     from wuwaterm_client.segmentation import pair_segments
 
@@ -252,24 +213,23 @@ def _build_large_recovery_payload(segments: int = 500) -> dict[str, Any]:
     payload = manuscript.empty_workfile()
     payload.update(source=source, target=target, direction="en")
     pairs = pair_segments(source, target)
-    parts = sr.normalize(payload, pairs, basis)
+    parts = sr.normalize(payload, pairs, basis, check_limits=check_limits)
     payload = sr.with_parts(payload, parts)
 
-    verdicts = ("verified_constraint", "confirmed_conflict", "needs_review")
     for idx in range(len(pairs)):
         req = sr.plan_request(payload, idx, basis)
-        term_src = "共鸣者" if idx % 2 == 0 else "声骸"
-        term_tgt = "Rover" if idx % 2 == 0 else "Echo"
-        s_pos = req.source.index(term_src)
-        t_pos = req.target.index(term_tgt)
-        verdict = verdicts[idx % len(verdicts)]
+        s_pos_res = req.source.index("共鸣者")
+        t_pos_res = req.target.index("Rover")
+        s_pos_echo = req.source.index("声骸")
+        t_pos_echo = req.target.index("Echo")
+        echo_verdict = "confirmed_conflict" if idx % 2 == 0 else "needs_review"
         report = {
             "request_id": f"bench-seg-{idx}",
             "rule_version": basis["rule_version"],
             "dictionary": basis["dictionary"],
             "matcher_revision": basis["matcher_revision"],
             "coverage": {
-                "evaluated": 1,
+                "evaluated": 2,
                 "not_evaluated": 0,
                 "rules": list(sr.COVERAGE_RULES),
             },
@@ -277,26 +237,49 @@ def _build_large_recovery_payload(segments: int = 500) -> dict[str, Any]:
             "findings": [
                 {
                     "rule_id": sr.TERM_PAIR_RULE,
-                    "source_span": {"start": s_pos, "end": s_pos + len(term_src), "text": term_src},
-                    "target_span": {"start": t_pos, "end": t_pos + len(term_tgt), "text": term_tgt},
-                    "verdict": verdict,
+                    "source_span": {"start": s_pos_res, "end": s_pos_res + len("共鸣者"), "text": "共鸣者"},
+                    "target_span": {"start": t_pos_res, "end": t_pos_res + len("Rover"), "text": "Rover"},
+                    "verdict": "verified_constraint",
                     "candidates": [
                         {
-                            "candidate_id": f"{(idx % 2) + 1:064x}",
-                            "zh": term_src,
-                            "en": term_tgt,
-                            "category": "character" if idx % 2 == 0 else "system",
+                            "candidate_id": f"{1:064x}",
+                            "zh": "共鸣者",
+                            "en": "Rover",
+                            "category": "character",
                         }
                     ],
                     "candidates_truncated": False,
-                }
+                },
+                {
+                    "rule_id": sr.TERM_PAIR_RULE,
+                    "source_span": {"start": s_pos_echo, "end": s_pos_echo + len("声骸"), "text": "声骸"},
+                    "target_span": {"start": t_pos_echo, "end": t_pos_echo + len("Echo"), "text": "Echo"},
+                    "verdict": echo_verdict,
+                    "candidates": [
+                        {
+                            "candidate_id": f"{2:064x}",
+                            "zh": "声骸",
+                            "en": "Echo",
+                            "category": "system",
+                        }
+                    ],
+                    "candidates_truncated": False,
+                },
             ],
         }
         applied = sr.apply_response(payload, req, report, basis)
         if applied.outcome != "stored":
             raise RuntimeError(f"failed to store synthetic segment {idx}: {applied.outcome}")
         payload = sr.with_parts(payload, applied.parts)
-    payload["progress"] = {"current": segments // 2, "completed": list(range(0, segments, 2))}
+    if segments > 0:
+        completed = [i for i in range(0, len(pairs), 2)]
+        payload["progress"] = {"current": len(pairs) // 2, "completed": completed}
+    return payload, basis
+
+
+def _build_large_recovery_payload(segments: int = 500) -> dict[str, Any]:
+    """Build a valid serializable v5 workfile payload with ``segments`` (<= 512) populated records."""
+    payload, _basis = _build_populated_long_payload(segments, check_limits=True)
     return payload
 
 
@@ -381,15 +364,26 @@ def _make_list_adapter(app_parent: Any = None):
         return _LegacyListAdapter()
 
 
-def _cold_start_child_script() -> str:
-    """Self-contained snippet executed inside a fresh subprocess for Cold Start + Idle RSS."""
-    return r"""
-import ctypes, gc, json, os, sys, time, tracemalloc
+def _cold_start_child_script(*, enable_tracemalloc: bool = False) -> str:
+    """Self-contained snippet executed inside a fresh subprocess for Cold Start + Idle RSS.
+
+    When ``enable_tracemalloc`` is False (the default for cold start & RSS),
+    ``tracemalloc`` is not imported or started so its allocation hooks and
+    bookkeeping memory never skew startup latency or ``VmRSS``.
+    """
+    tm_setup = "import tracemalloc\ntracemalloc.start()\n" if enable_tracemalloc else ""
+    tm_collect = (
+        "cur_bytes, peak_bytes = tracemalloc.get_traced_memory()\n"
+        "tracemalloc.stop()\n"
+        if enable_tracemalloc
+        else "cur_bytes, peak_bytes = 0, 0\n"
+    )
+    return f"""
+import ctypes, gc, json, os, sys, time
 from pathlib import Path
 
 t_start = time.perf_counter()
-tracemalloc.start()
-
+{tm_setup}
 import qasync
 from PySide6.QtWidgets import QApplication
 from wuwaterm_client import i18n, strings, theme
@@ -447,7 +441,7 @@ try:
         priority = 1
 
         def __init__(self) -> None:
-            self._values: dict[tuple[str, str], str] = {}
+            self._values: dict[tuple[str, str], str] = {{}}
 
         def get_password(self, service: str, username: str) -> str | None:
             return self._values.get((service, username))
@@ -479,64 +473,66 @@ t_ready = time.perf_counter()
 gc.collect()
 app.processEvents()
 rss_mib = _rss_mib()
-cur_bytes, peak_bytes = tracemalloc.get_traced_memory()
-tracemalloc.stop()
-
+{tm_collect}
 window.manuscript_view.confirm_discard = lambda: True
 window.close()
 window.deleteLater()
 app.processEvents()
 loop.close()
 
-print(json.dumps({
+print(json.dumps({{
     "cold_start_ms": (t_ready - t_start) * 1000.0,
     "window_construct_ms": (t_ready - t_win) * 1000.0,
     "idle_rss_mib": rss_mib,
-    "idle_tracemalloc_current_mib": round(cur_bytes / (1024.0 * 1024.0), 2),
-    "idle_tracemalloc_peak_mib": round(peak_bytes / (1024.0 * 1024.0), 2),
-}))
+    "idle_tracemalloc_current_mib": round(cur_bytes / (1024.0 * 1024.0), 2) if {enable_tracemalloc!r} else None,
+    "idle_tracemalloc_peak_mib": round(peak_bytes / (1024.0 * 1024.0), 2) if {enable_tracemalloc!r} else None,
+}}))
 """
 
 
+def _run_cold_subprocess(repo_root: Path, *, enable_tracemalloc: bool) -> tuple[dict[str, Any], float]:
+    snippet = _cold_start_child_script(enable_tracemalloc=enable_tracemalloc)
+    src_dir = str((repo_root / "src").resolve())
+    with tempfile.TemporaryDirectory(prefix="wuwaterm-cold-") as tmp_dir:
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else src_dir
+        for key in _PROFILE_ENV_VARS:
+            env[key] = tmp_dir
+        t0 = time.perf_counter()
+        proc = subprocess.run(
+            [sys.executable, "-c", snippet],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            check=True,
+        )
+        elapsed_wall = (time.perf_counter() - t0) * 1000.0
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    return json.loads(lines[-1]), elapsed_wall
+
+
 def measure_cold_start_and_idle_rss(repo_root: Path, samples: int) -> dict[str, Any]:
-    """Spawn ``samples`` clean subprocesses against ``repo_root/src`` to measure cold start and idle RSS."""
+    """Spawn ``samples`` clean subprocesses without ``tracemalloc`` for cold start and idle RSS,
+    plus a separate ``tracemalloc`` probe subprocess."""
     cold_ms: list[float] = []
     win_ms: list[float] = []
     wall_ms: list[float] = []
     rss_vals: list[float | None] = []
-    tm_cur_vals: list[float] = []
-    tm_peak_vals: list[float] = []
-
-    snippet = _cold_start_child_script()
-    src_dir = str((repo_root / "src").resolve())
 
     for _ in range(samples):
-        with tempfile.TemporaryDirectory(prefix="wuwaterm-cold-") as tmp_dir:
-            env = dict(os.environ)
-            env["QT_QPA_PLATFORM"] = "offscreen"
-            existing_pp = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else src_dir
-            for key in _PROFILE_ENV_VARS:
-                env[key] = tmp_dir
-            t0 = time.perf_counter()
-            proc = subprocess.run(
-                [sys.executable, "-c", snippet],
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=60,
-                check=True,
-            )
-            elapsed_wall = (time.perf_counter() - t0) * 1000.0
-            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-            payload = json.loads(lines[-1])
-            cold_ms.append(float(payload["cold_start_ms"]))
-            win_ms.append(float(payload["window_construct_ms"]))
-            wall_ms.append(elapsed_wall)
-            rss_vals.append(payload.get("idle_rss_mib"))
-            tm_cur_vals.append(float(payload["idle_tracemalloc_current_mib"]))
-            tm_peak_vals.append(float(payload["idle_tracemalloc_peak_mib"]))
+        payload, elapsed_wall = _run_cold_subprocess(repo_root, enable_tracemalloc=False)
+        cold_ms.append(float(payload["cold_start_ms"]))
+        win_ms.append(float(payload["window_construct_ms"]))
+        wall_ms.append(elapsed_wall)
+        rss_vals.append(payload.get("idle_rss_mib"))
+
+    tm_payload, _ = _run_cold_subprocess(repo_root, enable_tracemalloc=True)
+    tm_cur_vals = [float(tm_payload["idle_tracemalloc_current_mib"])]
+    tm_peak_vals = [float(tm_payload["idle_tracemalloc_peak_mib"])]
 
     return {
         "samples": samples,
@@ -622,7 +618,7 @@ def measure_large_manuscript_refresh(app: Any, samples: int, sizes: tuple[int, .
 
     for seg_count in sizes:
         source, target = _build_large_manuscript(seg_count)
-        report = _build_document_term_report(source, target, seg_count)
+        populated_payload, basis = _build_populated_long_payload(seg_count, check_limits=False)
         row_specs = [
             (
                 f"共鸣者术语 #{i + 1}\nResonator Term #{i + 1} · 第 {(i % seg_count) + 1} 段",
@@ -638,6 +634,7 @@ def measure_large_manuscript_refresh(app: Any, samples: int, sizes: tuple[int, .
         view_filter_ms: list[float] = []
         widget_load_ms: list[float] = []
         widget_filter_ms: list[float] = []
+        term_group_count = 0
 
         for _ in range(samples):
             view = ManuscriptView(ApiClient(None))
@@ -645,28 +642,44 @@ def measure_large_manuscript_refresh(app: Any, samples: int, sizes: tuple[int, .
             view.show()
             app.processEvents()
             try:
-                payload = empty_workfile()
-                payload.update(source=source, target=target, direction="en")
+                plain_payload = empty_workfile()
+                plain_payload.update(source=source, target=target, direction="en")
 
                 t0 = time.perf_counter()
-                view._set_payload(payload)
+                view._set_payload(plain_payload)
                 view._show_track(TRACK_SEGMENTS)
                 view._refresh_derived()
                 app.processEvents()
                 seg_load_ms.append((time.perf_counter() - t0) * 1000.0)
 
+                view._controller.capabilities = frozenset()
+                view._term_basis = basis
+                view._set_payload(populated_payload)
+                view._records()
+                app.processEvents()
+
                 t1 = time.perf_counter()
                 view._show_track(TRACK_TERMS)
-                view._show_term_report(report, state="current")
+                view._show_segment_term_report()
                 app.processEvents()
+                if len(view._term_groups_data) == 0 or view.term_groups.count() == 0 or view.findings.count() == 0:
+                    raise RuntimeError(
+                        f"expected non-empty term_groups and findings for {seg_count} segments, "
+                        f"got groups={len(view._term_groups_data)} rows={view.term_groups.count()} "
+                        f"findings={view.findings.count()}"
+                    )
                 term_load_ms.append((time.perf_counter() - t1) * 1000.0)
+                term_group_count = len(view._term_groups_data)
 
                 t2 = time.perf_counter()
                 for target_key in ("all", "confirmed", "pending", "unhandled"):
                     idx = view.term_filter_combo.findData(target_key)
-                    if idx >= 0:
-                        view.term_filter_combo.setCurrentIndex(idx)
-                        app.processEvents()
+                    if idx < 0:
+                        raise RuntimeError(f"missing term_filter_combo option {target_key!r}")
+                    view.term_filter_combo.setCurrentIndex(idx)
+                    app.processEvents()
+                    if view.term_groups.count() == 0:
+                        raise RuntimeError(f"term_groups became empty under filter {target_key!r}")
                 view_filter_ms.append((time.perf_counter() - t2) * 1000.0)
             finally:
                 view._derived_timer.stop()
@@ -701,6 +714,7 @@ def measure_large_manuscript_refresh(app: Any, samples: int, sizes: tuple[int, .
             "segments": seg_count,
             "source_chars": len(source),
             "target_chars": len(target),
+            "term_group_count": term_group_count,
             "segment_list_load_ms": _summarize(seg_load_ms),
             "term_report_load_ms": _summarize(term_load_ms),
             "view_filter_cycle_ms": _summarize(view_filter_ms),
