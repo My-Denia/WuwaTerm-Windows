@@ -598,6 +598,8 @@ python -m pytest tests/test_manuscript.py
 
 跨产品契约测试还需 Node 及 [固定的 Core 和 Web 源码](contracts/sources.json)，通过 `WUWATERM_CORE_ROOT` 和 `WUWATERM_WEB_ROOT` 指向对应目录。源码文件哈希与记录不符会失败；设置 `WUWATERM_CONTRACTS_REQUIRED=1` 后，缺少源码或 Node 也会失败。CI 强制执行 Core API 和 Web 双向稿件测试。
 
+离线性能基准脚本为 `scripts/benchmark_windows_perf.py` 与 `scripts/compare_perf_revisions.py`，重构前（`e6835f3`）与当前工作台架构（`bd239c7`）的 6 项量化性能对照结果见 [工作台性能对照基准报告](docs/benchmarks/workbench-before-after.md)。
+
 ## 依赖漏洞门禁
 
 `.github/workflows/dependency-audit.yml` 审计 `uv.lock` 锁定的依赖集合：critical 和 high 的 advisory（漏洞公告）让 CI 失败，medium 和 low 只打印。它回答的是 `uv sync --locked` 不回答的问题——锁能解析、与 `pyproject.toml` 一致、构建装的确实是锁里的版本，这些都不说明某个固定版本有没有已披露的漏洞。
